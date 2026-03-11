@@ -1,12 +1,12 @@
 {
   "domain": "automagic",
   "name": "AutoMagic - AI Automation Builder",
-  "version": "0.1.0",
-  "documentation": "https://github.com/usersaynoso/AutoMagic---AI-Automation-Builder-for-Home-Assistant",
-  "issue_tracker": "https://github.com/usersaynoso/AutoMagic---AI-Automation-Builder-for-Home-Assistant/issues",
-  "dependencies": ["http"],
   "codeowners": ["@usersaynoso"],
-  "requirements": [],
+  "config_flow": true,
+  "dependencies": ["http"],
+  "documentation": "https://github.com/usersaynoso/AutoMagic---AI-Automation-Builder-for-Home-Assistant",
   "iot_class": "local_polling",
-  "config_flow": true
+  "issue_tracker": "https://github.com/usersaynoso/AutoMagic---AI-Automation-Builder-for-Home-Assistant/issues",
+  "requirements": [],
+  "version": "0.1.0"
 }

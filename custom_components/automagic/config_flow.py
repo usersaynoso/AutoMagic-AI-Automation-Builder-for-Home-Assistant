@@ -186,7 +186,13 @@ class AutoMagicOptionsFlow(config_entries.OptionsFlow):
     ) -> FlowResult:
         """Manage the options."""
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+            new_data = {**self._config_entry.data, **user_input}
+            self.hass.config_entries.async_update_entry(
+                self._config_entry,
+                data=new_data,
+                title=f"AutoMagic ({new_data.get(CONF_MODEL, '')})",
+            )
+            return self.async_create_entry(title="", data={})
 
         current = self._config_entry.data
         endpoint_url = current.get(CONF_ENDPOINT_URL, DEFAULT_ENDPOINT)

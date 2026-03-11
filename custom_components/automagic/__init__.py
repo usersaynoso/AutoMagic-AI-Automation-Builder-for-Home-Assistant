@@ -66,8 +66,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         update=True,
     )
 
+    # Refresh cached config when options change
+    entry.async_on_unload(entry.add_update_listener(_update_listener))
+
     _LOGGER.info("AutoMagic integration loaded")
     return True
+
+
+async def _update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Refresh cached config data when config entry is updated."""
+    hass.data[DOMAIN][entry.entry_id] = dict(entry.data)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -76,7 +84,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     domain_data.pop(entry.entry_id, None)
 
     if not any(isinstance(value, dict) for value in domain_data.values()):
-        frontend.async_remove_panel(hass, "automagic", warn_if_unknown=False)
+        frontend.async_remove_panel(hass, "automagic")
 
     _LOGGER.info("AutoMagic integration unloaded")
     return True

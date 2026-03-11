@@ -44,6 +44,7 @@ _HA_MODULES = [
     "homeassistant.components",
     "homeassistant.components.http",
     "homeassistant.components.frontend",
+    "homeassistant.components.panel_custom",
     "homeassistant.components.automation",
     "homeassistant.helpers",
     "homeassistant.helpers.entity_registry",
@@ -73,6 +74,15 @@ http_mod.HomeAssistantView = type("HomeAssistantView", (), {
     "requires_auth": True,
     "json": staticmethod(lambda data, status_code=200: MagicMock()),
 })
+http_mod.StaticPathConfig = type(
+    "StaticPathConfig",
+    (),
+    {"__init__": lambda self, url_path, path, cache_headers=True: None},
+)
+
+frontend_mod = sys.modules["homeassistant.components.frontend"]
+frontend_mod.async_register_built_in_panel = MagicMock()
+frontend_mod.async_remove_panel = MagicMock()
 
 # ConfigFlow / OptionsFlow need to be real classes for inheritance
 config_entries = sys.modules["homeassistant.config_entries"]

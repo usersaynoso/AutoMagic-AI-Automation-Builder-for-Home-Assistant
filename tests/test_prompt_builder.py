@@ -1,9 +1,10 @@
-"""Tests for prompt_builder module."""
+"""Tests for prompt_builder and config flow prompt-adjacent helpers."""
 
 from __future__ import annotations
 
 import pytest
 
+from custom_components.automagic.config_flow import _pick_default_model
 from custom_components.automagic.prompt_builder import build_prompt, SYSTEM_PROMPT
 
 
@@ -63,3 +64,26 @@ class TestBuildPrompt:
         result = build_prompt("Turn on lights", "")
         assert len(result) == 2
         assert "Available entities:" in result[1]["content"]
+
+
+class TestPickDefaultModel:
+    """Tests for automatic default model selection."""
+
+    def test_prefers_best_known_model(self):
+        """Prefer stronger recommended models when available."""
+        models = ["llama3.2:latest", "qwen2.5:7b", "mistral-nemo"]
+        assert _pick_default_model(models) == "qwen2.5:7b"
+
+    def test_matches_prefixed_variant(self):
+        """Allow variant suffixes like context-tuned or quantized tags."""
+        models = ["qwen2.5:3b-16k", "llama3.2:latest"]
+        assert _pick_default_model(models) == "qwen2.5:3b-16k"
+
+    def test_falls_back_to_first_model(self):
+        """Use the first discovered model if none match preferences."""
+        models = ["custom-model", "another-model"]
+        assert _pick_default_model(models) == "custom-model"
+
+    def test_empty_model_list_returns_empty_string(self):
+        """No models means no auto-detected default."""
+        assert _pick_default_model([]) == ""

@@ -28,6 +28,34 @@ from .llm_client import fetch_models
 
 _LOGGER = logging.getLogger(__name__)
 
+_PREFERRED_MODEL_ORDER = [
+    "qwen2.5:14b",
+    "qwen2.5:7b",
+    "mistral-nemo",
+    "qwen2.5:3b",
+    "gpt-4o-mini",
+    "gpt-4o",
+]
+
+
+def _pick_default_model(models: list[str]) -> str:
+    """Pick the best default model from a discovered model list."""
+    if not models:
+        return ""
+
+    normalized = {model.lower(): model for model in models}
+
+    for preferred in _PREFERRED_MODEL_ORDER:
+        if preferred in normalized:
+            return normalized[preferred]
+
+    for preferred in _PREFERRED_MODEL_ORDER:
+        for model in models:
+            if model.lower().startswith(preferred):
+                return model
+
+    return models[0]
+
 
 class AutoMagicConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for AutoMagic."""
@@ -38,6 +66,7 @@ class AutoMagicConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Initialise the config flow."""
         self._endpoint_url: str = DEFAULT_ENDPOINT
         self._models: list[str] = []
+        self._detected_model: str = ""
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -58,6 +87,7 @@ class AutoMagicConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
             if models:
                 self._models = models
+                self._detected_model = _pick_default_model(models)
                 return await self.async_step_model()
 
             # If no models returned, check if endpoint is reachable at all
@@ -69,6 +99,7 @@ class AutoMagicConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 ) as resp:
                     # Endpoint is reachable but no models found - allow manual entry
                     self._models = []
+                    self._detected_model = ""
                     return await self.async_step_model()
             except (aiohttp.ClientError, TimeoutError):
                 errors["base"] = "cannot_connect"
@@ -117,7 +148,10 @@ class AutoMagicConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="model",
             data_schema=vol.Schema(
                 {
-                    vol.Required(CONF_MODEL): model_schema,
+                    vol.Required(
+                        CONF_MODEL,
+                        default=self._detected_model,
+                    ): model_schema,
                     vol.Optional(
                         CONF_MAX_TOKENS, default=DEFAULT_MAX_TOKENS
                     ): vol.All(int, vol.Range(min=256, max=8192)),
@@ -164,6 +198,8 @@ class AutoMagicOptionsFlow(config_entries.OptionsFlow):
         except Exception:
             models = []
 
+        detected_model = _pick_default_model(models)
+
         if models:
             model_schema = vol.In(models)
         else:
@@ -175,7 +211,7 @@ class AutoMagicOptionsFlow(config_entries.OptionsFlow):
                 {
                     vol.Required(
                         CONF_MODEL,
-                        default=current.get(CONF_MODEL, ""),
+                        default=current.get(CONF_MODEL) or detected_model,
                     ): model_schema,
                     vol.Optional(
                         CONF_MAX_TOKENS,

@@ -7,19 +7,16 @@ import os
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
 
 from .api import AutoMagicEntitiesView, AutoMagicGenerateView, AutoMagicInstallView
 from .const import DOMAIN
 
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
 _CARD_URL = "/automagic/automagic-card.js"
 
 _LOGGER = logging.getLogger(__name__)
-
-
-async def async_setup(hass: HomeAssistant, config: dict) -> bool:
-    """Set up the AutoMagic integration (YAML config - not used)."""
-    hass.data.setdefault(DOMAIN, {})
-    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

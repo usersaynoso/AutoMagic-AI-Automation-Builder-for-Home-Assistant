@@ -18,6 +18,7 @@ jobs:
       - uses: hacs/action@main
         with:
           category: integration
+          ignore: brands
 
   hassfest:
     name: Hassfest Validation
@@ -35,6 +36,6 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: pip install pytest pytest-asyncio
+        run: pip install pytest pytest-asyncio aiohttp pyyaml
       - name: Run tests
         run: pytest tests/ -v

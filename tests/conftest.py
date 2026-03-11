@@ -49,6 +49,7 @@ _HA_MODULES = [
     "homeassistant.helpers.entity_registry",
     "homeassistant.helpers.device_registry",
     "homeassistant.helpers.aiohttp_client",
+    "homeassistant.helpers.config_validation",
     "voluptuous",
 ]
 

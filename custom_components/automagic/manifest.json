@@ -3,10 +3,10 @@
   "name": "AutoMagic - AI Automation Builder",
   "version": "0.1.0",
   "documentation": "https://github.com/usersaynoso/AutoMagic---AI-Automation-Builder-for-Home-Assistant",
-  "dependencies": [],
+  "issue_tracker": "https://github.com/usersaynoso/AutoMagic---AI-Automation-Builder-for-Home-Assistant/issues",
+  "dependencies": ["http"],
   "codeowners": ["@usersaynoso"],
   "requirements": [],
   "iot_class": "local_polling",
-  "homeassistant": "2024.10.0",
   "config_flow": true
 }

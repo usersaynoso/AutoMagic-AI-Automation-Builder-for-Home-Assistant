@@ -83,6 +83,7 @@ http_mod.StaticPathConfig = type(
 frontend_mod = sys.modules["homeassistant.components.frontend"]
 frontend_mod.async_register_built_in_panel = MagicMock()
 frontend_mod.async_remove_panel = MagicMock()
+frontend_mod.add_extra_js_url = MagicMock()
 
 # ConfigFlow / OptionsFlow need to be real classes for inheritance
 config_entries = sys.modules["homeassistant.config_entries"]

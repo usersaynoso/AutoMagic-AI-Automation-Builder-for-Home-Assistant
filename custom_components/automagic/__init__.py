@@ -50,6 +50,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.http.register_view(AutoMagicEntitiesView())
         domain_data[_DATA_VIEWS_REGISTERED] = True
 
+    # Make the card JS available as a Lovelace resource so users can add
+    # custom:automagic-card to any dashboard without manual resource setup.
+    frontend.add_extra_js_url(hass, _CARD_URL)
+
     # Register the sidebar panel pointing to the integration-served JS
     frontend.async_register_built_in_panel(
         hass,

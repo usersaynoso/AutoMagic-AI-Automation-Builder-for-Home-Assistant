@@ -4,16 +4,19 @@ DOMAIN = "automagic"
 CONF_ENDPOINT_URL = "endpoint_url"
 CONF_MODEL = "model"
 CONF_MAX_TOKENS = "max_tokens"
+CONF_REQUEST_TIMEOUT = "request_timeout"
 CONF_TEMPERATURE = "temperature"
 CONF_CONTEXT_LIMIT = "context_limit"
 
 DEFAULT_ENDPOINT = "http://localhost:11434"
 DEFAULT_MAX_TOKENS = 4096
+DEFAULT_REQUEST_TIMEOUT = 300
 DEFAULT_TEMPERATURE = 0.15
 # 0 = send all entities (no artificial cap)
 DEFAULT_CONTEXT_LIMIT = 0
 
 API_PATH_GENERATE = "/api/automagic/generate"
+API_PATH_GENERATE_STATUS = "/api/automagic/generate/{job_id}"
 API_PATH_INSTALL = "/api/automagic/install"
 API_PATH_ENTITIES = "/api/automagic/entities"
 API_PATH_HISTORY = "/api/automagic/history"

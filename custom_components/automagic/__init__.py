@@ -14,6 +14,7 @@ from homeassistant.helpers import config_validation as cv
 from .api import (
     AutoMagicEntitiesView,
     AutoMagicGenerateView,
+    AutoMagicGenerateStatusView,
     AutoMagicHistoryView,
     AutoMagicInstallView,
 )
@@ -51,6 +52,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Register API views
     if not domain_data.get(_DATA_VIEWS_REGISTERED):
         hass.http.register_view(AutoMagicGenerateView())
+        hass.http.register_view(AutoMagicGenerateStatusView())
         hass.http.register_view(AutoMagicInstallView())
         hass.http.register_view(AutoMagicEntitiesView())
         hass.http.register_view(AutoMagicHistoryView())

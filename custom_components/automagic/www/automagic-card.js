@@ -35,6 +35,10 @@ class AutoMagicCard extends LitElement {
       _summary: { type: String },
       _parsedAutomation: { type: Object },
       _error: { type: String },
+      _generationJobId: { type: String },
+      _loadingMessage: { type: String },
+      _loadingDetail: { type: String },
+      _loadingElapsedSeconds: { type: Number },
       _installedAlias: { type: String },
       _showYaml: { type: Boolean },
       _entityCount: { type: Number },
@@ -53,12 +57,17 @@ class AutoMagicCard extends LitElement {
     this._summary = "";
     this._parsedAutomation = null;
     this._error = "";
+    this._generationJobId = "";
+    this._loadingMessage = "";
+    this._loadingDetail = "";
+    this._loadingElapsedSeconds = 0;
     this._installedAlias = "";
     this._showYaml = false;
     this._entityCount = 0;
     this._history = [];
     this._expandedHistory = -1;
     this._isPanel = false;
+    this._statusPollHandle = null;
   }
 
   setConfig(config) {
@@ -73,6 +82,11 @@ class AutoMagicCard extends LitElement {
     super.connectedCallback();
     this._fetchEntityCount();
     this._fetchHistory();
+  }
+
+  disconnectedCallback() {
+    this._clearGenerationPolling();
+    super.disconnectedCallback();
   }
 
   async _fetchEntityCount() {
@@ -123,8 +137,15 @@ class AutoMagicCard extends LitElement {
     const prompt = this._prompt.trim();
     if (!prompt) return;
 
+    this._clearGenerationPolling();
     this._state = STATES.LOADING;
     this._error = "";
+    this._yaml = "";
+    this._summary = "";
+    this._parsedAutomation = null;
+    this._loadingMessage = "Submitting your request...";
+    this._loadingElapsedSeconds = 0;
+    this._loadingDetail = "Submitting your request to the server.";
 
     try {
       const result = await this._apiPost("/api/automagic/generate", {
@@ -137,10 +158,13 @@ class AutoMagicCard extends LitElement {
         return;
       }
 
-      this._yaml = result.yaml || "";
-      this._summary = result.summary || "";
-      this._parsedAutomation = this._parseYaml(this._yaml);
-      this._state = STATES.PREVIEW;
+      if (!result.job_id) {
+        throw new Error("Server did not return a generation job id");
+      }
+
+      this._generationJobId = result.job_id;
+      this._updateLoadingState(result);
+      this._scheduleGenerationPoll(result.poll_after_ms || 1000);
     } catch (err) {
       this._state = STATES.ERROR;
       this._error = `Request failed: ${err.message}`;
@@ -175,19 +199,106 @@ class AutoMagicCard extends LitElement {
   }
 
   _handleReset() {
+    this._clearGenerationPolling();
     this._state = STATES.IDLE;
     this._prompt = "";
     this._yaml = "";
     this._summary = "";
     this._parsedAutomation = null;
     this._error = "";
+    this._generationJobId = "";
+    this._loadingMessage = "";
+    this._loadingDetail = "";
+    this._loadingElapsedSeconds = 0;
     this._installedAlias = "";
     this._showYaml = false;
   }
 
   _handleRetry() {
+    this._clearGenerationPolling();
     this._state = STATES.IDLE;
     this._error = "";
+    this._generationJobId = "";
+    this._loadingMessage = "";
+    this._loadingDetail = "";
+    this._loadingElapsedSeconds = 0;
+  }
+
+  _clearGenerationPolling() {
+    if (this._statusPollHandle !== null) {
+      window.clearTimeout(this._statusPollHandle);
+      this._statusPollHandle = null;
+    }
+  }
+
+  _scheduleGenerationPoll(delayMs = 2000) {
+    this._clearGenerationPolling();
+    this._statusPollHandle = window.setTimeout(() => {
+      this._pollGenerationJob();
+    }, delayMs);
+  }
+
+  async _pollGenerationJob() {
+    if (!this._generationJobId || this._state !== STATES.LOADING) return;
+
+    try {
+      const result = await this._apiGet(`/api/automagic/generate/${this._generationJobId}`);
+
+      if (result.error && !result.status) {
+        this._clearGenerationPolling();
+        this._state = STATES.ERROR;
+        this._error = result.error;
+        return;
+      }
+
+      this._updateLoadingState(result);
+
+      if (result.status === "completed") {
+        this._clearGenerationPolling();
+        this._yaml = result.yaml || "";
+        this._summary = result.summary || "";
+        this._parsedAutomation = this._parseYaml(this._yaml);
+        this._generationJobId = "";
+        this._state = STATES.PREVIEW;
+        return;
+      }
+
+      if (result.status === "error") {
+        this._clearGenerationPolling();
+        this._generationJobId = "";
+        this._state = STATES.ERROR;
+        this._error = result.error || "Generation failed";
+        return;
+      }
+
+      this._scheduleGenerationPoll(result.poll_after_ms || 2000);
+    } catch (err) {
+      this._clearGenerationPolling();
+      this._state = STATES.ERROR;
+      this._error = `Request failed: ${err.message}`;
+    }
+  }
+
+  _updateLoadingState(result) {
+    this._loadingElapsedSeconds = Number(result.elapsed_seconds || 0);
+
+    const statusMessage = result.message || "Generating your automation...";
+    const detailParts = [];
+    if (result.detail) detailParts.push(result.detail);
+    if (result.backend_status && result.backend_status.message) {
+      detailParts.push(result.backend_status.message);
+    }
+
+    if (detailParts.length === 0) {
+      detailParts.push(
+        this._loadingElapsedSeconds >= 60
+          ? "The request is still active on the server. Slower local models can take a few minutes."
+          : "This can take a few minutes depending on your model and hardware."
+      );
+    }
+
+    this._loadingMessage = statusMessage;
+    this._loadingDetail = detailParts.join(" ");
   }
 
   _parseYaml(yamlStr) {
@@ -305,6 +416,13 @@ class AutoMagicCard extends LitElement {
     }
   }
 
+  _formatDuration(totalSeconds) {
+    const seconds = Math.max(0, Number(totalSeconds || 0));
+    const minutes = Math.floor(seconds / 60);
+    const remainder = String(seconds % 60).padStart(2, "0");
+    return `${minutes}:${remainder}`;
+  }
+
   render() {
     return html`
       <div class="root ${this._isPanel ? "panel-mode" : ""}">
@@ -410,8 +528,9 @@ class AutoMagicCard extends LitElement {
     return html`
       <div class="loading-section">
         <ha-circular-progress indeterminate></ha-circular-progress>
-        <p class="loading-text">Generating your automation...</p>
-        <p class="loading-sub">This may take a moment depending on your model</p>
+        <p class="loading-text">${this._loadingMessage || "Generating your automation..."}</p>
+        <p class="loading-sub">${this._loadingDetail}</p>
+        <span class="loading-meta">Elapsed: ${this._formatDuration(this._loadingElapsedSeconds)}</span>
       </div>
     `;
   }
@@ -848,6 +967,19 @@ class AutoMagicCard extends LitElement {
         color: var(--secondary-text-color);
         font-size: 0.85em;
         margin: 0;
+        text-align: center;
+        line-height: 1.5;
+        max-width: 32rem;
+      }
+      .loading-meta {
+        font-size: 0.78em;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: var(--secondary-text-color);
+        padding: 5px 10px;
+        border-radius: 999px;
+        border: 1px solid var(--divider-color);
       }
 
       /* Preview */

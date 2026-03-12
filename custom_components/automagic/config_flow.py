@@ -16,9 +16,11 @@ from .const import (
     CONF_ENDPOINT_URL,
     CONF_MAX_TOKENS,
     CONF_MODEL,
+    CONF_REQUEST_TIMEOUT,
     CONF_TEMPERATURE,
     DEFAULT_ENDPOINT,
     DEFAULT_LOCAL_MAX_TOKENS,
+    DEFAULT_REQUEST_TIMEOUT,
     DEFAULT_TEMPERATURE,
     DOMAIN,
     MODEL_MAX_TOKENS_MAP,
@@ -104,6 +106,7 @@ class AutoMagicConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     CONF_MODEL: model,
                     CONF_TEMPERATURE: _get_model_temperature(model),
                     CONF_MAX_TOKENS: _get_model_max_tokens(model),
+                    CONF_REQUEST_TIMEOUT: DEFAULT_REQUEST_TIMEOUT,
                 }
 
                 await self.async_set_unique_id(DOMAIN)
@@ -157,6 +160,8 @@ class AutoMagicOptionsFlow(config_entries.OptionsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         """Manage the options — endpoint URL and optional model override."""
+        current = self._config_entry.data
+
         if user_input is not None:
             endpoint_url = user_input[CONF_ENDPOINT_URL].rstrip("/")
             model = user_input.get(CONF_MODEL, "").strip()
@@ -175,6 +180,10 @@ class AutoMagicOptionsFlow(config_entries.OptionsFlow):
                 CONF_MODEL: model,
                 CONF_TEMPERATURE: _get_model_temperature(model),
                 CONF_MAX_TOKENS: _get_model_max_tokens(model),
+                CONF_REQUEST_TIMEOUT: user_input.get(
+                    CONF_REQUEST_TIMEOUT,
+                    current.get(CONF_REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT),
+                ),
             }
             self.hass.config_entries.async_update_entry(
                 self._config_entry,
@@ -182,8 +191,6 @@ class AutoMagicOptionsFlow(config_entries.OptionsFlow):
                 title=f"AutoMagic ({model})",
             )
             return self.async_create_entry(title="", data={})
-
-        current = self._config_entry.data
 
         # Fetch available models for display
         endpoint_url = current.get(CONF_ENDPOINT_URL, DEFAULT_ENDPOINT)
@@ -210,6 +217,12 @@ class AutoMagicOptionsFlow(config_entries.OptionsFlow):
                         CONF_MODEL,
                         default=current.get(CONF_MODEL, ""),
                     ): model_schema,
+                    vol.Optional(
+                        CONF_REQUEST_TIMEOUT,
+                        default=current.get(
+                            CONF_REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT
+                        ),
+                    ): vol.All(int, vol.Range(min=60, max=1800)),
                 }
             ),
         )

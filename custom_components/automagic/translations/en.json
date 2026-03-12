@@ -21,10 +21,11 @@
     "step": {
       "init": {
         "title": "AutoMagic Settings",
-        "description": "Change endpoint or override the auto-detected model.",
+        "description": "Change endpoint, override the auto-detected model, or increase how long AutoMagic waits for a generation request.",
         "data": {
           "endpoint_url": "LLM Endpoint URL",
-          "model": "Model (leave empty for auto-detect)"
+          "model": "Model (leave empty for auto-detect)",
+          "request_timeout": "Generation timeout (seconds)"
         }
       }
     }

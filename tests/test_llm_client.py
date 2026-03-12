@@ -171,12 +171,14 @@ async def test_from_config():
         "endpoint_url": "http://localhost:1234",
         "model": "gpt-4o",
         "max_tokens": 4096,
+        "request_timeout": 480,
         "temperature": 0.5,
     }
     client = LLMClient.from_config(config)
     assert client._endpoint_url == "http://localhost:1234"
     assert client._model == "gpt-4o"
     assert client._max_tokens == 4096
+    assert client._request_timeout == 480
     assert client._temperature == 0.5
 
 
@@ -226,3 +228,38 @@ async def test_fetch_models_both_fail():
 
     models = await fetch_models("http://localhost:11434", session=FailSession())
     assert models == []
+
+
+@pytest.mark.asyncio
+async def test_probe_generation_status_reports_active_ollama_model():
+    """Ollama /api/ps should surface active model status."""
+    resp = FakeResponse(200, {"models": [{"name": "qwen2.5:14b"}]})
+    session = FakeSession(resp)
+
+    client = LLMClient(
+        endpoint_url="http://localhost:11434",
+        model="qwen2.5:14b",
+        session=session,
+    )
+    status = await client.probe_generation_status()
+
+    assert status["available"] is True
+    assert status["backend"] == "ollama"
+    assert status["active"] is True
+    assert "still running" in status["message"]
+
+
+@pytest.mark.asyncio
+async def test_probe_generation_status_handles_non_ollama_endpoint():
+    """Non-Ollama endpoints should simply report no backend probe support."""
+    resp = FakeResponse(404, "Not found")
+    session = FakeSession(resp)
+
+    client = LLMClient(
+        endpoint_url="http://localhost:1234",
+        model="gpt-4o-mini",
+        session=session,
+    )
+    status = await client.probe_generation_status()
+
+    assert status["available"] is False

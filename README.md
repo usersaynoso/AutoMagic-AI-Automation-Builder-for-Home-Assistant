@@ -24,7 +24,13 @@
 - A running OpenAI-compatible LLM endpoint (e.g. [Ollama](https://ollama.ai))
 
 ## Installation
-### HACS (Recommended)
+### HACS (After Default Listing Approval)
+1. Open HACS in Home Assistant
+2. Search for **AutoMagic - AI Automation Builder**
+3. Open the integration page and click **Download**
+4. Restart Home Assistant
+
+### HACS (Until Approval, via Custom Repository)
 1. Open HACS in Home Assistant
 2. Click the three dots menu → **Custom repositories**
 3. Add `https://github.com/usersaynoso/AutoMagic---AI-Automation-Builder-for-Home-Assistant` and select **Integration** as the category

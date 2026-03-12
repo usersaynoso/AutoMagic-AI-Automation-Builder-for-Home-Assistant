@@ -13,29 +13,21 @@ from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import (
-    CONF_CONTEXT_LIMIT,
     CONF_ENDPOINT_URL,
     CONF_MAX_TOKENS,
     CONF_MODEL,
     CONF_TEMPERATURE,
-    DEFAULT_CONTEXT_LIMIT,
     DEFAULT_ENDPOINT,
-    DEFAULT_MAX_TOKENS,
+    DEFAULT_LOCAL_MAX_TOKENS,
     DEFAULT_TEMPERATURE,
     DOMAIN,
+    MODEL_MAX_TOKENS_MAP,
+    MODEL_TEMPERATURE_MAP,
+    PREFERRED_MODEL_ORDER,
 )
 from .llm_client import fetch_models
 
 _LOGGER = logging.getLogger(__name__)
-
-_PREFERRED_MODEL_ORDER = [
-    "qwen2.5:14b",
-    "qwen2.5:7b",
-    "mistral-nemo",
-    "qwen2.5:3b",
-    "gpt-4o-mini",
-    "gpt-4o",
-]
 
 
 def _pick_default_model(models: list[str]) -> str:
@@ -45,16 +37,34 @@ def _pick_default_model(models: list[str]) -> str:
 
     normalized = {model.lower(): model for model in models}
 
-    for preferred in _PREFERRED_MODEL_ORDER:
+    for preferred in PREFERRED_MODEL_ORDER:
         if preferred in normalized:
             return normalized[preferred]
 
-    for preferred in _PREFERRED_MODEL_ORDER:
+    for preferred in PREFERRED_MODEL_ORDER:
         for model in models:
             if model.lower().startswith(preferred):
                 return model
 
     return models[0]
+
+
+def _get_model_temperature(model: str) -> float:
+    """Return the optimal temperature for a given model."""
+    model_lower = model.lower()
+    for prefix, temp in MODEL_TEMPERATURE_MAP.items():
+        if model_lower.startswith(prefix):
+            return temp
+    return DEFAULT_TEMPERATURE
+
+
+def _get_model_max_tokens(model: str) -> int:
+    """Return the optimal max_tokens for a given model."""
+    model_lower = model.lower()
+    for prefix, tokens in MODEL_MAX_TOKENS_MAP.items():
+        if model_lower.startswith(prefix):
+            return tokens
+    return DEFAULT_LOCAL_MAX_TOKENS
 
 
 class AutoMagicConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -71,14 +81,13 @@ class AutoMagicConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Step 1: Connection - get LLM endpoint URL."""
+        """Single-step setup: enter endpoint URL, everything else auto-detected."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
             endpoint_url = user_input[CONF_ENDPOINT_URL].rstrip("/")
             self._endpoint_url = endpoint_url
 
-            # Try to fetch model list to verify connectivity
             session = async_get_clientsession(self.hass)
             try:
                 models = await fetch_models(endpoint_url, session=session)
@@ -88,19 +97,31 @@ class AutoMagicConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if models:
                 self._models = models
                 self._detected_model = _pick_default_model(models)
-                return await self.async_step_model()
 
-            # If no models returned, check if endpoint is reachable at all
+                model = self._detected_model or models[0]
+                data = {
+                    CONF_ENDPOINT_URL: endpoint_url,
+                    CONF_MODEL: model,
+                    CONF_TEMPERATURE: _get_model_temperature(model),
+                    CONF_MAX_TOKENS: _get_model_max_tokens(model),
+                }
+
+                await self.async_set_unique_id(DOMAIN)
+                self._abort_if_unique_id_configured()
+
+                return self.async_create_entry(
+                    title=f"AutoMagic ({model})",
+                    data=data,
+                )
+
+            # Endpoint reachable but no models? Let user enter manually
             import aiohttp
 
             try:
                 async with session.get(
                     endpoint_url, timeout=aiohttp.ClientTimeout(total=5)
                 ) as resp:
-                    # Endpoint is reachable but no models found - allow manual entry
-                    self._models = []
-                    self._detected_model = ""
-                    return await self.async_step_model()
+                    errors["base"] = "no_models"
             except (aiohttp.ClientError, TimeoutError):
                 errors["base"] = "cannot_connect"
 
@@ -114,55 +135,6 @@ class AutoMagicConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 }
             ),
             errors=errors,
-        )
-
-    async def async_step_model(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Step 2: Model selection and parameters."""
-        if user_input is not None:
-            # Combine with endpoint from step 1
-            data = {
-                CONF_ENDPOINT_URL: self._endpoint_url,
-                CONF_MODEL: user_input[CONF_MODEL],
-                CONF_MAX_TOKENS: user_input.get(CONF_MAX_TOKENS, DEFAULT_MAX_TOKENS),
-                CONF_TEMPERATURE: user_input.get(CONF_TEMPERATURE, DEFAULT_TEMPERATURE),
-                CONF_CONTEXT_LIMIT: user_input.get(CONF_CONTEXT_LIMIT, DEFAULT_CONTEXT_LIMIT),
-            }
-
-            await self.async_set_unique_id(DOMAIN)
-            self._abort_if_unique_id_configured()
-
-            return self.async_create_entry(
-                title=f"AutoMagic ({data[CONF_MODEL]})",
-                data=data,
-            )
-
-        # Build model selector
-        if self._models:
-            model_schema = vol.In(self._models)
-        else:
-            model_schema = str
-
-        return self.async_show_form(
-            step_id="model",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(
-                        CONF_MODEL,
-                        default=self._detected_model,
-                    ): model_schema,
-                    vol.Optional(
-                        CONF_MAX_TOKENS, default=DEFAULT_MAX_TOKENS
-                    ): vol.All(int, vol.Range(min=256, max=8192)),
-                    vol.Optional(
-                        CONF_TEMPERATURE, default=DEFAULT_TEMPERATURE
-                    ): vol.All(float, vol.Range(min=0.0, max=1.0)),
-                    vol.Optional(
-                        CONF_CONTEXT_LIMIT, default=DEFAULT_CONTEXT_LIMIT
-                    ): vol.All(int, vol.Range(min=1, max=500)),
-                }
-            ),
         )
 
     @staticmethod
@@ -184,27 +156,42 @@ class AutoMagicOptionsFlow(config_entries.OptionsFlow):
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Manage the options."""
+        """Manage the options — endpoint URL and optional model override."""
         if user_input is not None:
-            new_data = {**self._config_entry.data, **user_input}
+            endpoint_url = user_input[CONF_ENDPOINT_URL].rstrip("/")
+            model = user_input.get(CONF_MODEL, "").strip()
+
+            # Re-fetch models if endpoint changed or no model specified
+            if not model:
+                session = async_get_clientsession(self.hass)
+                try:
+                    models = await fetch_models(endpoint_url, session=session)
+                except Exception:
+                    models = []
+                model = _pick_default_model(models) or self._config_entry.data.get(CONF_MODEL, "")
+
+            new_data = {
+                CONF_ENDPOINT_URL: endpoint_url,
+                CONF_MODEL: model,
+                CONF_TEMPERATURE: _get_model_temperature(model),
+                CONF_MAX_TOKENS: _get_model_max_tokens(model),
+            }
             self.hass.config_entries.async_update_entry(
                 self._config_entry,
                 data=new_data,
-                title=f"AutoMagic ({new_data.get(CONF_MODEL, '')})",
+                title=f"AutoMagic ({model})",
             )
             return self.async_create_entry(title="", data={})
 
         current = self._config_entry.data
-        endpoint_url = current.get(CONF_ENDPOINT_URL, DEFAULT_ENDPOINT)
 
-        # Fetch models for the selector
+        # Fetch available models for display
+        endpoint_url = current.get(CONF_ENDPOINT_URL, DEFAULT_ENDPOINT)
         session = async_get_clientsession(self.hass)
         try:
             models = await fetch_models(endpoint_url, session=session)
         except Exception:
             models = []
-
-        detected_model = _pick_default_model(models)
 
         if models:
             model_schema = vol.In(models)
@@ -216,21 +203,13 @@ class AutoMagicOptionsFlow(config_entries.OptionsFlow):
             data_schema=vol.Schema(
                 {
                     vol.Required(
+                        CONF_ENDPOINT_URL,
+                        default=current.get(CONF_ENDPOINT_URL, DEFAULT_ENDPOINT),
+                    ): str,
+                    vol.Optional(
                         CONF_MODEL,
-                        default=current.get(CONF_MODEL) or detected_model,
+                        default=current.get(CONF_MODEL, ""),
                     ): model_schema,
-                    vol.Optional(
-                        CONF_MAX_TOKENS,
-                        default=current.get(CONF_MAX_TOKENS, DEFAULT_MAX_TOKENS),
-                    ): vol.All(int, vol.Range(min=256, max=8192)),
-                    vol.Optional(
-                        CONF_TEMPERATURE,
-                        default=current.get(CONF_TEMPERATURE, DEFAULT_TEMPERATURE),
-                    ): vol.All(float, vol.Range(min=0.0, max=1.0)),
-                    vol.Optional(
-                        CONF_CONTEXT_LIMIT,
-                        default=current.get(CONF_CONTEXT_LIMIT, DEFAULT_CONTEXT_LIMIT),
-                    ): vol.All(int, vol.Range(min=1, max=500)),
                 }
             ),
         )

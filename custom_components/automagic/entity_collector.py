@@ -14,9 +14,12 @@ _LOGGER = logging.getLogger(__name__)
 
 
 async def get_entity_context(
-    hass: HomeAssistant, max_entities: int = 40
+    hass: HomeAssistant, max_entities: int = 0
 ) -> list[dict[str, Any]]:
-    """Pull entities from the registry and return a prioritised, truncated list.
+    """Pull entities from the registry and return a prioritised list.
+
+    Args:
+        max_entities: Maximum entities to return. 0 means all entities.
 
     Returns a list of dicts with keys:
         entity_id, name, domain, state, device_class
@@ -66,18 +69,18 @@ async def get_entity_context(
         )
     )
 
-    truncated = entities[:max_entities]
+    truncated = entities[:max_entities] if max_entities > 0 else entities
     _LOGGER.debug(
-        "Entity collector: %d total, returning %d (limit %d)",
+        "Entity collector: %d total, returning %d (limit %s)",
         len(entities),
         len(truncated),
-        max_entities,
+        max_entities or "all",
     )
     return truncated
 
 
 async def get_entity_summary_string(
-    hass: HomeAssistant, max_entities: int = 40
+    hass: HomeAssistant, max_entities: int = 0
 ) -> str:
     """Return a compact string of entities for injection into the LLM prompt.
 

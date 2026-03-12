@@ -11,7 +11,12 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 
-from .api import AutoMagicEntitiesView, AutoMagicGenerateView, AutoMagicInstallView
+from .api import (
+    AutoMagicEntitiesView,
+    AutoMagicGenerateView,
+    AutoMagicHistoryView,
+    AutoMagicInstallView,
+)
 from .const import DOMAIN
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
@@ -48,6 +53,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.http.register_view(AutoMagicGenerateView())
         hass.http.register_view(AutoMagicInstallView())
         hass.http.register_view(AutoMagicEntitiesView())
+        hass.http.register_view(AutoMagicHistoryView())
         domain_data[_DATA_VIEWS_REGISTERED] = True
 
     # Make the card JS available as a Lovelace resource so users can add

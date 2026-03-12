@@ -3,24 +3,15 @@
     "step": {
       "user": {
         "title": "Connect to LLM",
-        "description": "Enter the URL of your OpenAI-compatible LLM endpoint. Ollama default is http://localhost:11434 — no other Ollama config needed.",
+        "description": "Enter the URL of your OpenAI-compatible LLM endpoint.\n\nOllama default: http://localhost:11434\n\nAutoMagic will auto-detect the best available model and configure everything for you.",
         "data": {
           "endpoint_url": "LLM Endpoint URL"
-        }
-      },
-      "model": {
-        "title": "Model Settings",
-        "description": "Select the model and configure generation parameters.",
-        "data": {
-          "model": "Model",
-          "max_tokens": "Max Tokens",
-          "temperature": "Temperature",
-          "context_limit": "Entity Context Limit"
         }
       }
     },
     "error": {
-      "cannot_connect": "Cannot connect to LLM endpoint. Check the URL and ensure the server is running."
+      "cannot_connect": "Cannot connect to LLM endpoint. Check the URL and ensure the server is running.",
+      "no_models": "Connected but no models found. Install a model first (e.g. ollama pull qwen2.5:7b)."
     },
     "abort": {
       "already_configured": "AutoMagic is already configured."
@@ -30,11 +21,10 @@
     "step": {
       "init": {
         "title": "AutoMagic Settings",
+        "description": "Change endpoint or override the auto-detected model.",
         "data": {
-          "model": "Model",
-          "max_tokens": "Max Tokens",
-          "temperature": "Temperature",
-          "context_limit": "Entity Context Limit"
+          "endpoint_url": "LLM Endpoint URL",
+          "model": "Model (leave empty for auto-detect)"
         }
       }
     }

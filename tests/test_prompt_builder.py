@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from custom_components.automagic.config_flow import _pick_default_model
+from custom_components.automagic.config_flow import (
+    _pick_default_model,
+    _get_model_temperature,
+    _get_model_max_tokens,
+)
 from custom_components.automagic.prompt_builder import build_prompt, SYSTEM_PROMPT
 
 
@@ -87,3 +91,27 @@ class TestPickDefaultModel:
     def test_empty_model_list_returns_empty_string(self):
         """No models means no auto-detected default."""
         assert _pick_default_model([]) == ""
+
+
+class TestModelTemperature:
+    """Tests for per-model temperature selection."""
+
+    def test_known_model_gets_specific_temp(self):
+        assert _get_model_temperature("qwen2.5:7b") == 0.15
+        assert _get_model_temperature("gpt-4o-mini") == 0.1
+        assert _get_model_temperature("mistral-nemo:latest") == 0.2
+
+    def test_unknown_model_gets_default(self):
+        from custom_components.automagic.const import DEFAULT_TEMPERATURE
+        assert _get_model_temperature("totally-unknown-model") == DEFAULT_TEMPERATURE
+
+
+class TestModelMaxTokens:
+    """Tests for per-model max_tokens selection."""
+
+    def test_known_cloud_model(self):
+        assert _get_model_max_tokens("gpt-4o") == 4096
+
+    def test_unknown_model_gets_local_default(self):
+        from custom_components.automagic.const import DEFAULT_LOCAL_MAX_TOKENS
+        assert _get_model_max_tokens("custom-local-model") == DEFAULT_LOCAL_MAX_TOKENS

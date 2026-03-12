@@ -36,6 +36,15 @@ def test_manifest_declares_single_config_entry_service_integration():
     assert manifest["version"] == "0.2.0"
 
 
+def test_manifest_keys_follow_home_assistant_ordering_rules():
+    """Hassfest requires domain, name, then alphabetical ordering."""
+    manifest = _read_json(MANIFEST_PATH)
+    keys = list(manifest.keys())
+
+    assert keys[:2] == ["domain", "name"]
+    assert keys[2:] == sorted(keys[2:])
+
+
 def test_hacs_config_targets_supported_home_assistant_version():
     """HACS metadata should advertise the supported minimum HA version."""
     hacs_config = _read_json(HACS_CONFIG_PATH)
@@ -56,6 +65,10 @@ def test_validate_workflow_runs_hacs_without_skipping_brands():
     workflow = _read_workflow(WORKFLOW_PATH)
 
     assert "workflow_dispatch" in workflow["on"]
+    assert workflow["jobs"]["hacs"]["steps"][0]["uses"] == "actions/checkout@v5"
+    assert workflow["jobs"]["hassfest"]["steps"][0]["uses"] == "actions/checkout@v5"
+    assert workflow["jobs"]["tests"]["steps"][0]["uses"] == "actions/checkout@v5"
+    assert workflow["jobs"]["tests"]["steps"][1]["uses"] == "actions/setup-python@v6"
 
     hacs_step = next(
         step for step in workflow["jobs"]["hacs"]["steps"]

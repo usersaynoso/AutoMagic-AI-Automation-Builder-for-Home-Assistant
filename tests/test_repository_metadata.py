@@ -14,6 +14,10 @@ HACS_CONFIG_PATH = REPO_ROOT / "hacs.json"
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "validate.yml"
 BRAND_DIR = REPO_ROOT / "custom_components" / "automagic" / "brand"
 AGENTS_PATH = REPO_ROOT / "AGENTS.md"
+STRINGS_PATH = REPO_ROOT / "custom_components" / "automagic" / "strings.json"
+TRANSLATION_PATH = (
+    REPO_ROOT / "custom_components" / "automagic" / "translations" / "en.json"
+)
 
 
 def _read_json(path: Path) -> dict:
@@ -34,7 +38,7 @@ def test_manifest_declares_single_config_entry_service_integration():
     assert manifest["config_flow"] is True
     assert manifest["integration_type"] == "service"
     assert manifest["single_config_entry"] is True
-    assert manifest["version"] == "0.2.6"
+    assert manifest["version"] == "0.2.7"
 
 
 def test_manifest_keys_follow_home_assistant_ordering_rules():
@@ -69,6 +73,18 @@ def test_local_brand_assets_exist_for_hacs_validation():
     """HACS default repo validation accepts a local brand directory."""
     assert (BRAND_DIR / "icon.png").is_file()
     assert (BRAND_DIR / "logo.png").is_file()
+
+
+def test_subentry_translations_define_initiate_flow_labels():
+    """Hassfest requires config subentry initiate-flow labels in both files."""
+    strings = _read_json(STRINGS_PATH)
+    translation = _read_json(TRANSLATION_PATH)
+
+    assert strings["config_subentries"]["service"]["initiate_flow"]["user"] == "Add service"
+    assert (
+        translation["config_subentries"]["service"]["initiate_flow"]["user"]
+        == "Add service"
+    )
 
 
 def test_validate_workflow_runs_hacs_without_skipping_brands():

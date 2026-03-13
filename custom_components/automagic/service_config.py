@@ -7,10 +7,12 @@ from typing import Any, Mapping
 from urllib.parse import urlparse
 
 from .const import (
+    CONF_API_KEY,
     CONF_DEFAULT_SERVICE_ID,
     CONF_ENDPOINT_URL,
     CONF_MAX_TOKENS,
     CONF_MODEL,
+    CONF_PROVIDER,
     CONF_REQUEST_TIMEOUT,
     CONF_SERVICE_ID,
     CONF_SERVICES,
@@ -20,7 +22,10 @@ from .const import (
     DEFAULT_TEMPERATURE,
     MODEL_MAX_TOKENS_MAP,
     MODEL_TEMPERATURE_MAP,
+    OPENAI_ENDPOINT,
     PREFERRED_MODEL_ORDER,
+    PROVIDER_CUSTOM,
+    PROVIDER_OPENAI,
 )
 
 
@@ -88,22 +93,48 @@ def _normalize_temperature(value: Any, model: str) -> float:
     return max(0.0, min(temperature, 2.0))
 
 
+def _normalize_provider(provider: Any, endpoint_url: str, api_key: str) -> str:
+    """Return the normalized provider name for a service."""
+    normalized_provider = str(provider or "").strip().lower()
+    if normalized_provider in {PROVIDER_CUSTOM, PROVIDER_OPENAI}:
+        return normalized_provider
+
+    parsed = urlparse(endpoint_url)
+    hostname = (parsed.hostname or "").lower()
+    if api_key and hostname == "api.openai.com":
+        return PROVIDER_OPENAI
+    return PROVIDER_CUSTOM
+
+
 def build_service_config(
     endpoint_url: str,
     model: str,
     *,
     service_id: str | None = None,
+    provider: str | None = None,
+    api_key: str | None = None,
     max_tokens: int | None = None,
     request_timeout: int | None = None,
     temperature: float | None = None,
 ) -> dict[str, Any]:
     """Build a normalized AI service configuration."""
-    normalized_endpoint = str(endpoint_url or "").strip().rstrip("/")
     normalized_model = str(model or "").strip()
+    normalized_api_key = str(api_key or "").strip()
+    candidate_endpoint = str(endpoint_url or "").strip().rstrip("/")
+    normalized_provider = _normalize_provider(
+        provider,
+        candidate_endpoint,
+        normalized_api_key,
+    )
+    normalized_endpoint = (
+        OPENAI_ENDPOINT if normalized_provider == PROVIDER_OPENAI else candidate_endpoint
+    )
     resolved_service_id = str(service_id or "").strip() or uuid.uuid4().hex
 
     return {
         CONF_SERVICE_ID: resolved_service_id,
+        CONF_PROVIDER: normalized_provider,
+        CONF_API_KEY: normalized_api_key,
         CONF_ENDPOINT_URL: normalized_endpoint,
         CONF_MODEL: normalized_model,
         CONF_MAX_TOKENS: _normalize_max_tokens(max_tokens, normalized_model),
@@ -114,7 +145,11 @@ def build_service_config(
 
 def build_service_label(service: Mapping[str, Any]) -> str:
     """Return a human-readable label for a configured AI service."""
+    provider = str(service.get(CONF_PROVIDER, "") or "").strip().lower()
     model = str(service.get(CONF_MODEL, "") or "").strip()
+    if provider == PROVIDER_OPENAI:
+        return f"OpenAI: {model}" if model else "OpenAI"
+
     endpoint = str(service.get(CONF_ENDPOINT_URL, "") or "").strip()
     parsed = urlparse(endpoint)
     endpoint_label = parsed.netloc or parsed.path or endpoint
@@ -141,13 +176,19 @@ def normalize_config_data(data: Mapping[str, Any] | None) -> dict[str, Any]:
                 continue
             endpoint_url = str(raw_service.get(CONF_ENDPOINT_URL, "") or "").strip()
             model = str(raw_service.get(CONF_MODEL, "") or "").strip()
-            if not endpoint_url or not model:
+            provider = str(raw_service.get(CONF_PROVIDER, "") or "").strip().lower()
+            api_key = str(raw_service.get(CONF_API_KEY, "") or "").strip()
+            if not model:
+                continue
+            if provider != PROVIDER_OPENAI and not endpoint_url:
                 continue
             services.append(
                 build_service_config(
                     endpoint_url,
                     model,
                     service_id=str(raw_service.get(CONF_SERVICE_ID, "") or "").strip() or None,
+                    provider=provider or None,
+                    api_key=api_key or None,
                     max_tokens=raw_service.get(CONF_MAX_TOKENS),
                     request_timeout=raw_service.get(CONF_REQUEST_TIMEOUT),
                     temperature=raw_service.get(CONF_TEMPERATURE),
@@ -157,12 +198,16 @@ def normalize_config_data(data: Mapping[str, Any] | None) -> dict[str, Any]:
     if not services:
         endpoint_url = str(normalized.get(CONF_ENDPOINT_URL, "") or "").strip()
         model = str(normalized.get(CONF_MODEL, "") or "").strip()
-        if endpoint_url and model:
+        provider = str(normalized.get(CONF_PROVIDER, "") or "").strip().lower()
+        api_key = str(normalized.get(CONF_API_KEY, "") or "").strip()
+        if model and (endpoint_url or provider == PROVIDER_OPENAI):
             services.append(
                 build_service_config(
                     endpoint_url,
                     model,
                     service_id=str(normalized.get(CONF_SERVICE_ID, "") or "").strip() or None,
+                    provider=provider or None,
+                    api_key=api_key or None,
                     max_tokens=normalized.get(CONF_MAX_TOKENS),
                     request_timeout=normalized.get(CONF_REQUEST_TIMEOUT),
                     temperature=normalized.get(CONF_TEMPERATURE),
@@ -187,6 +232,8 @@ def normalize_config_data(data: Mapping[str, Any] | None) -> dict[str, Any]:
     )
 
     if default_service is not None:
+        normalized[CONF_PROVIDER] = default_service[CONF_PROVIDER]
+        normalized[CONF_API_KEY] = default_service[CONF_API_KEY]
         normalized[CONF_ENDPOINT_URL] = default_service[CONF_ENDPOINT_URL]
         normalized[CONF_MODEL] = default_service[CONF_MODEL]
         normalized[CONF_MAX_TOKENS] = default_service[CONF_MAX_TOKENS]
@@ -196,7 +243,9 @@ def normalize_config_data(data: Mapping[str, Any] | None) -> dict[str, Any]:
     return normalized
 
 
-def get_configured_services(config_data: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+def get_configured_services(
+    config_data: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
     """Return all configured AI services."""
     normalized = normalize_config_data(config_data)
     return [dict(service) for service in normalized.get(CONF_SERVICES, [])]

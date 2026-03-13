@@ -13,15 +13,19 @@ from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import (
+    CONF_API_KEY,
     CONF_DEFAULT_SERVICE_ID,
     CONF_ENDPOINT_URL,
     CONF_MODEL,
+    CONF_PROVIDER,
     CONF_REQUEST_TIMEOUT,
     CONF_SERVICE_ID,
     CONF_SERVICES,
     DEFAULT_ENDPOINT,
     DEFAULT_REQUEST_TIMEOUT,
     DOMAIN,
+    OPENAI_ENDPOINT,
+    PROVIDER_OPENAI,
 )
 from .llm_client import fetch_models
 from .service_config import (
@@ -65,7 +69,38 @@ async def _async_endpoint_is_reachable(hass, endpoint_url: str) -> bool:
         return False
 
 
-async def _async_resolve_service(
+async def _async_fetch_openai_models(
+    hass, api_key: str
+) -> tuple[list[str], str | None]:
+    """Fetch available OpenAI models with explicit API-key validation."""
+    normalized_api_key = str(api_key or "").strip()
+    if not normalized_api_key:
+        return [], "missing_api_key"
+
+    session = async_get_clientsession(hass)
+    try:
+        async with session.get(
+            f"{OPENAI_ENDPOINT}/v1/models",
+            timeout=aiohttp.ClientTimeout(total=10),
+            headers={"Authorization": f"Bearer {normalized_api_key}"},
+        ) as resp:
+            if resp.status in {401, 403}:
+                return [], "invalid_api_key"
+            if resp.status != 200:
+                return [], "cannot_connect"
+            data = await resp.json()
+    except (aiohttp.ClientError, TimeoutError, ValueError):
+        return [], "cannot_connect"
+
+    models = [
+        model["id"]
+        for model in data.get("data", [])
+        if isinstance(model, dict) and model.get("id")
+    ]
+    return sorted(models), None
+
+
+async def _async_resolve_endpoint_service(
     hass,
     endpoint_url: str,
     requested_model: str = "",
@@ -104,6 +139,41 @@ async def _async_resolve_service(
     )
 
 
+async def _async_resolve_openai_service(
+    hass,
+    api_key: str,
+    requested_model: str = "",
+    request_timeout: int = DEFAULT_REQUEST_TIMEOUT,
+    service_id: str | None = None,
+    existing_api_key: str = "",
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Validate an OpenAI API key/model pair and return service data."""
+    normalized_model = str(requested_model or "").strip()
+    normalized_api_key = str(api_key or "").strip() or str(existing_api_key or "").strip()
+
+    models, error = await _async_fetch_openai_models(hass, normalized_api_key)
+    if error is not None:
+        return None, error
+
+    if models and not normalized_model:
+        normalized_model = _pick_default_model(models) or models[0]
+
+    if not normalized_model:
+        return None, "no_models"
+
+    return (
+        build_service_config(
+            OPENAI_ENDPOINT,
+            normalized_model,
+            service_id=service_id,
+            provider=PROVIDER_OPENAI,
+            api_key=normalized_api_key,
+            request_timeout=request_timeout,
+        ),
+        None,
+    )
+
+
 def _entry_title(config_data: dict[str, Any]) -> str:
     """Return the config-entry title."""
     service = get_service_config(config_data)
@@ -131,7 +201,7 @@ class AutoMagicConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            service, error = await _async_resolve_service(
+            service, error = await _async_resolve_endpoint_service(
                 self.hass,
                 user_input[CONF_ENDPOINT_URL],
             )
@@ -206,6 +276,7 @@ class AutoMagicOptionsFlow(config_entries.OptionsFlow):
         services = get_configured_services(current)
         action_options = {
             "add_service": "Add AI service",
+            "add_openai_key": "Add OpenAI Key",
             "edit_service": "Edit AI service",
         }
         if len(services) > 1:
@@ -216,6 +287,8 @@ class AutoMagicOptionsFlow(config_entries.OptionsFlow):
             action = user_input.get("action")
             if action == "add_service":
                 return await self.async_step_add_service()
+            if action == "add_openai_key":
+                return await self.async_step_add_openai_key()
             if action == "edit_service":
                 return await self.async_step_edit_pick()
             if action == "delete_service":
@@ -237,12 +310,12 @@ class AutoMagicOptionsFlow(config_entries.OptionsFlow):
     async def async_step_add_service(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Add a new AI service."""
+        """Add a new URL-based AI service."""
         current = self._current_config()
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            service, error = await _async_resolve_service(
+            service, error = await _async_resolve_endpoint_service(
                 self.hass,
                 user_input[CONF_ENDPOINT_URL],
                 user_input.get(CONF_MODEL, ""),
@@ -283,6 +356,49 @@ class AutoMagicOptionsFlow(config_entries.OptionsFlow):
             errors=errors,
         )
 
+    async def async_step_add_openai_key(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Add a new OpenAI-backed AI service."""
+        current = self._current_config()
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            service, error = await _async_resolve_openai_service(
+                self.hass,
+                user_input.get(CONF_API_KEY, ""),
+                user_input.get(CONF_MODEL, ""),
+                user_input.get(CONF_REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT),
+            )
+            if service is not None:
+                services = get_configured_services(current)
+                services.append(service)
+                return self._update_entry(
+                    {
+                        **current,
+                        CONF_SERVICES: services,
+                        CONF_DEFAULT_SERVICE_ID: get_default_service_id(current)
+                        or service[CONF_SERVICE_ID],
+                    }
+                )
+            if error:
+                errors["base"] = error
+
+        return self.async_show_form(
+            step_id="add_openai_key",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_API_KEY): str,
+                    vol.Optional(CONF_MODEL, default=""): str,
+                    vol.Optional(
+                        CONF_REQUEST_TIMEOUT,
+                        default=DEFAULT_REQUEST_TIMEOUT,
+                    ): vol.All(int, vol.Range(min=60, max=1800)),
+                }
+            ),
+            errors=errors,
+        )
+
     async def async_step_edit_pick(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
@@ -294,6 +410,9 @@ class AutoMagicOptionsFlow(config_entries.OptionsFlow):
 
         if user_input is not None:
             self._selected_service_id = user_input[CONF_SERVICE_ID]
+            service = get_service_config(current, self._selected_service_id)
+            if service and service.get(CONF_PROVIDER) == PROVIDER_OPENAI:
+                return await self.async_step_edit_openai_key()
             return await self.async_step_edit_service()
 
         return self.async_show_form(
@@ -308,7 +427,7 @@ class AutoMagicOptionsFlow(config_entries.OptionsFlow):
     async def async_step_edit_service(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Edit an existing AI service."""
+        """Edit an existing URL-based AI service."""
         current = self._current_config()
         service = get_service_config(current, self._selected_service_id)
         if service is None:
@@ -316,7 +435,7 @@ class AutoMagicOptionsFlow(config_entries.OptionsFlow):
 
         errors: dict[str, str] = {}
         if user_input is not None:
-            updated_service, error = await _async_resolve_service(
+            updated_service, error = await _async_resolve_endpoint_service(
                 self.hass,
                 user_input[CONF_ENDPOINT_URL],
                 user_input.get(CONF_MODEL, ""),
@@ -350,6 +469,68 @@ class AutoMagicOptionsFlow(config_entries.OptionsFlow):
                         CONF_ENDPOINT_URL,
                         default=service.get(CONF_ENDPOINT_URL, DEFAULT_ENDPOINT),
                     ): str,
+                    vol.Optional(
+                        CONF_MODEL,
+                        default=service.get(CONF_MODEL, ""),
+                    ): str,
+                    vol.Optional(
+                        CONF_REQUEST_TIMEOUT,
+                        default=service.get(
+                            CONF_REQUEST_TIMEOUT,
+                            DEFAULT_REQUEST_TIMEOUT,
+                        ),
+                    ): vol.All(int, vol.Range(min=60, max=1800)),
+                }
+            ),
+            errors=errors,
+            description_placeholders={
+                "service_name": build_service_label(service),
+            },
+        )
+
+    async def async_step_edit_openai_key(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Edit an existing OpenAI-backed AI service."""
+        current = self._current_config()
+        service = get_service_config(current, self._selected_service_id)
+        if service is None:
+            return self.async_abort(reason="service_not_found")
+
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            updated_service, error = await _async_resolve_openai_service(
+                self.hass,
+                user_input.get(CONF_API_KEY, ""),
+                user_input.get(CONF_MODEL, ""),
+                user_input.get(
+                    CONF_REQUEST_TIMEOUT,
+                    service.get(CONF_REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT),
+                ),
+                service_id=service[CONF_SERVICE_ID],
+                existing_api_key=service.get(CONF_API_KEY, ""),
+            )
+            if updated_service is not None:
+                services = [
+                    updated_service
+                    if item.get(CONF_SERVICE_ID) == service[CONF_SERVICE_ID]
+                    else item
+                    for item in get_configured_services(current)
+                ]
+                return self._update_entry(
+                    {
+                        **current,
+                        CONF_SERVICES: services,
+                    }
+                )
+            if error:
+                errors["base"] = error
+
+        return self.async_show_form(
+            step_id="edit_openai_key",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(CONF_API_KEY, default=""): str,
                     vol.Optional(
                         CONF_MODEL,
                         default=service.get(CONF_MODEL, ""),

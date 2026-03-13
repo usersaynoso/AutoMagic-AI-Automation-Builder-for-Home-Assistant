@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from custom_components.automagic.const import (
+    CONF_API_KEY,
     CONF_DEFAULT_SERVICE_ID,
     CONF_ENDPOINT_URL,
     CONF_MODEL,
+    CONF_PROVIDER,
     CONF_REQUEST_TIMEOUT,
     CONF_SERVICE_ID,
     CONF_SERVICES,
+    PROVIDER_OPENAI,
 )
 from custom_components.automagic.service_config import (
     build_service_config,
@@ -76,3 +79,27 @@ def test_build_service_label_uses_model_and_host():
     )
 
     assert build_service_label(service) == "gpt-4o-mini (remote-host:1234)"
+
+
+def test_openai_service_uses_fixed_endpoint_and_provider_label():
+    """OpenAI-backed services should normalize to the hosted endpoint."""
+    service = build_service_config(
+        "",
+        "gpt-4o-mini",
+        service_id="openai",
+        provider=PROVIDER_OPENAI,
+        api_key="sk-test",
+    )
+    normalized = normalize_config_data(
+        {
+            CONF_SERVICES: [service],
+            CONF_DEFAULT_SERVICE_ID: "openai",
+        }
+    )
+
+    assert service[CONF_PROVIDER] == PROVIDER_OPENAI
+    assert service[CONF_ENDPOINT_URL] == "https://api.openai.com"
+    assert service[CONF_API_KEY] == "sk-test"
+    assert build_service_label(service) == "OpenAI: gpt-4o-mini"
+    assert normalized[CONF_PROVIDER] == PROVIDER_OPENAI
+    assert normalized[CONF_API_KEY] == "sk-test"

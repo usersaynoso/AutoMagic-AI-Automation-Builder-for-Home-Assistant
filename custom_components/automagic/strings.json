@@ -11,6 +11,8 @@
     },
     "error": {
       "cannot_connect": "Cannot connect to LLM endpoint. Check the URL and ensure the server is running.",
+      "invalid_api_key": "OpenAI rejected that API key. Paste a valid key and try again.",
+      "missing_api_key": "Paste an OpenAI API key to continue.",
       "no_models": "Connected but no models found. Install a model first (e.g. ollama pull qwen2.5:7b)."
     },
     "abort": {
@@ -24,6 +26,8 @@
     },
     "error": {
       "cannot_connect": "Cannot connect to LLM endpoint. Check the URL and ensure the server is running.",
+      "invalid_api_key": "OpenAI rejected that API key. Paste a valid key and try again.",
+      "missing_api_key": "Paste an OpenAI API key to continue.",
       "no_models": "Connected but no models found. Install a model first or enter the model name manually."
     },
     "step": {
@@ -43,6 +47,15 @@
           "request_timeout": "Generation timeout (seconds)"
         }
       },
+      "add_openai_key": {
+        "title": "Add OpenAI Key",
+        "description": "Add an OpenAI service by pasting an API key. AutoMagic uses OpenAI's hosted endpoint automatically, so no model URL is needed.",
+        "data": {
+          "api_key": "OpenAI API Key",
+          "model": "Model (leave empty for auto-detect)",
+          "request_timeout": "Generation timeout (seconds)"
+        }
+      },
       "edit_pick": {
         "title": "Choose AI Service",
         "description": "Pick which AI service to edit.",
@@ -55,6 +68,15 @@
         "description": "Update the endpoint, model, or timeout for the selected AI service.",
         "data": {
           "endpoint_url": "LLM Endpoint URL",
+          "model": "Model (leave empty for auto-detect)",
+          "request_timeout": "Generation timeout (seconds)"
+        }
+      },
+      "edit_openai_key": {
+        "title": "Edit OpenAI Key",
+        "description": "Update the OpenAI model or timeout. Leave the API key blank to keep the current key.",
+        "data": {
+          "api_key": "New OpenAI API Key",
           "model": "Model (leave empty for auto-detect)",
           "request_timeout": "Generation timeout (seconds)"
         }

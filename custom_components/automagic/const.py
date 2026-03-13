@@ -1,10 +1,12 @@
 """Constants for the AutoMagic integration."""
 
 DOMAIN = "automagic"
+CONF_API_KEY = "api_key"
 CONF_DEFAULT_SERVICE_ID = "default_service_id"
 CONF_ENDPOINT_URL = "endpoint_url"
 CONF_MODEL = "model"
 CONF_MAX_TOKENS = "max_tokens"
+CONF_PROVIDER = "provider"
 CONF_REQUEST_TIMEOUT = "request_timeout"
 CONF_SERVICE_ID = "service_id"
 CONF_SERVICES = "services"
@@ -15,6 +17,9 @@ DEFAULT_ENDPOINT = "http://localhost:11434"
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_REQUEST_TIMEOUT = 900
 DEFAULT_TEMPERATURE = 0.15
+OPENAI_ENDPOINT = "https://api.openai.com"
+PROVIDER_CUSTOM = "custom"
+PROVIDER_OPENAI = "openai"
 # 0 = send all entities (no artificial cap)
 DEFAULT_CONTEXT_LIMIT = 0
 

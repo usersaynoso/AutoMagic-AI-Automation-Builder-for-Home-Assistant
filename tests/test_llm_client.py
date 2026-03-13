@@ -59,11 +59,15 @@ class FakeSession:
 
     def __init__(self, response: FakeResponse):
         self._response = response
+        self.last_post = None
+        self.last_get = None
 
     def post(self, url, **kwargs):
+        self.last_post = {"url": url, "kwargs": kwargs}
         return self._response
 
     def get(self, url, **kwargs):
+        self.last_get = {"url": url, "kwargs": kwargs}
         return self._response
 
     async def close(self):
@@ -94,6 +98,33 @@ async def test_complete_success():
     assert result["summary"] == "A test automation"
     assert result["needs_clarification"] is False
     assert result["clarifying_questions"] == []
+
+
+@pytest.mark.asyncio
+async def test_complete_sends_bearer_token_for_openai_style_services():
+    """Configured API keys should be forwarded as bearer auth headers."""
+    content = json.dumps(
+        {
+            "yaml": "alias: Test",
+            "summary": "A test automation",
+            "needs_clarification": False,
+            "clarifying_questions": [],
+        }
+    )
+    resp = FakeResponse(200, _make_completion_response(content))
+    session = FakeSession(resp)
+
+    client = LLMClient(
+        endpoint_url="https://api.openai.com",
+        model="gpt-4o-mini",
+        api_key="sk-test",
+        session=session,
+    )
+    await client.complete([{"role": "user", "content": "test"}])
+
+    assert session.last_post["kwargs"]["headers"] == {
+        "Authorization": "Bearer sk-test"
+    }
 
 
 @pytest.mark.asyncio
@@ -331,6 +362,7 @@ async def test_from_config():
         "max_tokens": 4096,
         "request_timeout": 480,
         "temperature": 0.5,
+        "api_key": "sk-test",
     }
     client = LLMClient.from_config(config)
     assert client._endpoint_url == "http://localhost:1234"
@@ -338,6 +370,7 @@ async def test_from_config():
     assert client._max_tokens == 4096
     assert client._request_timeout == 480
     assert client._temperature == 0.5
+    assert client._api_key == "sk-test"
 
 
 def test_default_request_timeout_is_900_seconds():
@@ -361,6 +394,27 @@ async def test_fetch_models_openai_format():
     models = await fetch_models("http://localhost:1234", session=session)
     assert "gpt-3.5-turbo" in models
     assert "gpt-4o" in models
+
+
+@pytest.mark.asyncio
+async def test_fetch_models_openai_format_uses_bearer_token():
+    """OpenAI model discovery should include the configured bearer token."""
+    openai_resp = FakeResponse(
+        200,
+        {"data": [{"id": "gpt-4o-mini"}]},
+    )
+    session = FakeSession(openai_resp)
+
+    models = await fetch_models(
+        "https://api.openai.com",
+        session=session,
+        api_key="sk-openai",
+    )
+
+    assert models == ["gpt-4o-mini"]
+    assert session.last_get["kwargs"]["headers"] == {
+        "Authorization": "Bearer sk-openai"
+    }
 
 
 @pytest.mark.asyncio

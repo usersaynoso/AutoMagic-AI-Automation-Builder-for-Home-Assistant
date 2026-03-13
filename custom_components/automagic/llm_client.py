@@ -10,6 +10,7 @@ from typing import Any
 import aiohttp
 
 from .const import (
+    CONF_API_KEY,
     CONF_ENDPOINT_URL,
     CONF_MAX_TOKENS,
     CONF_MODEL,
@@ -226,6 +227,7 @@ class LLMClient:
         max_tokens: int = 2048,
         request_timeout: int = DEFAULT_REQUEST_TIMEOUT,
         temperature: float = 0.2,
+        api_key: str = "",
         session: aiohttp.ClientSession | None = None,
     ) -> None:
         self._endpoint_url = endpoint_url.rstrip("/")
@@ -233,6 +235,7 @@ class LLMClient:
         self._max_tokens = max_tokens
         self._request_timeout = request_timeout
         self._temperature = temperature
+        self._api_key = api_key.strip()
         self._session = session
 
     @classmethod
@@ -248,8 +251,15 @@ class LLMClient:
                 CONF_REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT
             ),
             temperature=config.get(CONF_TEMPERATURE, 0.2),
+            api_key=config.get(CONF_API_KEY, ""),
             session=session,
         )
+
+    def _request_headers(self) -> dict[str, str]:
+        """Return request headers for the configured provider."""
+        if not self._api_key:
+            return {}
+        return {"Authorization": f"Bearer {self._api_key}"}
 
     async def complete(self, messages: list[dict[str, str]]) -> dict[str, Any]:
         """Send messages to the LLM and return parsed JSON content.
@@ -276,7 +286,10 @@ class LLMClient:
             session = self._session or aiohttp.ClientSession()
             try:
                 async with session.post(
-                    url, json=payload, timeout=timeout
+                    url,
+                    json=payload,
+                    timeout=timeout,
+                    headers=self._request_headers(),
                 ) as resp:
                     if resp.status != 200:
                         body = await resp.text()
@@ -310,7 +323,11 @@ class LLMClient:
         try:
             session = self._session or aiohttp.ClientSession()
             try:
-                async with session.get(url, timeout=timeout) as resp:
+                async with session.get(
+                    url,
+                    timeout=timeout,
+                    headers=self._request_headers(),
+                ) as resp:
                     if resp.status != 200:
                         return {
                             "available": False,
@@ -445,7 +462,9 @@ class LLMClient:
 
 
 async def fetch_models(
-    endpoint_url: str, session: aiohttp.ClientSession | None = None
+    endpoint_url: str,
+    session: aiohttp.ClientSession | None = None,
+    api_key: str = "",
 ) -> list[str]:
     """Fetch available models from an LLM endpoint.
 
@@ -454,6 +473,11 @@ async def fetch_models(
     """
     base = endpoint_url.rstrip("/")
     timeout = aiohttp.ClientTimeout(total=10)
+    headers = (
+        {"Authorization": f"Bearer {api_key.strip()}"}
+        if str(api_key or "").strip()
+        else None
+    )
     own_session = session is None
     if own_session:
         session = aiohttp.ClientSession()
@@ -461,7 +485,11 @@ async def fetch_models(
     try:
         # Try OpenAI format first
         try:
-            async with session.get(f"{base}/v1/models", timeout=timeout) as resp:
+            async with session.get(
+                f"{base}/v1/models",
+                timeout=timeout,
+                headers=headers,
+            ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     models = [m["id"] for m in data.get("data", []) if m.get("id")]
@@ -472,7 +500,11 @@ async def fetch_models(
 
         # Fall back to Ollama format
         try:
-            async with session.get(f"{base}/api/tags", timeout=timeout) as resp:
+            async with session.get(
+                f"{base}/api/tags",
+                timeout=timeout,
+                headers=headers,
+            ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     models = [

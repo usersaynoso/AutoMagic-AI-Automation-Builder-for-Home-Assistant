@@ -13,6 +13,7 @@ from .api import (
     async_get_entities_payload,
     async_get_generation_status_payload,
     async_get_history_payload,
+    async_get_services_payload,
     async_install_automation_request,
     async_start_generation_request,
 )
@@ -25,6 +26,7 @@ from .api import (
         vol.Required("prompt"): str,
         vol.Optional("entity_filter"): [str],
         vol.Optional("continue_job_id"): str,
+        vol.Optional("service_id"): str,
     }
 )
 async def websocket_generate(
@@ -95,6 +97,20 @@ async def websocket_history(
     connection.send_result(msg["id"], payload)
 
 
+@websocket_api.async_response
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "automagic/services",
+    }
+)
+async def websocket_services(
+    hass: HomeAssistant, connection: Any, msg: dict[str, Any]
+) -> None:
+    """Return configured AI services over websocket."""
+    payload, _status = await async_get_services_payload(hass)
+    connection.send_result(msg["id"], payload)
+
+
 def async_register_websocket_commands(hass: HomeAssistant) -> None:
     """Register AutoMagic websocket commands."""
     websocket_api.async_register_command(hass, websocket_generate)
@@ -102,3 +118,4 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_install)
     websocket_api.async_register_command(hass, websocket_entities)
     websocket_api.async_register_command(hass, websocket_history)
+    websocket_api.async_register_command(hass, websocket_services)

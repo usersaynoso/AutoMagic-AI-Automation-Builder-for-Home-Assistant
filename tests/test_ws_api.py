@@ -10,6 +10,7 @@ from custom_components.automagic.ws_api import (
     async_register_websocket_commands,
     websocket_generate,
     websocket_generate_status,
+    websocket_services,
 )
 
 
@@ -22,7 +23,7 @@ def test_register_websocket_commands_registers_all_handlers():
     ) as register_command:
         async_register_websocket_commands(hass)
 
-    assert register_command.call_count == 5
+    assert register_command.call_count == 6
 
 
 @pytest.mark.asyncio
@@ -58,4 +59,34 @@ async def test_websocket_status_sends_status_payload():
 
     connection.send_result.assert_called_once_with(
         9, {"job_id": "job-1", "status": "running"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_websocket_services_sends_service_payload():
+    """Services websocket handler should return the configured picker payload."""
+    hass = MagicMock()
+    connection = MagicMock()
+    msg = {"id": 11, "type": "automagic/services"}
+
+    with patch(
+        "custom_components.automagic.ws_api.async_get_services_payload",
+        AsyncMock(
+            return_value=(
+                {
+                    "services": [{"service_id": "primary"}],
+                    "default_service_id": "primary",
+                },
+                200,
+            )
+        ),
+    ):
+        await websocket_services(hass, connection, msg)
+
+    connection.send_result.assert_called_once_with(
+        11,
+        {
+            "services": [{"service_id": "primary"}],
+            "default_service_id": "primary",
+        },
     )

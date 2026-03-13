@@ -15,14 +15,20 @@ from custom_components.automagic.api import (
     _create_generation_job,
     _get_config_data,
     _run_generation_job,
+    async_get_services_payload,
+    async_start_generation_request,
 )
 from custom_components.automagic.const import (
+    CONF_DEFAULT_SERVICE_ID,
     CONF_ENDPOINT_URL,
     CONF_MODEL,
     CONF_REQUEST_TIMEOUT,
+    CONF_SERVICE_ID,
+    CONF_SERVICES,
     DOMAIN,
 )
 from custom_components.automagic.llm_client import LLMConnectionError
+from custom_components.automagic.service_config import build_service_config
 
 
 class FakeRequest:
@@ -59,6 +65,34 @@ def _make_hass():
     return hass
 
 
+def _make_multi_service_hass():
+    """Build a mock Home Assistant object with multiple configured AI services."""
+    primary = build_service_config(
+        "http://localhost:11434",
+        "qwen2.5:14b",
+        service_id="primary",
+        request_timeout=420,
+    )
+    backup = build_service_config(
+        "http://remote:1234",
+        "gpt-4o-mini",
+        service_id="backup",
+        request_timeout=900,
+    )
+    hass = MagicMock()
+    hass.data = {
+        DOMAIN: {
+            "entry-1": {
+                CONF_SERVICES: [primary, backup],
+                CONF_DEFAULT_SERVICE_ID: "primary",
+            },
+            "views_registered": True,
+        }
+    }
+    hass.async_create_task = MagicMock(return_value=MagicMock())
+    return hass
+
+
 def test_get_config_data_ignores_non_config_dicts():
     """Only real config entry dicts should be returned as config data."""
     hass = MagicMock()
@@ -77,6 +111,50 @@ def test_get_config_data_ignores_non_config_dicts():
 
     assert config[CONF_ENDPOINT_URL] == "http://localhost:11434"
     assert config[CONF_MODEL] == "qwen2.5:14b"
+
+
+@pytest.mark.asyncio
+async def test_start_generation_request_uses_selected_service():
+    """Generation requests should pin the job to the chosen AI service."""
+    hass = _make_multi_service_hass()
+
+    with patch(
+        "custom_components.automagic.api._run_generation_job",
+        AsyncMock(),
+    ):
+        payload, status = await async_start_generation_request(
+            hass,
+            {
+                "prompt": "Turn on the kitchen lights",
+                "service_id": "backup",
+            },
+        )
+
+    assert status == 202
+    assert payload["service_id"] == "backup"
+    assert "gpt-4o-mini" in payload["detail"]
+
+    job = hass.data[f"{DOMAIN}_generation_jobs"][payload["job_id"]]
+    assert job["service_id"] == "backup"
+    assert job["service_config"][CONF_MODEL] == "gpt-4o-mini"
+    assert job["service_config"][CONF_ENDPOINT_URL] == "http://remote:1234"
+
+
+@pytest.mark.asyncio
+async def test_get_services_payload_lists_configured_service_options():
+    """Frontend service picker payload should include all configured services."""
+    hass = _make_multi_service_hass()
+
+    payload, status = await async_get_services_payload(hass)
+
+    assert status == 200
+    assert payload["default_service_id"] == "primary"
+    assert [service["service_id"] for service in payload["services"]] == [
+        "primary",
+        "backup",
+    ]
+    assert payload["services"][0]["is_default"] is True
+    assert "qwen2.5:14b" in payload["services"][0]["label"]
 
 
 @pytest.mark.asyncio

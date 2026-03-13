@@ -256,6 +256,9 @@ function buildHarness() {
     "_humanizeIdentifier",
     "_formatError",
     "_shouldRetryBackendStatus",
+    "_serviceLabel",
+    "_selectedService",
+    "_buildGenerationRequestPayload",
     "_notificationServiceEntries",
     "_collectSemanticPromptMatches",
     "_semanticEntityMatches",
@@ -2369,6 +2372,43 @@ test("Non-clarifying summaries without YAML are surfaced for the repair pass", (
 test("Direct chat completions request JSON object output from Ollama", () => {
   assert.match(cardSource, /response_format:\s*\{\s*type:\s*"json_object"\s*\}/);
   assert.match(cardSource, /stream:\s*false/);
+});
+
+test("Backend generation payload includes the selected service id", () => {
+  const harness = buildHarness();
+  harness._services = [
+    {
+      service_id: "primary",
+      model: "qwen2.5:14b",
+      endpoint_url: "http://localhost:11434",
+      is_default: true,
+    },
+    {
+      service_id: "backup",
+      model: "gpt-4o-mini",
+      endpoint_url: "http://remote:1234",
+      is_default: false,
+    },
+  ];
+  harness._selectedServiceId = "backup";
+
+  const payload = harness._buildGenerationRequestPayload.call(
+    harness,
+    "Turn on the kitchen lights",
+    "job-1"
+  );
+
+  assert.deepEqual(payload, {
+    prompt: "Turn on the kitchen lights",
+    service_id: "backup",
+    continue_job_id: "job-1",
+  });
+});
+
+test("Create view source exposes a configured model picker", () => {
+  assert.match(cardSource, /class="service-select"/);
+  assert.match(cardSource, /automagic\/services/);
+  assert.match(cardSource, /service_id/);
 });
 
 test("Missing-yaml repair explicitly demands a non-empty yaml string", () => {

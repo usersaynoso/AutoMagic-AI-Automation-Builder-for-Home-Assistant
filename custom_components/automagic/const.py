@@ -1,10 +1,13 @@
 """Constants for the AutoMagic integration."""
 
 DOMAIN = "automagic"
+CONF_DEFAULT_SERVICE_ID = "default_service_id"
 CONF_ENDPOINT_URL = "endpoint_url"
 CONF_MODEL = "model"
 CONF_MAX_TOKENS = "max_tokens"
 CONF_REQUEST_TIMEOUT = "request_timeout"
+CONF_SERVICE_ID = "service_id"
+CONF_SERVICES = "services"
 CONF_TEMPERATURE = "temperature"
 CONF_CONTEXT_LIMIT = "context_limit"
 
@@ -20,6 +23,7 @@ API_PATH_GENERATE_STATUS = "/api/automagic/generate/{job_id}"
 API_PATH_INSTALL = "/api/automagic/install"
 API_PATH_ENTITIES = "/api/automagic/entities"
 API_PATH_HISTORY = "/api/automagic/history"
+API_PATH_SERVICES = "/api/automagic/services"
 
 HA_MIN_VERSION = (2024, 10)
 

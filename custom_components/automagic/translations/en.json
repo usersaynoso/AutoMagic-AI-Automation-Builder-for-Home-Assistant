@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Connect to LLM",
-        "description": "Enter the URL of your OpenAI-compatible LLM endpoint.\n\nOllama default: http://localhost:11434\n\nAutoMagic will auto-detect the best available model and configure everything for you.",
+        "description": "Enter the URL of your OpenAI-compatible LLM endpoint.\n\nOllama default: http://localhost:11434\n\nAutoMagic will auto-detect the best available model for the first AI service. You can add more services later from Settings.",
         "data": {
           "endpoint_url": "LLM Endpoint URL"
         }
@@ -18,14 +18,59 @@
     }
   },
   "options": {
+    "abort": {
+      "cannot_delete_last_service": "At least one AI service must stay configured.",
+      "service_not_found": "That AI service is no longer available."
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to LLM endpoint. Check the URL and ensure the server is running.",
+      "no_models": "Connected but no models found. Install a model first or enter the model name manually."
+    },
     "step": {
       "init": {
-        "title": "AutoMagic Settings",
-        "description": "Change endpoint, override the auto-detected model, or increase how long AutoMagic waits for a generation request.",
+        "title": "Manage AI Services",
+        "description": "Add, edit, delete, or choose the default AI service used by the AutoMagic panel.",
+        "data": {
+          "action": "Action"
+        }
+      },
+      "add_service": {
+        "title": "Add AI Service",
+        "description": "Add another endpoint/model combination that can be chosen from the AutoMagic panel.",
         "data": {
           "endpoint_url": "LLM Endpoint URL",
           "model": "Model (leave empty for auto-detect)",
           "request_timeout": "Generation timeout (seconds)"
+        }
+      },
+      "edit_pick": {
+        "title": "Choose AI Service",
+        "description": "Pick which AI service to edit.",
+        "data": {
+          "service_id": "AI Service"
+        }
+      },
+      "edit_service": {
+        "title": "Edit AI Service",
+        "description": "Update the endpoint, model, or timeout for the selected AI service.",
+        "data": {
+          "endpoint_url": "LLM Endpoint URL",
+          "model": "Model (leave empty for auto-detect)",
+          "request_timeout": "Generation timeout (seconds)"
+        }
+      },
+      "delete_service": {
+        "title": "Delete AI Service",
+        "description": "Remove one AI service from AutoMagic.",
+        "data": {
+          "service_id": "AI Service"
+        }
+      },
+      "default_service": {
+        "title": "Default AI Service",
+        "description": "Choose which AI service is preselected on the AutoMagic panel.",
+        "data": {
+          "service_id": "AI Service"
         }
       }
     }

@@ -17,8 +17,10 @@ from .api import (
     AutoMagicGenerateStatusView,
     AutoMagicHistoryView,
     AutoMagicInstallView,
+    AutoMagicServicesView,
 )
-from .const import DOMAIN
+from .const import CONF_MODEL, DOMAIN
+from .service_config import get_service_config, normalize_config_data
 from .ws_api import async_register_websocket_commands
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
@@ -31,10 +33,33 @@ _DATA_WS_REGISTERED = "ws_registered"
 _LOGGER = logging.getLogger(__name__)
 
 
+def _entry_title(data: dict) -> str:
+    """Return the config-entry title for the current default service."""
+    service = get_service_config(data)
+    model = service.get(CONF_MODEL, "") if service else ""
+    return f"AutoMagic ({model})" if model else "AutoMagic"
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Migrate legacy single-service entries to multi-service storage."""
+    if entry.version >= 2:
+        return True
+
+    normalized = normalize_config_data(entry.data)
+    hass.config_entries.async_update_entry(
+        entry,
+        data=normalized,
+        title=_entry_title(normalized),
+        version=2,
+    )
+    _LOGGER.info("Migrated AutoMagic config entry %s to version 2", entry.entry_id)
+    return True
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up AutoMagic from a config entry."""
     domain_data = hass.data.setdefault(DOMAIN, {})
-    domain_data[entry.entry_id] = dict(entry.data)
+    domain_data[entry.entry_id] = normalize_config_data(entry.data)
 
     # Serve the Lovelace card JS from the integration's own www/ directory.
     # This avoids requiring the user to manually copy files to config/www/.
@@ -58,6 +83,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.http.register_view(AutoMagicInstallView())
         hass.http.register_view(AutoMagicEntitiesView())
         hass.http.register_view(AutoMagicHistoryView())
+        hass.http.register_view(AutoMagicServicesView())
         domain_data[_DATA_VIEWS_REGISTERED] = True
 
     if not domain_data.get(_DATA_WS_REGISTERED):
@@ -93,7 +119,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def _update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Refresh cached config data when config entry is updated."""
-    hass.data[DOMAIN][entry.entry_id] = dict(entry.data)
+    hass.data[DOMAIN][entry.entry_id] = normalize_config_data(entry.data)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

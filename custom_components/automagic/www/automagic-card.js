@@ -343,6 +343,8 @@ class AutoMagicCard extends LitElement {
       _showYaml: { type: Boolean },
       _entityCount: { type: Number },
       _history: { type: Array },
+      _services: { type: Array },
+      _selectedServiceId: { type: String },
       _chatMessages: { type: Array },
       _expandedHistory: { type: Number },
       _isPanel: { type: Boolean },
@@ -372,6 +374,8 @@ class AutoMagicCard extends LitElement {
     this._showYaml = false;
     this._entityCount = 0;
     this._history = [];
+    this._services = [];
+    this._selectedServiceId = "";
     this._chatMessages = [];
     this._expandedHistory = -1;
     this._isPanel = false;
@@ -396,6 +400,7 @@ class AutoMagicCard extends LitElement {
 
   connectedCallback() {
     super.connectedCallback();
+    this._fetchServices();
     this._fetchEntityCount();
     this._fetchHistory();
   }
@@ -433,6 +438,30 @@ class AutoMagicCard extends LitElement {
       }
     } catch {
       // Silently ignore
+    }
+  }
+
+  async _fetchServices() {
+    try {
+      const resp = await this._requestServices();
+      const services = Array.isArray(resp?.services) ? resp.services : [];
+      this._services = services;
+
+      const defaultServiceId = this._normalizeText(resp?.default_service_id);
+      const currentSelection = this._normalizeText(this._selectedServiceId);
+      const nextSelection = services.some(
+        (service) => this._normalizeText(service?.service_id) === currentSelection
+      )
+        ? currentSelection
+        : this._normalizeText(
+            services.find(
+              (service) =>
+                this._normalizeText(service?.service_id) === defaultServiceId
+            )?.service_id || services[0]?.service_id || ""
+          );
+      this._selectedServiceId = nextSelection;
+    } catch {
+      this._services = [];
     }
   }
 
@@ -719,6 +748,58 @@ class AutoMagicCard extends LitElement {
     } catch (err) {
       return this._apiGet("/api/automagic/history");
     }
+  }
+
+  async _requestServices() {
+    try {
+      return await this._wsCommand("automagic/services");
+    } catch (err) {
+      return this._apiGet("/api/automagic/services");
+    }
+  }
+
+  _serviceLabel(service) {
+    const explicitLabel = this._normalizeText(service?.label);
+    if (explicitLabel) return explicitLabel;
+
+    const model = this._normalizeText(service?.model);
+    const endpoint = this._normalizeText(service?.endpoint_url);
+    try {
+      const parsed = new URL(endpoint);
+      if (model && parsed.host) {
+        return `${model} (${parsed.host})`;
+      }
+      return model || parsed.host;
+    } catch {
+      if (model && endpoint) {
+        return `${model} (${endpoint})`;
+      }
+      return model || endpoint || "AI service";
+    }
+  }
+
+  _selectedService() {
+    const selectedServiceId = this._normalizeText(this._selectedServiceId);
+    return (
+      this._services.find(
+        (service) => this._normalizeText(service?.service_id) === selectedServiceId
+      ) ||
+      this._services.find((service) => service?.is_default) ||
+      this._services[0] ||
+      null
+    );
+  }
+
+  _buildGenerationRequestPayload(prompt, continueJobId = "") {
+    const payload = { prompt };
+    const serviceId = this._normalizeText(this._selectedService()?.service_id);
+    if (serviceId) {
+      payload.service_id = serviceId;
+    }
+    if (continueJobId) {
+      payload.continue_job_id = continueJobId;
+    }
+    return payload;
   }
 
   _startLoadingTicker(message, detail) {
@@ -4900,16 +4981,15 @@ class AutoMagicCard extends LitElement {
   }
 
   async _runBackendGeneration(prompt, requestText = null, continueJobId = "") {
+    const selectedService = this._selectedService();
     this._startLoadingTicker(
       "Waiting for your model to respond...",
-      "Using Home Assistant's background generation job."
+      selectedService
+        ? `Using ${this._serviceLabel(selectedService)} via Home Assistant's background generation job.`
+        : "Using Home Assistant's background generation job."
     );
 
-    const payload = { prompt };
-    if (continueJobId) {
-      payload.continue_job_id = continueJobId;
-    }
-
+    const payload = this._buildGenerationRequestPayload(prompt, continueJobId);
     const job = await this._requestGenerateWithToken(payload);
     const finalJob = await this._pollBackendGeneration(job.job_id);
     this._generationJobId = finalJob.job_id || job.job_id || "";
@@ -5961,14 +6041,45 @@ class AutoMagicCard extends LitElement {
               ? "Continue the thread with follow-up questions or changes. Every message goes back to the AI."
               : "Describe the automation you want. AutoMagic keeps the whole exchange in one chat thread."}
           </p>
-          ${isFollowUp
-            ? html`
-                <button class="btn btn-secondary chat-toolbar-btn" @click=${this._handleReset}>
-                  <ha-icon icon="mdi:refresh"></ha-icon>
-                  Start Over
-                </button>
-              `
-            : ""}
+          <div class="chat-toolbar-actions">
+            ${this._services.length > 0
+              ? html`
+                  <label class="service-picker">
+                    <span class="service-picker-label">Model</span>
+                    <select
+                      class="service-select"
+                      .value=${this._normalizeText(
+                        this._selectedService()?.service_id || ""
+                      )}
+                      ?disabled=${isBusy || this._services.length <= 1}
+                      @change=${(e) => {
+                        this._selectedServiceId = this._normalizeText(
+                          e.target.value
+                        );
+                      }}
+                    >
+                      ${this._services.map(
+                        (service) => html`
+                          <option
+                            value=${this._normalizeText(service?.service_id)}
+                          >
+                            ${this._serviceLabel(service)}
+                          </option>
+                        `
+                      )}
+                    </select>
+                  </label>
+                `
+              : ""}
+            ${isFollowUp
+              ? html`
+                  <button class="btn btn-secondary chat-toolbar-btn" @click=${this._handleReset}>
+                    <ha-icon icon="mdi:refresh"></ha-icon>
+                    Start Over
+                  </button>
+                `
+              : ""}
+          </div>
         </div>
 
         <div class="chat-thread">
@@ -6639,8 +6750,9 @@ class AutoMagicCard extends LitElement {
       }
       .chat-toolbar {
         display: flex;
-        align-items: center;
+        align-items: flex-start;
         justify-content: space-between;
+        flex-wrap: wrap;
         gap: 12px;
       }
       .chat-subtitle {
@@ -6648,6 +6760,44 @@ class AutoMagicCard extends LitElement {
         color: var(--secondary-text-color);
         font-size: 0.92em;
         line-height: 1.45;
+      }
+      .chat-toolbar-actions {
+        display: flex;
+        align-items: flex-end;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin-left: auto;
+      }
+      .service-picker {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        min-width: min(100%, 280px);
+      }
+      .service-picker-label {
+        color: var(--secondary-text-color);
+        font-size: 0.76em;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+      .service-select {
+        border: 1px solid var(--divider-color);
+        border-radius: 12px;
+        background: var(--card-background-color, var(--primary-background-color));
+        color: var(--primary-text-color);
+        min-height: 42px;
+        padding: 0 14px;
+        font: inherit;
+      }
+      .service-select:focus {
+        outline: none;
+        border-color: var(--primary-color);
+        box-shadow: 0 0 0 1px var(--primary-color);
+      }
+      .service-select:disabled {
+        opacity: 0.7;
+        cursor: default;
       }
       .chat-toolbar-btn {
         flex-shrink: 0;

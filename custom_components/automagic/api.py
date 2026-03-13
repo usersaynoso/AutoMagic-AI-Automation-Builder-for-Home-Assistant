@@ -24,8 +24,10 @@ from .const import (
     API_PATH_GENERATE_STATUS,
     API_PATH_HISTORY,
     API_PATH_INSTALL,
+    API_PATH_SERVICES,
     CONF_ENDPOINT_URL,
     CONF_MODEL,
+    CONF_SERVICE_ID,
     DOMAIN,
 )
 from .entity_collector import (
@@ -36,6 +38,13 @@ from .llm_client import LLMClient, LLMConnectionError, LLMResponseError
 from .prompt_builder import (
     build_auto_clarification_answer,
     build_prompt,
+)
+from .service_config import (
+    build_service_label,
+    get_configured_services,
+    get_default_service_id,
+    get_service_config,
+    normalize_config_data,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -137,6 +146,7 @@ def _create_generation_job(
     entity_filter: list[str] | None,
     *,
     conversation_messages: list[dict[str, str]] | None = None,
+    service_config: dict[str, Any] | None = None,
     root_prompt: str | None = None,
     parent_job_id: str | None = None,
 ) -> dict[str, Any]:
@@ -145,6 +155,7 @@ def _create_generation_job(
 
     now_iso = _utcnow_iso()
     now_monotonic = time.monotonic()
+    selected_service = dict(service_config or {})
     job = {
         "job_id": uuid.uuid4().hex,
         "prompt": prompt,
@@ -170,6 +181,9 @@ def _create_generation_job(
         "assistant_message": None,
         "root_prompt": root_prompt or prompt,
         "parent_job_id": parent_job_id,
+        "service_id": selected_service.get(CONF_SERVICE_ID, ""),
+        "service_label": build_service_label(selected_service),
+        "service_config": selected_service,
         "error": None,
         "task": None,
     }
@@ -344,6 +358,8 @@ def _serialize_generation_job(job: dict[str, Any]) -> dict[str, Any]:
         "status": job["status"],
         "message": job["message"],
         "detail": job["detail"],
+        "service_id": job.get("service_id", ""),
+        "service_label": job.get("service_label", ""),
         "created_at": job["created_at"],
         "started_at": job["started_at"],
         "finished_at": job["finished_at"],
@@ -387,12 +403,14 @@ async def _maybe_refresh_backend_status(
     ):
         return
 
-    config_data = _get_config_data(hass)
-    if config_data is None:
+    service_config = dict(job.get("service_config") or {})
+    if not service_config:
+        service_config = _get_service_config(hass, job.get("service_id"))
+    if service_config is None:
         return
 
     session = async_get_clientsession(hass)
-    client = LLMClient.from_config(config_data, session=session)
+    client = LLMClient.from_config(service_config, session=session)
     status = await client.probe_generation_status()
 
     job["backend_checked_monotonic"] = now_monotonic
@@ -415,6 +433,12 @@ async def _run_generation_job(
     config_data = _get_config_data(hass)
     if config_data is None:
         _mark_job_error(job, "AutoMagic is not configured.")
+        return
+    service_config = dict(job.get("service_config") or {})
+    if not service_config:
+        service_config = _get_service_config(hass, job.get("service_id"))
+    if service_config is None:
+        _mark_job_error(job, "The selected AI service is no longer available.")
         return
 
     try:
@@ -458,7 +482,7 @@ async def _run_generation_job(
     job["conversation_messages"] = _clone_messages(messages)
 
     session = async_get_clientsession(hass)
-    client = LLMClient.from_config(config_data, session=session)
+    client = LLMClient.from_config(service_config, session=session)
     request_timeout = getattr(client, "_request_timeout", None)
 
     async def _complete_messages(
@@ -607,6 +631,7 @@ async def async_start_generation_request(
 
     entity_filter = body.get("entity_filter")
     continue_job_id = str(body.get("continue_job_id", "")).strip()
+    selected_service_id = str(body.get(CONF_SERVICE_ID, "")).strip()
 
     config_data = _get_config_data(hass)
     if config_data is None:
@@ -638,24 +663,31 @@ async def async_start_generation_request(
         )
         if entity_filter is None:
             entity_filter = parent_job.get("entity_filter")
+        if not selected_service_id:
+            selected_service_id = str(parent_job.get("service_id") or "").strip()
+
+    service_config = _get_service_config(hass, selected_service_id)
+    if service_config is None:
+        return {"error": "Selected AI service not found"}, 400
 
     job = _create_generation_job(
         hass,
         root_prompt,
         entity_filter,
         conversation_messages=conversation_messages,
+        service_config=service_config,
         root_prompt=root_prompt,
         parent_job_id=continue_job_id or None,
     )
     if continue_job_id:
         job["detail"] = (
-            f"Queued follow-up for model {config_data.get(CONF_MODEL, 'unknown')} at "
-            f"{config_data.get(CONF_ENDPOINT_URL, 'configured endpoint')}."
+            f"Queued follow-up for model {service_config.get(CONF_MODEL, 'unknown')} at "
+            f"{service_config.get(CONF_ENDPOINT_URL, 'configured endpoint')}."
         )
     else:
         job["detail"] = (
-            f"Queued for model {config_data.get(CONF_MODEL, 'unknown')} at "
-            f"{config_data.get(CONF_ENDPOINT_URL, 'configured endpoint')}."
+            f"Queued for model {service_config.get(CONF_MODEL, 'unknown')} at "
+            f"{service_config.get(CONF_ENDPOINT_URL, 'configured endpoint')}."
         )
     job["task"] = hass.async_create_task(
         _run_generation_job(hass, job["job_id"], root_prompt, entity_filter)
@@ -734,6 +766,31 @@ async def async_get_history_payload(
     """Return the persisted automation history payload."""
     history = await hass.async_add_executor_job(_load_history, hass)
     return {"history": history}, 200
+
+
+async def async_get_services_payload(
+    hass: HomeAssistant,
+) -> tuple[dict[str, Any], int]:
+    """Return the configured AI services for the frontend model picker."""
+    config_data = _get_config_data(hass)
+    if config_data is None:
+        return {"services": [], "default_service_id": ""}, 200
+
+    default_service_id = get_default_service_id(config_data)
+    services = [
+        {
+            "service_id": service.get(CONF_SERVICE_ID, ""),
+            "model": service.get(CONF_MODEL, ""),
+            "endpoint_url": service.get(CONF_ENDPOINT_URL, ""),
+            "label": build_service_label(service),
+            "is_default": service.get(CONF_SERVICE_ID) == default_service_id,
+        }
+        for service in get_configured_services(config_data)
+    ]
+    return {
+        "services": services,
+        "default_service_id": default_service_id,
+    }, 200
 
 
 class AutoMagicGenerateView(HomeAssistantView):
@@ -820,14 +877,34 @@ class AutoMagicHistoryView(HomeAssistantView):
         return self.json(payload, status_code=status_code)
 
 
+class AutoMagicServicesView(HomeAssistantView):
+    """Handle GET /api/automagic/services."""
+
+    url = API_PATH_SERVICES
+    name = "api:automagic:services"
+    requires_auth = True
+
+    async def get(self, request: web.Request) -> web.Response:
+        """Return configured AI services for the frontend picker."""
+        hass: HomeAssistant = request.app["hass"]
+        payload, status_code = await async_get_services_payload(hass)
+        return self.json(payload, status_code=status_code)
+
+
 def _get_config_data(hass: HomeAssistant) -> dict[str, Any] | None:
     """Get the config data from the first AutoMagic config entry."""
     domain_data = hass.data.get(DOMAIN, {})
     for entry_data in domain_data.values():
-        if (
-            isinstance(entry_data, dict)
-            and CONF_ENDPOINT_URL in entry_data
-            and CONF_MODEL in entry_data
-        ):
-            return entry_data
+        if not isinstance(entry_data, dict):
+            continue
+        normalized = normalize_config_data(entry_data)
+        if get_configured_services(normalized):
+            return normalized
     return None
+
+
+def _get_service_config(
+    hass: HomeAssistant, service_id: str | None = None
+) -> dict[str, Any] | None:
+    """Return the selected AI service or the configured default."""
+    return get_service_config(_get_config_data(hass), service_id)

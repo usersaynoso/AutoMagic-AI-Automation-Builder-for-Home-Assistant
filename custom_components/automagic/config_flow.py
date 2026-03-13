@@ -39,6 +39,13 @@ from .service_config import (
     pick_default_model,
 )
 
+LOCAL_LLM_SERVICE_LABEL = "Local LLM"
+OPENAI_MODEL_OPTIONS = {
+    "gpt-4o-mini": "gpt-4o-mini",
+    "gpt-4o": "gpt-4o",
+}
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+
 
 def _pick_default_model(models: list[str]) -> str:
     """Pick the best default model from a discovered model list."""
@@ -78,11 +85,6 @@ def _persist_primary_service(
         str(default_service_id or "").strip() or service[CONF_SERVICE_ID]
     )
     return persisted
-
-
-def _runtime_config(config_entry: config_entries.ConfigEntry) -> dict[str, Any]:
-    """Return normalized runtime config including service subentries."""
-    return normalize_config_data(config_entry.data, _entry_subentries(config_entry))
 
 
 def _service_exists(
@@ -203,18 +205,15 @@ async def _async_resolve_openai_service(
     existing_api_key: str = "",
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Validate an OpenAI API key/model pair and return service data."""
-    normalized_model = str(requested_model or "").strip()
+    normalized_model = str(requested_model or "").strip() or DEFAULT_OPENAI_MODEL
+    if normalized_model not in OPENAI_MODEL_OPTIONS:
+        return None, "unsupported_model"
+
     normalized_api_key = str(api_key or "").strip() or str(existing_api_key or "").strip()
 
-    models, error = await _async_fetch_openai_models(hass, normalized_api_key)
+    _models, error = await _async_fetch_openai_models(hass, normalized_api_key)
     if error is not None:
         return None, error
-
-    if models and not normalized_model:
-        normalized_model = _pick_default_model(models) or models[0]
-
-    if not normalized_model:
-        return None, "no_models"
 
     return (
         build_service_config(
@@ -290,67 +289,11 @@ class AutoMagicConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     @staticmethod
     @callback
-    def async_get_options_flow(
-        config_entry: config_entries.ConfigEntry,
-    ) -> AutoMagicOptionsFlow:
-        """Return the options flow handler."""
-        return AutoMagicOptionsFlow(config_entry)
-
-    @staticmethod
-    @callback
     def async_get_supported_subentry_types(
         config_entry: config_entries.ConfigEntry,
     ) -> dict[str, type[config_entries.ConfigSubentryFlow]]:
         """Return supported service subentry types."""
         return {"service": AutoMagicServiceSubentryFlow}
-
-
-class AutoMagicOptionsFlow(config_entries.OptionsFlow):
-    """Handle options flow for default service selection."""
-
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        """Initialise options flow."""
-        self._config_entry = config_entry
-
-    async def async_step_init(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Choose the default AI service used by the panel."""
-        current = _runtime_config(self._config_entry)
-        services = get_configured_services(current)
-        if len(services) <= 1:
-            return self.async_abort(reason="single_service")
-
-        if user_input is not None:
-            new_data = {
-                **self._config_entry.data,
-                CONF_DEFAULT_SERVICE_ID: user_input[CONF_SERVICE_ID],
-            }
-            self.hass.config_entries.async_update_entry(
-                self._config_entry,
-                data=new_data,
-                title=_entry_title(
-                    normalize_config_data(new_data, _entry_subentries(self._config_entry))
-                ),
-            )
-            return self.async_create_entry(title="", data={})
-
-        return self.async_show_form(
-            step_id="init",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(
-                        CONF_SERVICE_ID,
-                        default=get_default_service_id(current),
-                    ): vol.In(
-                        {
-                            service[CONF_SERVICE_ID]: build_service_label(service)
-                            for service in services
-                        }
-                    ),
-                }
-            ),
-        )
 
 
 class AutoMagicServiceSubentryFlow(config_entries.ConfigSubentryFlow):
@@ -372,7 +315,7 @@ class AutoMagicServiceSubentryFlow(config_entries.ConfigSubentryFlow):
                 {
                     vol.Required("service_type", default=PROVIDER_CUSTOM): vol.In(
                         {
-                            PROVIDER_CUSTOM: "Compatible endpoint",
+                            PROVIDER_CUSTOM: LOCAL_LLM_SERVICE_LABEL,
                             PROVIDER_OPENAI: "OpenAI API key",
                         }
                     )
@@ -453,7 +396,10 @@ class AutoMagicServiceSubentryFlow(config_entries.ConfigSubentryFlow):
             data_schema=vol.Schema(
                 {
                     vol.Required(CONF_API_KEY): str,
-                    vol.Optional(CONF_MODEL, default=""): str,
+                    vol.Required(
+                        CONF_MODEL,
+                        default=DEFAULT_OPENAI_MODEL,
+                    ): vol.In(OPENAI_MODEL_OPTIONS),
                     vol.Optional(
                         CONF_REQUEST_TIMEOUT,
                         default=DEFAULT_REQUEST_TIMEOUT,

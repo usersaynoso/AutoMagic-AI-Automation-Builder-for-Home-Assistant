@@ -13,32 +13,16 @@
       "cannot_connect": "Cannot connect to LLM endpoint. Check the URL and ensure the server is running.",
       "invalid_api_key": "OpenAI rejected that API key. Paste a valid key and try again.",
       "missing_api_key": "Paste an OpenAI API key to continue.",
-      "no_models": "Connected but no models found. Install a model first (e.g. ollama pull qwen2.5:7b)."
+      "no_models": "Connected but no models found. Install a model first (e.g. ollama pull qwen2.5:7b).",
+      "unsupported_model": "Choose either gpt-4o-mini or gpt-4o."
     },
     "abort": {
       "already_configured": "AutoMagic is already configured."
     }
   },
-  "options": {
-    "abort": {
-      "single_service": "Only one AI service is configured right now."
-    },
-    "step": {
-      "init": {
-        "title": "Default AI Service",
-        "description": "Choose which configured AI service is preselected on the AutoMagic panel.",
-        "data": {
-          "service_id": "AI Service"
-        }
-      }
-    }
-  },
   "config_subentries": {
     "service": {
       "entry_type": "Service",
-      "initiate_flow": {
-        "user": "Add service"
-      },
       "abort": {
         "already_exists": "That AI service is already configured."
       },
@@ -46,19 +30,20 @@
         "cannot_connect": "Cannot connect to the AI service. Check the details and try again.",
         "invalid_api_key": "OpenAI rejected that API key. Paste a valid key and try again.",
         "missing_api_key": "Paste an OpenAI API key to continue.",
-        "no_models": "Connected but no models were found. Install a model first or enter the model name manually."
+        "no_models": "Connected but no models were found. Install a model first or enter the model name manually.",
+        "unsupported_model": "Choose either gpt-4o-mini or gpt-4o."
       },
       "step": {
         "user": {
           "title": "Add Service",
-          "description": "Choose whether to add a compatible endpoint or an OpenAI API key.",
+          "description": "Choose whether to add a Local LLM or an OpenAI API key.",
           "data": {
             "service_type": "Service Type"
           }
         },
         "custom_service": {
-          "title": "Add Service",
-          "description": "Add another endpoint/model combination that AutoMagic can send prompts to.",
+          "title": "Add Local LLM",
+          "description": "Add another local endpoint/model combination that AutoMagic can send prompts to.",
           "data": {
             "endpoint_url": "LLM Endpoint URL",
             "model": "Model (leave empty for auto-detect)",
@@ -67,10 +52,10 @@
         },
         "openai_service": {
           "title": "Add OpenAI Key",
-          "description": "Add an OpenAI service by pasting an API key. AutoMagic uses OpenAI's hosted endpoint automatically, so no model URL is needed.",
+          "description": "Add an OpenAI service by pasting an API key. AutoMagic uses OpenAI's hosted endpoint automatically, so no model URL is needed. Choose either gpt-4o-mini or gpt-4o.",
           "data": {
             "api_key": "OpenAI API Key",
-            "model": "Model (leave empty for auto-detect)",
+            "model": "Model",
             "request_timeout": "Generation timeout (seconds)"
           }
         }

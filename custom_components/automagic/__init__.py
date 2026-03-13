@@ -19,8 +19,8 @@ from .api import (
     AutoMagicInstallView,
     AutoMagicServicesView,
 )
-from .const import CONF_MODEL, DOMAIN
-from .service_config import get_service_config, normalize_config_data
+from .const import CONF_DEFAULT_SERVICE_ID, CONF_MODEL, DOMAIN
+from .service_config import build_service_config, get_service_config, normalize_config_data
 from .ws_api import async_register_websocket_commands
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
@@ -40,12 +40,33 @@ def _entry_title(data: dict) -> str:
     return f"AutoMagic ({model})" if model else "AutoMagic"
 
 
+def _entry_runtime_config(entry: ConfigEntry) -> dict:
+    """Return normalized entry data including any service subentries."""
+    subentries = getattr(entry, "subentries", {})
+    values = subentries.values() if hasattr(subentries, "values") else subentries
+    return normalize_config_data(entry.data, values)
+
+
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Migrate legacy single-service entries to multi-service storage."""
     if entry.version >= 2:
         return True
 
-    normalized = normalize_config_data(entry.data)
+    service = build_service_config(
+        entry.data.get("endpoint_url", ""),
+        entry.data.get("model", ""),
+        service_id=entry.data.get("service_id"),
+        provider=entry.data.get("provider"),
+        api_key=entry.data.get("api_key"),
+        max_tokens=entry.data.get("max_tokens"),
+        request_timeout=entry.data.get("request_timeout"),
+        temperature=entry.data.get("temperature"),
+    )
+    normalized = {
+        **entry.data,
+        **service,
+        CONF_DEFAULT_SERVICE_ID: service["service_id"],
+    }
     hass.config_entries.async_update_entry(
         entry,
         data=normalized,
@@ -59,7 +80,7 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up AutoMagic from a config entry."""
     domain_data = hass.data.setdefault(DOMAIN, {})
-    domain_data[entry.entry_id] = normalize_config_data(entry.data)
+    domain_data[entry.entry_id] = _entry_runtime_config(entry)
 
     # Serve the Lovelace card JS from the integration's own www/ directory.
     # This avoids requiring the user to manually copy files to config/www/.
@@ -119,7 +140,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def _update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Refresh cached config data when config entry is updated."""
-    hass.data[DOMAIN][entry.entry_id] = normalize_config_data(entry.data)
+    hass.data[DOMAIN][entry.entry_id] = _entry_runtime_config(entry)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

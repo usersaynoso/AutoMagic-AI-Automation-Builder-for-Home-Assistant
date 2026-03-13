@@ -94,10 +94,28 @@ frontend_mod.async_remove_panel = MagicMock()
 frontend_mod.add_extra_js_url = MagicMock()
 
 # ConfigFlow / OptionsFlow need to be real classes for inheritance
+homeassistant_mod = sys.modules["homeassistant"]
 config_entries = sys.modules["homeassistant.config_entries"]
-config_entries.ConfigFlow = type("ConfigFlow", (), {})
+
+
+class _ConfigFlow:
+    def __init_subclass__(cls, **kwargs):
+        return super().__init_subclass__()
+
+
+class _ConfigSubentryFlow:
+    def __init_subclass__(cls, **kwargs):
+        return super().__init_subclass__()
+
+    def _get_entry(self):
+        return getattr(self, "_entry", MagicMock())
+
+
+config_entries.ConfigFlow = _ConfigFlow
 config_entries.ConfigEntry = MagicMock
+config_entries.ConfigSubentryFlow = _ConfigSubentryFlow
 config_entries.OptionsFlow = type("OptionsFlow", (), {})
+homeassistant_mod.config_entries = config_entries
 
 # entity_registry.async_get
 er = sys.modules["homeassistant.helpers.entity_registry"]
@@ -107,6 +125,7 @@ er.async_get = MagicMock()
 core = sys.modules["homeassistant.core"]
 core.callback = lambda f: f
 core.HomeAssistant = MagicMock
+homeassistant_mod.core = core
 
 # FlowResult is just a dict alias
 flow = sys.modules["homeassistant.data_entry_flow"]

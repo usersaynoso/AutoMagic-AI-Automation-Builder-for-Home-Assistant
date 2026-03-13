@@ -893,6 +893,16 @@ class AutoMagicServicesView(HomeAssistantView):
 
 def _get_config_data(hass: HomeAssistant) -> dict[str, Any] | None:
     """Get the config data from the first AutoMagic config entry."""
+    config_entries = getattr(hass, "config_entries", None)
+    async_entries = getattr(config_entries, "async_entries", None)
+    if callable(async_entries):
+        for entry in async_entries(DOMAIN):
+            subentries = getattr(entry, "subentries", {})
+            values = subentries.values() if hasattr(subentries, "values") else subentries
+            normalized = normalize_config_data(entry.data, values)
+            if get_configured_services(normalized):
+                return normalized
+
     domain_data = hass.data.get(DOMAIN, {})
     for entry_data in domain_data.values():
         if not isinstance(entry_data, dict):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterable
 from typing import Any, Mapping
 from urllib.parse import urlparse
 
@@ -163,56 +164,77 @@ def build_service_label(service: Mapping[str, Any]) -> str:
     return "AI service"
 
 
-def normalize_config_data(data: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Normalize config-entry data into the multi-service storage shape."""
+def _normalize_service_mapping(raw_service: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Normalize a raw service mapping into stored service data."""
+    endpoint_url = str(raw_service.get(CONF_ENDPOINT_URL, "") or "").strip()
+    model = str(raw_service.get(CONF_MODEL, "") or "").strip()
+    provider = str(raw_service.get(CONF_PROVIDER, "") or "").strip().lower()
+    api_key = str(raw_service.get(CONF_API_KEY, "") or "").strip()
+    if not model:
+        return None
+    if provider != PROVIDER_OPENAI and not endpoint_url:
+        return None
+    return build_service_config(
+        endpoint_url,
+        model,
+        service_id=str(raw_service.get(CONF_SERVICE_ID, "") or "").strip() or None,
+        provider=provider or None,
+        api_key=api_key or None,
+        max_tokens=raw_service.get(CONF_MAX_TOKENS),
+        request_timeout=raw_service.get(CONF_REQUEST_TIMEOUT),
+        temperature=raw_service.get(CONF_TEMPERATURE),
+    )
+
+
+def _iter_subentry_mappings(
+    subentries: Iterable[Mapping[str, Any] | Any] | None,
+) -> list[Mapping[str, Any]]:
+    """Return data mappings for config subentries."""
+    mappings: list[Mapping[str, Any]] = []
+    if not subentries:
+        return mappings
+
+    for subentry in subentries:
+        if isinstance(subentry, Mapping):
+            data = subentry.get("data")
+            if isinstance(data, Mapping):
+                mappings.append(data)
+            else:
+                mappings.append(subentry)
+            continue
+        data = getattr(subentry, "data", None)
+        if isinstance(data, Mapping):
+            mappings.append(data)
+    return mappings
+
+
+def normalize_config_data(
+    data: Mapping[str, Any] | None,
+    subentries: Iterable[Mapping[str, Any] | Any] | None = None,
+) -> dict[str, Any]:
+    """Normalize config-entry data into a multi-service runtime shape."""
     normalized: dict[str, Any] = dict(data or {})
+    services_by_id: dict[str, dict[str, Any]] = {}
 
     raw_services = normalized.get(CONF_SERVICES)
-    services: list[dict[str, Any]] = []
-
     if isinstance(raw_services, list):
         for raw_service in raw_services:
             if not isinstance(raw_service, Mapping):
                 continue
-            endpoint_url = str(raw_service.get(CONF_ENDPOINT_URL, "") or "").strip()
-            model = str(raw_service.get(CONF_MODEL, "") or "").strip()
-            provider = str(raw_service.get(CONF_PROVIDER, "") or "").strip().lower()
-            api_key = str(raw_service.get(CONF_API_KEY, "") or "").strip()
-            if not model:
-                continue
-            if provider != PROVIDER_OPENAI and not endpoint_url:
-                continue
-            services.append(
-                build_service_config(
-                    endpoint_url,
-                    model,
-                    service_id=str(raw_service.get(CONF_SERVICE_ID, "") or "").strip() or None,
-                    provider=provider or None,
-                    api_key=api_key or None,
-                    max_tokens=raw_service.get(CONF_MAX_TOKENS),
-                    request_timeout=raw_service.get(CONF_REQUEST_TIMEOUT),
-                    temperature=raw_service.get(CONF_TEMPERATURE),
-                )
-            )
+            service = _normalize_service_mapping(raw_service)
+            if service is not None:
+                services_by_id[service[CONF_SERVICE_ID]] = service
 
-    if not services:
-        endpoint_url = str(normalized.get(CONF_ENDPOINT_URL, "") or "").strip()
-        model = str(normalized.get(CONF_MODEL, "") or "").strip()
-        provider = str(normalized.get(CONF_PROVIDER, "") or "").strip().lower()
-        api_key = str(normalized.get(CONF_API_KEY, "") or "").strip()
-        if model and (endpoint_url or provider == PROVIDER_OPENAI):
-            services.append(
-                build_service_config(
-                    endpoint_url,
-                    model,
-                    service_id=str(normalized.get(CONF_SERVICE_ID, "") or "").strip() or None,
-                    provider=provider or None,
-                    api_key=api_key or None,
-                    max_tokens=normalized.get(CONF_MAX_TOKENS),
-                    request_timeout=normalized.get(CONF_REQUEST_TIMEOUT),
-                    temperature=normalized.get(CONF_TEMPERATURE),
-                )
-            )
+    primary_service = _normalize_service_mapping(normalized)
+    if primary_service is not None:
+        services_by_id.setdefault(primary_service[CONF_SERVICE_ID], primary_service)
+
+    for raw_subentry in _iter_subentry_mappings(subentries):
+        service = _normalize_service_mapping(raw_subentry)
+        if service is not None:
+            services_by_id[service[CONF_SERVICE_ID]] = service
+
+    services = list(services_by_id.values())
 
     default_service_id = str(normalized.get(CONF_DEFAULT_SERVICE_ID, "") or "").strip()
     if not any(service[CONF_SERVICE_ID] == default_service_id for service in services):
@@ -245,24 +267,29 @@ def normalize_config_data(data: Mapping[str, Any] | None) -> dict[str, Any]:
 
 def get_configured_services(
     config_data: Mapping[str, Any] | None,
+    subentries: Iterable[Mapping[str, Any] | Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Return all configured AI services."""
-    normalized = normalize_config_data(config_data)
+    normalized = normalize_config_data(config_data, subentries)
     return [dict(service) for service in normalized.get(CONF_SERVICES, [])]
 
 
-def get_default_service_id(config_data: Mapping[str, Any] | None) -> str:
+def get_default_service_id(
+    config_data: Mapping[str, Any] | None,
+    subentries: Iterable[Mapping[str, Any] | Any] | None = None,
+) -> str:
     """Return the configured default service id."""
-    normalized = normalize_config_data(config_data)
+    normalized = normalize_config_data(config_data, subentries)
     return str(normalized.get(CONF_DEFAULT_SERVICE_ID, "") or "")
 
 
 def get_service_config(
     config_data: Mapping[str, Any] | None,
     service_id: str | None = None,
+    subentries: Iterable[Mapping[str, Any] | Any] | None = None,
 ) -> dict[str, Any] | None:
     """Return the requested service config or the default service."""
-    normalized = normalize_config_data(config_data)
+    normalized = normalize_config_data(config_data, subentries)
     services = normalized.get(CONF_SERVICES, [])
     if not services:
         return None

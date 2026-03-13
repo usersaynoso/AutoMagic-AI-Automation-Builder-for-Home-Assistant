@@ -113,6 +113,37 @@ def test_get_config_data_ignores_non_config_dicts():
     assert config[CONF_MODEL] == "qwen2.5:14b"
 
 
+def test_get_config_data_includes_service_subentries_when_live_entry_is_available():
+    """Live config entries should merge the primary service with service subentries."""
+    primary = build_service_config(
+        "http://localhost:11434",
+        "qwen2.5:14b",
+        service_id="primary",
+    )
+    backup = build_service_config(
+        "http://remote:1234",
+        "gpt-4o-mini",
+        service_id="backup",
+    )
+    entry = MagicMock()
+    entry.data = {
+        **primary,
+        CONF_DEFAULT_SERVICE_ID: "backup",
+    }
+    entry.subentries = {"backup": MagicMock(data=backup)}
+    hass = MagicMock()
+    hass.config_entries.async_entries.return_value = [entry]
+    hass.data = {DOMAIN: {}}
+
+    config = _get_config_data(hass)
+
+    assert config[CONF_DEFAULT_SERVICE_ID] == "backup"
+    assert [service[CONF_SERVICE_ID] for service in config[CONF_SERVICES]] == [
+        "primary",
+        "backup",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_start_generation_request_uses_selected_service():
     """Generation requests should pin the job to the chosen AI service."""

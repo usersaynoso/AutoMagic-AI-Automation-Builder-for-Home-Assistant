@@ -103,3 +103,26 @@ def test_openai_service_uses_fixed_endpoint_and_provider_label():
     assert build_service_label(service) == "OpenAI: gpt-4o-mini"
     assert normalized[CONF_PROVIDER] == PROVIDER_OPENAI
     assert normalized[CONF_API_KEY] == "sk-test"
+
+
+def test_normalize_config_data_includes_service_subentries():
+    """Runtime config should merge the primary service with subentry services."""
+    primary = build_service_config(
+        "http://localhost:11434",
+        "qwen2.5:14b",
+        service_id="primary",
+    )
+    subentry = {
+        "data": build_service_config(
+            "http://remote:1234",
+            "gpt-4o-mini",
+            service_id="backup",
+        )
+    }
+
+    normalized = normalize_config_data(primary, [subentry])
+
+    assert [service[CONF_SERVICE_ID] for service in normalized[CONF_SERVICES]] == [
+        "primary",
+        "backup",
+    ]

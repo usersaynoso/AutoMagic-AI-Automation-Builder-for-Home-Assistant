@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from custom_components.automagic.config_flow import (
+    AutoMagicConfigFlow,
+    AutoMagicServiceSubentryFlow,
     _async_fetch_openai_models,
     _async_resolve_openai_service,
 )
@@ -87,3 +89,10 @@ async def test_async_resolve_openai_service_builds_openai_provider_config():
     assert service[CONF_API_KEY] == "sk-live"
     assert service[CONF_ENDPOINT_URL] == "https://api.openai.com"
     assert service[CONF_MODEL] == "gpt-4o-mini"
+
+
+def test_supported_subentry_types_expose_home_assistant_add_service_button():
+    """The config flow should advertise service subentries to Home Assistant."""
+    supported = AutoMagicConfigFlow.async_get_supported_subentry_types(MagicMock())
+
+    assert supported == {"service": AutoMagicServiceSubentryFlow}

@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Connect to LLM",
-        "description": "Enter the URL of your OpenAI-compatible LLM endpoint.\n\nOllama default: http://localhost:11434\n\nAutoMagic will auto-detect the best available model for the first AI service. You can add more services later from Settings.",
+        "description": "Enter the URL of your OpenAI-compatible LLM endpoint.\n\nOllama default: http://localhost:11434\n\nAutoMagic will auto-detect the best available model for the first AI service. You can add more services later with Home Assistant's Add service button.",
         "data": {
           "endpoint_url": "LLM Endpoint URL"
         }
@@ -21,78 +21,58 @@
   },
   "options": {
     "abort": {
-      "cannot_delete_last_service": "At least one AI service must stay configured.",
-      "service_not_found": "That AI service is no longer available."
-    },
-    "error": {
-      "cannot_connect": "Cannot connect to LLM endpoint. Check the URL and ensure the server is running.",
-      "invalid_api_key": "OpenAI rejected that API key. Paste a valid key and try again.",
-      "missing_api_key": "Paste an OpenAI API key to continue.",
-      "no_models": "Connected but no models found. Install a model first or enter the model name manually."
+      "single_service": "Only one AI service is configured right now."
     },
     "step": {
       "init": {
-        "title": "Manage AI Services",
-        "description": "Add, edit, delete, or choose the default AI service used by the AutoMagic panel.",
-        "data": {
-          "action": "Action"
-        }
-      },
-      "add_service": {
-        "title": "Add AI Service",
-        "description": "Add another endpoint/model combination that can be chosen from the AutoMagic panel.",
-        "data": {
-          "endpoint_url": "LLM Endpoint URL",
-          "model": "Model (leave empty for auto-detect)",
-          "request_timeout": "Generation timeout (seconds)"
-        }
-      },
-      "add_openai_key": {
-        "title": "Add OpenAI Key",
-        "description": "Add an OpenAI service by pasting an API key. AutoMagic uses OpenAI's hosted endpoint automatically, so no model URL is needed.",
-        "data": {
-          "api_key": "OpenAI API Key",
-          "model": "Model (leave empty for auto-detect)",
-          "request_timeout": "Generation timeout (seconds)"
-        }
-      },
-      "edit_pick": {
-        "title": "Choose AI Service",
-        "description": "Pick which AI service to edit.",
-        "data": {
-          "service_id": "AI Service"
-        }
-      },
-      "edit_service": {
-        "title": "Edit AI Service",
-        "description": "Update the endpoint, model, or timeout for the selected AI service.",
-        "data": {
-          "endpoint_url": "LLM Endpoint URL",
-          "model": "Model (leave empty for auto-detect)",
-          "request_timeout": "Generation timeout (seconds)"
-        }
-      },
-      "edit_openai_key": {
-        "title": "Edit OpenAI Key",
-        "description": "Update the OpenAI model or timeout. Leave the API key blank to keep the current key.",
-        "data": {
-          "api_key": "New OpenAI API Key",
-          "model": "Model (leave empty for auto-detect)",
-          "request_timeout": "Generation timeout (seconds)"
-        }
-      },
-      "delete_service": {
-        "title": "Delete AI Service",
-        "description": "Remove one AI service from AutoMagic.",
-        "data": {
-          "service_id": "AI Service"
-        }
-      },
-      "default_service": {
         "title": "Default AI Service",
-        "description": "Choose which AI service is preselected on the AutoMagic panel.",
+        "description": "Choose which configured AI service is preselected on the AutoMagic panel.",
         "data": {
           "service_id": "AI Service"
+        }
+      }
+    }
+  },
+  "config_subentries": {
+    "service": {
+      "entry_type": "Service",
+      "initiate_flow": {
+        "user": "Add service"
+      },
+      "abort": {
+        "already_exists": "That AI service is already configured."
+      },
+      "error": {
+        "cannot_connect": "Cannot connect to the AI service. Check the details and try again.",
+        "invalid_api_key": "OpenAI rejected that API key. Paste a valid key and try again.",
+        "missing_api_key": "Paste an OpenAI API key to continue.",
+        "no_models": "Connected but no models were found. Install a model first or enter the model name manually."
+      },
+      "step": {
+        "user": {
+          "title": "Add Service",
+          "description": "Choose whether to add a compatible endpoint or an OpenAI API key.",
+          "data": {
+            "service_type": "Service Type"
+          }
+        },
+        "custom_service": {
+          "title": "Add Service",
+          "description": "Add another endpoint/model combination that AutoMagic can send prompts to.",
+          "data": {
+            "endpoint_url": "LLM Endpoint URL",
+            "model": "Model (leave empty for auto-detect)",
+            "request_timeout": "Generation timeout (seconds)"
+          }
+        },
+        "openai_service": {
+          "title": "Add OpenAI Key",
+          "description": "Add an OpenAI service by pasting an API key. AutoMagic uses OpenAI's hosted endpoint automatically, so no model URL is needed.",
+          "data": {
+            "api_key": "OpenAI API Key",
+            "model": "Model (leave empty for auto-detect)",
+            "request_timeout": "Generation timeout (seconds)"
+          }
         }
       }
     }

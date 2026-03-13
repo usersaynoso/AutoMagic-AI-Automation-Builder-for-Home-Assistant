@@ -1,0 +1,104 @@
+"""Websocket API commands for AutoMagic."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import voluptuous as vol
+
+from homeassistant.components import websocket_api
+from homeassistant.core import HomeAssistant
+
+from .api import (
+    async_get_entities_payload,
+    async_get_generation_status_payload,
+    async_get_history_payload,
+    async_install_automation_request,
+    async_start_generation_request,
+)
+
+
+@websocket_api.async_response
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "automagic/generate",
+        vol.Required("prompt"): str,
+        vol.Optional("entity_filter"): [str],
+        vol.Optional("continue_job_id"): str,
+    }
+)
+async def websocket_generate(
+    hass: HomeAssistant, connection: Any, msg: dict[str, Any]
+) -> None:
+    """Start a generation job over the authenticated HA websocket."""
+    payload, _status = await async_start_generation_request(hass, msg)
+    connection.send_result(msg["id"], payload)
+
+
+@websocket_api.async_response
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "automagic/generate_status",
+        vol.Required("job_id"): str,
+    }
+)
+async def websocket_generate_status(
+    hass: HomeAssistant, connection: Any, msg: dict[str, Any]
+) -> None:
+    """Return the current generation job status over websocket."""
+    payload, _status = await async_get_generation_status_payload(hass, msg["job_id"])
+    connection.send_result(msg["id"], payload)
+
+
+@websocket_api.async_response
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "automagic/install",
+        vol.Required("yaml"): str,
+        vol.Optional("prompt"): str,
+        vol.Optional("summary"): str,
+    }
+)
+async def websocket_install(
+    hass: HomeAssistant, connection: Any, msg: dict[str, Any]
+) -> None:
+    """Install a generated automation over websocket."""
+    payload, _status = await async_install_automation_request(hass, msg)
+    connection.send_result(msg["id"], payload)
+
+
+@websocket_api.async_response
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "automagic/entities",
+    }
+)
+async def websocket_entities(
+    hass: HomeAssistant, connection: Any, msg: dict[str, Any]
+) -> None:
+    """Return entity context data over websocket."""
+    payload, _status = await async_get_entities_payload(hass)
+    connection.send_result(msg["id"], payload)
+
+
+@websocket_api.async_response
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "automagic/history",
+    }
+)
+async def websocket_history(
+    hass: HomeAssistant, connection: Any, msg: dict[str, Any]
+) -> None:
+    """Return generation history over websocket."""
+    payload, _status = await async_get_history_payload(hass)
+    connection.send_result(msg["id"], payload)
+
+
+def async_register_websocket_commands(hass: HomeAssistant) -> None:
+    """Register AutoMagic websocket commands."""
+    websocket_api.async_register_command(hass, websocket_generate)
+    websocket_api.async_register_command(hass, websocket_generate_status)
+    websocket_api.async_register_command(hass, websocket_install)
+    websocket_api.async_register_command(hass, websocket_entities)
+    websocket_api.async_register_command(hass, websocket_history)

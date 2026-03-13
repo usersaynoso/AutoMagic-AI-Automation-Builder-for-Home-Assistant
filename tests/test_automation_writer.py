@@ -156,9 +156,12 @@ actions:
 
     assert result["success"] is True
     assert result["alias"] == "Test Automation"
-    assert result["filename"].startswith("automagic_")
-    assert result["filename"].endswith(".yaml")
+    assert result["filename"] == "automations.yaml"
     hass.async_add_executor_job.assert_called_once()
+    call_args = hass.async_add_executor_job.call_args
+    assert call_args[0][1] == "/config/automations.yaml"
+    assert call_args[0][2]["alias"] == "Test Automation"
+    assert "id" in call_args[0][2]
     hass.services.async_call.assert_called_once_with(
         "automation", "reload", blocking=True
     )
@@ -192,7 +195,7 @@ actions:
 
 @pytest.mark.asyncio
 async def test_install_fallback_to_config_root():
-    """Test writing to config root when automations/ dir doesn't exist."""
+    """Test writing to automations.yaml in config root."""
     hass = _make_hass()
     yaml_string = """\
 alias: Fallback Test
@@ -204,11 +207,11 @@ actions:
     target:
       entity_id: light.hallway
 """
-    with patch("os.path.isdir", return_value=False):
-        result = await install_automation(hass, yaml_string)
+    result = await install_automation(hass, yaml_string)
 
     assert result["success"] is True
-    # Verify the file path passed to executor job is in config root
     call_args = hass.async_add_executor_job.call_args
     filepath_arg = call_args[0][1]
-    assert "/config/automagic_" in filepath_arg
+    assert filepath_arg == "/config/automations.yaml"
+    assert call_args[0][2]["alias"] == "Fallback Test"
+    assert "id" in call_args[0][2]

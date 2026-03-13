@@ -73,7 +73,14 @@ class FakeSession:
 @pytest.mark.asyncio
 async def test_complete_success():
     """Test successful completion with valid JSON response."""
-    content = json.dumps({"yaml": "alias: Test", "summary": "A test automation"})
+    content = json.dumps(
+        {
+            "yaml": "alias: Test",
+            "summary": "A test automation",
+            "needs_clarification": False,
+            "clarifying_questions": [],
+        }
+    )
     resp = FakeResponse(200, _make_completion_response(content))
     session = FakeSession(resp)
 
@@ -85,12 +92,17 @@ async def test_complete_success():
     result = await client.complete([{"role": "user", "content": "test"}])
     assert result["yaml"] == "alias: Test"
     assert result["summary"] == "A test automation"
+    assert result["needs_clarification"] is False
+    assert result["clarifying_questions"] == []
 
 
 @pytest.mark.asyncio
 async def test_complete_strips_markdown_fences():
     """Test that markdown code fences are stripped before parsing."""
-    raw = '```json\n{"yaml": "alias: Fenced", "summary": "fenced"}\n```'
+    raw = (
+        '```json\n{"yaml": "alias: Fenced", "summary": "fenced", '
+        '"needs_clarification": false, "clarifying_questions": []}\n```'
+    )
     resp = FakeResponse(200, _make_completion_response(raw))
     session = FakeSession(resp)
 
@@ -149,9 +161,104 @@ async def test_complete_invalid_json_content():
 
 
 @pytest.mark.asyncio
+async def test_complete_salvages_loose_yaml_content():
+    """Plain YAML responses should still be accepted when they contain a full automation."""
+    raw = (
+        "yaml\n"
+        "yaml:\n"
+        "alias: Victron Phase Imbalance Alert\n"
+        "description: Warn on a phase imbalance.\n"
+        "triggers:\n"
+        "  - trigger: template\n"
+        "actions:\n"
+        "  - action: light.turn_on\n"
+    )
+    resp = FakeResponse(200, _make_completion_response(raw))
+    session = FakeSession(resp)
+
+    client = LLMClient(
+        endpoint_url="http://localhost:11434",
+        model="llama3",
+        session=session,
+    )
+    result = await client.complete([{"role": "user", "content": "test"}])
+
+    assert result["needs_clarification"] is False
+    assert "alias: Victron Phase Imbalance Alert" in result["yaml"]
+    assert "triggers:" in result["yaml"]
+    assert "actions:" in result["yaml"]
+
+
+@pytest.mark.asyncio
+async def test_complete_salvages_loose_yaml_before_repairable_syntax_fixups():
+    """Loose YAML should still parse before later repair when the model uses legacy section keys."""
+    raw = (
+        "yaml\n"
+        "yaml:\n"
+        "alias: Victron Phase Imbalance Alert\n"
+        "description: Warn on a phase imbalance.\n"
+        "trigger:\n"
+        "  - platform: template\n"
+        "action:\n"
+        "  - service: light.turn_on\n"
+    )
+    resp = FakeResponse(200, _make_completion_response(raw))
+    session = FakeSession(resp)
+
+    client = LLMClient(
+        endpoint_url="http://localhost:11434",
+        model="llama3",
+        session=session,
+    )
+    result = await client.complete([{"role": "user", "content": "test"}])
+
+    assert result["needs_clarification"] is False
+    assert "alias: Victron Phase Imbalance Alert" in result["yaml"]
+    assert "trigger:" in result["yaml"]
+    assert "action:" in result["yaml"]
+
+
+@pytest.mark.asyncio
+async def test_complete_salvages_fenced_yaml_block_scalars_with_single_item_lists():
+    """Fenced yaml: | responses should unwrap into a single automation mapping."""
+    raw = (
+        "```yaml\n"
+        "yaml: |\n"
+        "  - alias: Victron Phase Imbalance Alert\n"
+        "    description: Warn on a phase imbalance.\n"
+        "    trigger:\n"
+        "      - platform: template\n"
+        "    action:\n"
+        "      - service: light.turn_on\n"
+        "```"
+    )
+    resp = FakeResponse(200, _make_completion_response(raw))
+    session = FakeSession(resp)
+
+    client = LLMClient(
+        endpoint_url="http://localhost:11434",
+        model="llama3",
+        session=session,
+    )
+    result = await client.complete([{"role": "user", "content": "test"}])
+
+    assert result["needs_clarification"] is False
+    assert result["yaml"].startswith("alias: Victron Phase Imbalance Alert")
+    assert "\ntrigger:\n" in result["yaml"]
+    assert "\naction:\n" in result["yaml"]
+
+
+@pytest.mark.asyncio
 async def test_complete_null_model_handled():
     """Test that null model field in response (LM Studio quirk) is handled."""
-    content = json.dumps({"yaml": "alias: Test", "summary": "test"})
+    content = json.dumps(
+        {
+            "yaml": "alias: Test",
+            "summary": "test",
+            "needs_clarification": False,
+            "clarifying_questions": [],
+        }
+    )
     resp = FakeResponse(200, _make_completion_response(content, model=None))
     session = FakeSession(resp)
 
@@ -162,6 +269,57 @@ async def test_complete_null_model_handled():
     )
     result = await client.complete([{"role": "user", "content": "test"}])
     assert result["yaml"] == "alias: Test"
+
+
+@pytest.mark.asyncio
+async def test_complete_returns_clarification_payload():
+    """Explicit clarification responses should stay interactive."""
+    content = json.dumps(
+        {
+            "yaml": None,
+            "summary": "I need to know which light should flash.",
+            "needs_clarification": True,
+            "clarifying_questions": ["Which light should flash?"],
+        }
+    )
+    resp = FakeResponse(200, _make_completion_response(content))
+    session = FakeSession(resp)
+
+    client = LLMClient(
+        endpoint_url="http://localhost:11434",
+        model="llama3",
+        session=session,
+    )
+    result = await client.complete([{"role": "user", "content": "test"}])
+
+    assert result["yaml"] is None
+    assert result["needs_clarification"] is True
+    assert result["clarifying_questions"] == ["Which light should flash?"]
+
+
+@pytest.mark.asyncio
+async def test_complete_treats_question_only_summary_as_clarification():
+    """Question-shaped summaries without YAML should not be marked complete."""
+    content = json.dumps(
+        {
+            "yaml": None,
+            "summary": "Which light should flash when the door opens?",
+        }
+    )
+    resp = FakeResponse(200, _make_completion_response(content))
+    session = FakeSession(resp)
+
+    client = LLMClient(
+        endpoint_url="http://localhost:11434",
+        model="llama3",
+        session=session,
+    )
+    result = await client.complete([{"role": "user", "content": "test"}])
+
+    assert result["needs_clarification"] is True
+    assert result["clarifying_questions"] == [
+        "Which light should flash when the door opens?"
+    ]
 
 
 @pytest.mark.asyncio
@@ -180,6 +338,16 @@ async def test_from_config():
     assert client._max_tokens == 4096
     assert client._request_timeout == 480
     assert client._temperature == 0.5
+
+
+def test_default_request_timeout_is_900_seconds():
+    """Local clients should default to the longer generation timeout."""
+    client = LLMClient(
+        endpoint_url="http://localhost:11434",
+        model="qwen2.5:3b-16k",
+    )
+
+    assert client._request_timeout == 900
 
 
 @pytest.mark.asyncio

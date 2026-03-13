@@ -19,12 +19,14 @@ from .api import (
     AutoMagicInstallView,
 )
 from .const import DOMAIN
+from .ws_api import async_register_websocket_commands
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 _CARD_URL = "/automagic/automagic-card.js"
 _DATA_STATIC_REGISTERED = "static_registered"
 _DATA_VIEWS_REGISTERED = "views_registered"
+_DATA_WS_REGISTERED = "ws_registered"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -57,6 +59,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.http.register_view(AutoMagicEntitiesView())
         hass.http.register_view(AutoMagicHistoryView())
         domain_data[_DATA_VIEWS_REGISTERED] = True
+
+    if not domain_data.get(_DATA_WS_REGISTERED):
+        async_register_websocket_commands(hass)
+        domain_data[_DATA_WS_REGISTERED] = True
 
     # Make the card JS available as a Lovelace resource so users can add
     # custom:automagic-card to any dashboard without manual resource setup.
@@ -97,6 +103,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     if not any(isinstance(value, dict) for value in domain_data.values()):
         frontend.async_remove_panel(hass, "automagic")
+        domain_data.pop(_DATA_STATIC_REGISTERED, None)
+        domain_data.pop(_DATA_VIEWS_REGISTERED, None)
+        domain_data.pop(_DATA_WS_REGISTERED, None)
 
     _LOGGER.info("AutoMagic integration unloaded")
     return True

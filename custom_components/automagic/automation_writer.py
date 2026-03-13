@@ -105,28 +105,14 @@ async def install_automation(
         return {"success": False, "error": str(err)}
 
     alias = parsed["alias"]
-    short_id = uuid.uuid4().hex[:8]
-    filename = f"automagic_{short_id}.yaml"
+    if "id" not in parsed:
+        parsed = {"id": uuid.uuid4().hex, **parsed}
 
-    # Determine where to write
-    automations_dir = hass.config.path("automations")
-    if os.path.isdir(automations_dir):
-        filepath = os.path.join(automations_dir, filename)
-    else:
-        # Fallback: write to config root alongside automations.yaml
-        filepath = hass.config.path(filename)
+    filepath = hass.config.path("automations.yaml")
 
     # Write the file
     try:
-        # Wrap in a list so HA can merge it with other automation files
-        automation_list = [parsed]
-        yaml_output = yaml.dump(
-            automation_list,
-            default_flow_style=False,
-            allow_unicode=True,
-            sort_keys=False,
-        )
-        await hass.async_add_executor_job(_write_file, filepath, yaml_output)
+        await hass.async_add_executor_job(_append_automation, filepath, parsed)
     except OSError as err:
         _LOGGER.error("Failed to write automation file %s: %s", filepath, err)
         return {"success": False, "error": f"Failed to write file: {err}"}
@@ -140,7 +126,7 @@ async def install_automation(
         # Don't fail the install - file was written successfully
 
     _LOGGER.info("Installed automation '%s' to %s", alias, filepath)
-    return {"success": True, "alias": alias, "filename": filename}
+    return {"success": True, "alias": alias, "filename": "automations.yaml"}
 
 
 def _write_file(filepath: str, content: str) -> None:
@@ -148,3 +134,28 @@ def _write_file(filepath: str, content: str) -> None:
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(content)
+
+
+def _append_automation(filepath: str, automation: dict[str, Any]) -> None:
+    """Append a single automation entry to automations.yaml without rewriting existing data."""
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+    snippet = yaml.dump(
+        [automation],
+        default_flow_style=False,
+        allow_unicode=True,
+        sort_keys=False,
+    )
+
+    if os.path.exists(filepath):
+        with open(filepath, encoding="utf-8") as f:
+            existing = f.read()
+    else:
+        existing = ""
+
+    with open(filepath, "a", encoding="utf-8") as f:
+        if existing and not existing.endswith("\n"):
+            f.write("\n")
+        if existing.strip():
+            f.write("\n")
+        f.write(snippet)

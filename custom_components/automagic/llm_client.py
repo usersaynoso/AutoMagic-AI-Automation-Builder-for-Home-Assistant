@@ -20,7 +20,28 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-_FENCE_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?\s*```", re.DOTALL)
+_FENCE_RE = re.compile(r"```(?:[a-z0-9_+-]+)?\s*\n?(.*?)\n?\s*```", re.DOTALL | re.IGNORECASE)
+_LEADING_LIST_MARKER_RE = re.compile(r"^(?:[-*]\s+|\d+[\).\s]+)")
+_QUESTION_STARTERS = (
+    "which ",
+    "what ",
+    "when ",
+    "where ",
+    "who ",
+    "how ",
+    "do you ",
+    "does ",
+    "should ",
+    "would ",
+    "could ",
+    "can you ",
+    "is it ",
+    "are there ",
+)
+_FIELD_LINE_RE = re.compile(
+    r"^\s*(summary|needs_clarification|clarifying_questions|questions|follow_up_questions)\s*:",
+    re.IGNORECASE,
+)
 
 STATUS_PROBE_TIMEOUT = 5
 
@@ -31,6 +52,168 @@ class LLMConnectionError(Exception):
 
 class LLMResponseError(Exception):
     """Raised when the LLM response cannot be parsed."""
+
+
+def _normalize_text(raw: Any) -> str:
+    """Return a stripped string representation for a response field."""
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw.strip()
+    return str(raw).strip()
+
+
+def _normalize_questions(raw: Any) -> list[str]:
+    """Normalize question fields into a clean list of strings."""
+    items: list[str] = []
+
+    if raw is None:
+        return items
+
+    if isinstance(raw, str):
+        candidates = raw.splitlines()
+    elif isinstance(raw, list):
+        candidates = raw
+    else:
+        candidates = [raw]
+
+    for candidate in candidates:
+        text = _normalize_text(candidate)
+        if not text:
+            continue
+        text = _LEADING_LIST_MARKER_RE.sub("", text).strip()
+        if text:
+            items.append(text)
+
+    return items
+
+
+def _looks_like_question(text: str) -> bool:
+    """Heuristic for models that ask a question in summary without schema fields."""
+    normalized = _normalize_text(text).lower()
+    if not normalized:
+        return False
+    return normalized.endswith("?") or normalized.startswith(_QUESTION_STARTERS)
+
+
+def _extract_loose_yaml_response(content: str) -> dict[str, Any] | None:
+    """Salvage YAML when the model ignores the requested JSON wrapper."""
+    raw_text = _normalize_text(content)
+    fence_match = _FENCE_RE.search(raw_text)
+    text = _normalize_text(fence_match.group(1) if fence_match else raw_text)
+    if not text:
+        return None
+
+    lines = text.splitlines()
+    first_nonempty_index = next(
+        (index for index, line in enumerate(lines) if _normalize_text(line)),
+        -1,
+    )
+    if first_nonempty_index != -1 and re.match(
+        r"^\s*yaml\s*$",
+        lines[first_nonempty_index],
+        re.IGNORECASE,
+    ):
+        lines = lines[first_nonempty_index + 1 :]
+        first_nonempty_index = next(
+            (index for index, line in enumerate(lines) if _normalize_text(line)),
+            -1,
+        )
+    if first_nonempty_index != -1 and re.match(
+        r"^\s*yaml\s*:?\s*(\|)?\s*$",
+        lines[first_nonempty_index],
+        re.IGNORECASE,
+    ):
+        body_lines = lines[first_nonempty_index + 1 :]
+        if "|" in lines[first_nonempty_index]:
+            indents = [
+                len(line) - len(line.lstrip())
+                for line in body_lines
+                if line.strip()
+            ]
+            if indents:
+                min_indent = min(indents)
+                body_lines = [
+                    line[min_indent:] if len(line) >= min_indent else ""
+                    for line in body_lines
+                ]
+        lines = body_lines
+
+    summary = ""
+    for line in lines:
+        if re.match(r"^\s*summary\s*:", line, re.IGNORECASE):
+            summary = _normalize_text(re.sub(r"^\s*summary\s*:\s*", "", line, flags=re.IGNORECASE))
+            break
+
+    alias_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if re.match(r"^\s*(?:-\s*)?alias\s*:", line, re.IGNORECASE)
+        ),
+        -1,
+    )
+
+    if alias_index == -1:
+        yaml_label_index = next(
+            (index for index, line in enumerate(lines) if re.match(r"^\s*yaml\s*:?\s*$", line, re.IGNORECASE)),
+            -1,
+        )
+        if yaml_label_index != -1:
+            alias_index = next(
+                (
+                    index
+                    for index, line in enumerate(lines)
+                    if index > yaml_label_index
+                    and re.match(r"^\s*(?:-\s*)?alias\s*:", line, re.IGNORECASE)
+                ),
+                -1,
+            )
+
+    if alias_index == -1:
+        return None
+
+    yaml_lines = lines[alias_index:]
+    trailing_index = next(
+        (
+            index
+            for index, line in enumerate(yaml_lines)
+            if index > 0 and _FIELD_LINE_RE.match(line)
+        ),
+        -1,
+    )
+    if trailing_index != -1:
+        yaml_lines = yaml_lines[:trailing_index]
+
+    yaml_text = "\n".join(yaml_lines).strip()
+    if re.match(r"^\s*-\s*alias\s*:", yaml_text, re.IGNORECASE):
+        list_lines = yaml_text.splitlines()
+        first_line = re.sub(r"^(\s*)-\s+", r"\1", list_lines[0], count=1)
+        normalized_lines = [first_line]
+        for line in list_lines[1:]:
+            if not line.strip():
+                normalized_lines.append("")
+                continue
+            normalized_lines.append(line[2:] if line.startswith("  ") else line)
+        candidate = "\n".join(normalized_lines).strip()
+        if re.search(r"^alias\s*:", candidate, re.MULTILINE):
+            yaml_text = candidate
+
+    if not yaml_text:
+        return None
+    if not re.search(r"^alias\s*:", yaml_text, re.MULTILINE):
+        return None
+    if not re.search(r"^(triggers?|trigger|platform)\s*:", yaml_text, re.MULTILINE):
+        return None
+    if not re.search(r"^(actions?|action|service)\s*:", yaml_text, re.MULTILINE):
+        return None
+
+    return {
+        "yaml": yaml_text,
+        "summary": summary,
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
 
 
 class LLMClient:
@@ -201,14 +384,61 @@ class LLMClient:
                 content = fence_match.group(1)
 
             content = content.strip()
-            parsed = json.loads(content)
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError:
+                parsed = _extract_loose_yaml_response(content)
+                if parsed is None:
+                    raise
 
             if not isinstance(parsed, dict):
                 raise LLMResponseError(
                     f"LLM response is not a JSON object: {type(parsed)}"
                 )
 
-            return parsed
+            yaml_text = _normalize_text(parsed.get("yaml"))
+            summary = _normalize_text(parsed.get("summary"))
+            needs_clarification = bool(parsed.get("needs_clarification"))
+            clarifying_questions = _normalize_questions(
+                parsed.get("clarifying_questions")
+                or parsed.get("questions")
+                or parsed.get("follow_up_questions")
+            )
+
+            if not yaml_text:
+                if clarifying_questions:
+                    needs_clarification = True
+                elif needs_clarification and summary:
+                    clarifying_questions = [summary]
+                elif summary and _looks_like_question(summary):
+                    needs_clarification = True
+                    clarifying_questions = [summary]
+
+            if needs_clarification:
+                if not summary:
+                    summary = (
+                        "I need a bit more detail before I can generate the automation."
+                    )
+                if not clarifying_questions:
+                    clarifying_questions = [summary]
+                return {
+                    "yaml": None,
+                    "summary": summary,
+                    "needs_clarification": True,
+                    "clarifying_questions": clarifying_questions,
+                }
+
+            if not yaml_text:
+                raise LLMResponseError(
+                    "LLM response did not include automation YAML or clarification questions"
+                )
+
+            return {
+                "yaml": yaml_text,
+                "summary": summary,
+                "needs_clarification": False,
+                "clarifying_questions": [],
+            }
 
         except (json.JSONDecodeError, KeyError, IndexError, TypeError) as err:
             raise LLMResponseError(f"Failed to parse LLM response: {err}") from err

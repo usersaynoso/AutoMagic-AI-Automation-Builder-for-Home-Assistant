@@ -10,7 +10,7 @@ CONF_CONTEXT_LIMIT = "context_limit"
 
 DEFAULT_ENDPOINT = "http://localhost:11434"
 DEFAULT_MAX_TOKENS = 4096
-DEFAULT_REQUEST_TIMEOUT = 300
+DEFAULT_REQUEST_TIMEOUT = 900
 DEFAULT_TEMPERATURE = 0.15
 # 0 = send all entities (no artificial cap)
 DEFAULT_CONTEXT_LIMIT = 0
@@ -40,6 +40,7 @@ PRIORITY_DOMAINS = [
     "camera",
     "weather",
     "automation",
+    "notify",
     "script",
     "scene",
     "input_boolean",

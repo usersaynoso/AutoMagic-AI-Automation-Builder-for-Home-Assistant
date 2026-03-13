@@ -43,6 +43,7 @@ _HA_MODULES = [
     "homeassistant.data_entry_flow",
     "homeassistant.components",
     "homeassistant.components.http",
+    "homeassistant.components.websocket_api",
     "homeassistant.components.frontend",
     "homeassistant.components.panel_custom",
     "homeassistant.components.automation",
@@ -79,6 +80,13 @@ http_mod.StaticPathConfig = type(
     (),
     {"__init__": lambda self, url_path, path, cache_headers=True: None},
 )
+
+ws_mod = sys.modules["homeassistant.components.websocket_api"]
+ws_mod.async_register_command = MagicMock()
+ws_mod.async_response = lambda f: f
+ws_mod.websocket_command = lambda schema: (lambda f: f)
+components_mod = sys.modules["homeassistant.components"]
+components_mod.websocket_api = ws_mod
 
 frontend_mod = sys.modules["homeassistant.components.frontend"]
 frontend_mod.async_register_built_in_panel = MagicMock()

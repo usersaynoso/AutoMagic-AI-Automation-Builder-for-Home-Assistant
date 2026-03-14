@@ -21,6 +21,10 @@ _LOGGER = logging.getLogger(__name__)
 _LEGACY_TRIGGER_KEY = "platform"
 _LEGACY_ACTION_KEY = "service"
 _ACTION_FORMAT_RE = re.compile(r"^[a-z_]+\.[a-z_0-9]+$")
+_INVALID_SCENE_SERVICES = {
+    "scene.turn_all_off",
+    "scene.turn_all_on",
+}
 _TOP_LEVEL_WEEKDAY_ERROR = (
     "'weekday:' is not a valid top-level automation key. Weekday restrictions "
     "must go inside a 'condition: time' block under conditions: or inside a "
@@ -118,6 +122,12 @@ def validate_automation(parsed: dict[str, Any]) -> None:
                 f"<domain>.<service_name> format (e.g. 'light.turn_on', not "
                 f"'light.kitchen.turn_on'). Use action: <domain>.<service> with "
                 f"a separate target: entity_id: field."
+            )
+        if isinstance(action_value, str) and action_value in _INVALID_SCENE_SERVICES:
+            raise AutomationValidationError(
+                f"Action {i}: '{action_value}' is not a valid Home Assistant service. "
+                "Scenes are activated with 'action: scene.turn_on' and a 'target: entity_id:' field. "
+                "There is no turn_all_off or turn_all_on scene service."
             )
 
 

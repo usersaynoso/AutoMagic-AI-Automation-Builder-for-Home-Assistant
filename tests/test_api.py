@@ -14,6 +14,9 @@ from custom_components.automagic.api import (
     AutoMagicGenerateView,
     AutoMagicGenerateStatusView,
     AutoMagicHistoryEntryView,
+    _INSTALL_REPAIR_SYSTEM_PROMPT,
+    _YAML_REGENERATION_SYSTEM_PROMPT,
+    _YAML_REPAIR_SYSTEM_PROMPT,
     _extract_explicit_state_guards,
     _build_yaml_regeneration_messages,
     _build_yaml_repair_hints,
@@ -24,6 +27,7 @@ from custom_components.automagic.api import (
     _extract_entity_ids_from_yaml,
     _find_hallucinated_entities,
     _get_config_data,
+    _regenerate_generation_result,
     _run_generation_job,
     _validate_generated_yaml,
     _yaml_guard_is_in_conditions_block,
@@ -2004,6 +2008,186 @@ def test_yaml_repair_hints_include_top_level_conditions_guard_example():
     assert any("entity_id: switch.mesh_mesh_led" in hint for hint in hints)
 
 
+def test_collect_generated_yaml_issues_flags_missing_light_colour_and_brightness_data():
+    """Prompt-aware validation should reject light.turn_on actions that omit requested colour data."""
+    prompt = "When the front door opens, turn the bar lamp warm white at 20% brightness."
+    entities = [
+        {
+            "entity_id": "binary_sensor.front_door",
+            "name": "Front Door",
+            "state": "off",
+            "domain": "binary_sensor",
+        },
+        {
+            "entity_id": "light.bar_lamp",
+            "name": "Bar Lamp",
+            "state": "off",
+            "domain": "light",
+        },
+    ]
+    yaml_text = (
+        "alias: Bar Lamp Warm White\n"
+        "description: Turn on the bar lamp when the front door opens.\n"
+        "triggers:\n"
+        "  - trigger: state\n"
+        "    entity_id: binary_sensor.front_door\n"
+        '    to: "on"\n'
+        "conditions: []\n"
+        "actions:\n"
+        "  - action: light.turn_on\n"
+        "    target:\n"
+        "      entity_id: light.bar_lamp\n"
+        "mode: single\n"
+    )
+
+    issues = _collect_generated_yaml_issues(prompt, entities, yaml_text)
+
+    assert any(
+        (
+            "The prompt requests a specific colour or brightness for lights, but no "
+            "light.turn_on action includes colour or brightness data."
+        )
+        in issue
+        for issue in issues
+    )
+
+
+def test_collect_generated_yaml_issues_flags_unconditional_notify_after_delay():
+    """Prompt-aware validation should require a choose block for delayed conditional notifications."""
+    prompt = (
+        "Start Janet cleaning now. If she hasn't finished after 90 minutes, send a "
+        "notification to my iPhone."
+    )
+    entities = [
+        {
+            "entity_id": "vacuum.robot_vacuum",
+            "name": "Janet",
+            "state": "cleaning",
+            "domain": "vacuum",
+        },
+        {
+            "entity_id": "notify.mobile_app_iphone_13",
+            "name": "Notify Iphone 13",
+            "state": "service",
+            "domain": "notify",
+        },
+    ]
+    yaml_text = (
+        "alias: Janet Delay Notify\n"
+        "description: Notify after Janet is delayed.\n"
+        "triggers:\n"
+        "  - trigger: time\n"
+        '    at: "08:00:00"\n'
+        "conditions: []\n"
+        "actions:\n"
+        "  - action: vacuum.start\n"
+        "    target:\n"
+        "      entity_id: vacuum.robot_vacuum\n"
+        '  - delay: "01:30:00"\n'
+        "  - action: notify.mobile_app_iphone_13\n"
+        "    data:\n"
+        '      message: "Janet is still cleaning"\n'
+        "mode: single\n"
+    )
+
+    issues = _collect_generated_yaml_issues(prompt, entities, yaml_text)
+
+    assert (
+        "After a delay the prompt requires a conditional notification — notify only if a "
+        "condition is still true. Wrap the notify action in a choose: block after the delay "
+        "that re-checks the relevant entity state before sending the notification."
+    ) in issues
+
+
+def test_yaml_repair_hints_include_conditional_notification_example():
+    """Repair hints should explain the choose block shape for delayed notify checks."""
+    hints = _build_yaml_repair_hints(
+        [
+            "After a delay the prompt requires a conditional notification — notify only if a "
+            "condition is still true. Wrap the notify action in a choose: block after the delay "
+            "that re-checks the relevant entity state before sending the notification."
+        ]
+    )
+
+    assert any(
+        "After a delay, use choose: to re-check the relevant state before notifying."
+        in hint
+        for hint in hints
+    )
+    assert any("entity_id: <relevant_entity>" in hint for hint in hints)
+    assert any("action: <notify_service>" in hint for hint in hints)
+
+
+def test_yaml_regeneration_messages_discard_prior_assistant_turns():
+    """Regeneration should start from system/user context only, without prior drafts."""
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "original request"},
+        {"role": "assistant", "content": "broken draft"},
+        {"role": "user", "content": "follow-up detail"},
+    ]
+
+    regeneration_messages = _build_yaml_regeneration_messages(
+        messages,
+        ["Invalid YAML"],
+        attempt_number=2,
+    )
+
+    assert not any(message["role"] == "assistant" for message in regeneration_messages)
+    assert not any(
+        message["content"] == "broken draft" for message in regeneration_messages
+    )
+    assert any(
+        message["content"] == "original request" for message in regeneration_messages
+    )
+    assert any(
+        message["content"] == "follow-up detail" for message in regeneration_messages
+    )
+
+
+def test_repair_prompts_require_light_colour_and_brightness_data():
+    """Repair-oriented backend prompts should preserve requested light colour and brightness fields."""
+    for prompt in (
+        _YAML_REPAIR_SYSTEM_PROMPT,
+        _YAML_REGENERATION_SYSTEM_PROMPT,
+        _INSTALL_REPAIR_SYSTEM_PROMPT,
+    ):
+        assert "every affected" in prompt
+        assert "light.turn_on action MUST include a data: block" in prompt
+        assert "brightness_pct" in prompt
+
+
+@pytest.mark.asyncio
+async def test_regenerate_generation_result_caps_rounds_and_marks_job_error():
+    """Repeated regeneration failures should stop and surface a helpful error."""
+    hass = _make_hass()
+    job = _create_generation_job(hass, "Turn on the kitchen lights", None)
+    fake_client = MagicMock()
+    fake_client.complete = AsyncMock(side_effect=LLMResponseError("bad response"))
+
+    result = await _regenerate_generation_result(
+        fake_client,
+        [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "Turn on the kitchen lights"},
+        ],
+        "Turn on the kitchen lights",
+        [],
+        "Initial response was invalid",
+        job,
+    )
+
+    assert result == {}
+    assert fake_client.complete.await_count == 6
+    assert job["status"] == "error"
+    assert (
+        job["error"]
+        == "AutoMagic could not produce valid automation YAML after multiple correction attempts. "
+        "Try rephrasing your request or switch to a larger model. More capable models handle "
+        "complex multi-step automations significantly better than smaller local models."
+    )
+
+
 @pytest.mark.asyncio
 async def test_run_generation_job_repairs_prompt_coverage_issues_before_completion():
     """Semantically wrong but parseable YAML should be sent back to the AI for correction."""
@@ -2134,23 +2318,23 @@ async def test_run_generation_job_repairs_prompt_coverage_issues_before_completi
             "      entity_id: vacuum.robot_vacuum\n"
             "  - action: light.turn_on\n"
             "    target:\n"
-            "      entity_id:\n"
-            "        - light.lounge_strip_lights_left\n"
-            "        - light.lounge_strip_lights_right\n"
-            "        - light.bar_lamp\n"
+            "      entity_id: [light.lounge_strip_lights_left, light.lounge_strip_lights_right, light.bar_lamp]\n"
             "    data:\n"
             "      brightness_pct: 20\n"
             "      kelvin: 2700\n"
             '  - delay: "01:30:00"\n'
-            "  - action: notify.mobile_app_iphone_13\n"
-            "    data:\n"
-            '      message: "Janet is still cleaning after 90 minutes - she might be stuck"\n'
+            "  - choose:\n"
+            "      - conditions:\n"
+            "          - condition: state\n"
+            "            entity_id: vacuum.robot_vacuum\n"
+            '            state: "cleaning"\n'
+            "        sequence:\n"
+            "          - action: notify.mobile_app_iphone_13\n"
+            "            data:\n"
+            '              message: "Janet is still cleaning after 90 minutes - she might be stuck"\n'
             "  - action: light.turn_off\n"
             "    target:\n"
-            "      entity_id:\n"
-            "        - light.lounge_strip_lights_left\n"
-            "        - light.lounge_strip_lights_right\n"
-            "        - light.bar_lamp\n"
+            "      entity_id: [light.lounge_strip_lights_left, light.lounge_strip_lights_right, light.bar_lamp]\n"
             "mode: single\n"
         ),
         "summary": "Starts Janet cleaning on weekdays when the requested guards pass.",
@@ -2307,10 +2491,7 @@ async def test_run_generation_job_keeps_repairing_latest_yaml_before_regeneratio
             "      entity_id: vacuum.robot_vacuum\n"
             "  - action: light.turn_on\n"
             "    target:\n"
-            "      entity_id:\n"
-            "        - light.lounge_strip_lights_left\n"
-            "        - light.lounge_strip_lights_right\n"
-            "        - light.bar_lamp\n"
+            "      entity_id: [light.lounge_strip_lights_left, light.lounge_strip_lights_right, light.bar_lamp]\n"
             "    data:\n"
             "      brightness_pct: 20\n"
             "      kelvin: 2700\n"
@@ -2347,10 +2528,7 @@ async def test_run_generation_job_keeps_repairing_latest_yaml_before_regeneratio
             "      entity_id: vacuum.robot_vacuum\n"
             "  - action: light.turn_on\n"
             "    target:\n"
-            "      entity_id:\n"
-            "        - light.lounge_strip_lights_left\n"
-            "        - light.lounge_strip_lights_right\n"
-            "        - light.bar_lamp\n"
+            "      entity_id: [light.lounge_strip_lights_left, light.lounge_strip_lights_right, light.bar_lamp]\n"
             "    data:\n"
             "      brightness_pct: 20\n"
             "      kelvin: 2700\n"
@@ -2395,23 +2573,23 @@ async def test_run_generation_job_keeps_repairing_latest_yaml_before_regeneratio
             "      entity_id: vacuum.robot_vacuum\n"
             "  - action: light.turn_on\n"
             "    target:\n"
-            "      entity_id:\n"
-            "        - light.lounge_strip_lights_left\n"
-            "        - light.lounge_strip_lights_right\n"
-            "        - light.bar_lamp\n"
+            "      entity_id: [light.lounge_strip_lights_left, light.lounge_strip_lights_right, light.bar_lamp]\n"
             "    data:\n"
             "      brightness_pct: 20\n"
             "      kelvin: 2700\n"
             '  - delay: "01:30:00"\n'
-            "  - action: notify.mobile_app_iphone_13\n"
-            "    data:\n"
-            '      message: "Janet is still cleaning after 90 minutes - she might be stuck"\n'
+            "  - choose:\n"
+            "      - conditions:\n"
+            "          - condition: state\n"
+            "            entity_id: vacuum.robot_vacuum\n"
+            '            state: "cleaning"\n'
+            "        sequence:\n"
+            "          - action: notify.mobile_app_iphone_13\n"
+            "            data:\n"
+            '              message: "Janet is still cleaning after 90 minutes - she might be stuck"\n'
             "  - action: light.turn_off\n"
             "    target:\n"
-            "      entity_id:\n"
-            "        - light.lounge_strip_lights_left\n"
-            "        - light.lounge_strip_lights_right\n"
-            "        - light.bar_lamp\n"
+            "      entity_id: [light.lounge_strip_lights_left, light.lounge_strip_lights_right, light.bar_lamp]\n"
             "mode: single\n"
         ),
         "summary": "Starts Janet cleaning on weekdays when the requested guards pass.",

@@ -93,6 +93,10 @@ also return the full current or updated YAML in "yaml".
 - For complex multi-step requests, use variables, choose blocks, delay/wait steps, and \
 template conditions or template values as needed. Return one complete automation unless \
 the user explicitly asks for multiple automations.
+- When the prompt requests a specific colour or brightness for lights, every affected \
+light.turn_on action MUST include a data: block with at least one colour field \
+(color_temp in mireds, color_name, rgb_color, or kelvin) and brightness_pct. \
+Never drop colour or brightness attributes to resolve a different error.
 - Read the entire request as one combined condition/action sequence before deciding \
 anything is missing. Do not ask about a sub-step when the needed threshold, guard, time \
 window, or follow-up action is already stated elsewhere in the same prompt.
@@ -115,6 +119,10 @@ listed set together and do not ask which single entity to use if the set is alre
 - When different threshold or state clauses clearly refer to different entity families, map \
 each clause to its matching family and use all listed siblings in that family together. Do \
 not ask the user to choose just one family when the prompt already distinguishes the families.
+- When the prompt says to turn lights on while a device or process is active and off when \
+it finishes, the automation MUST include an explicit off sequence. Use a state trigger on \
+the device reaching its finished/idle/docked state, or a wait_for_trigger inside the \
+actions block, followed by light.turn_off. Do not leave lights on indefinitely with no off path.
 - If a follow-up question would only restate a threshold, delay branch, or fallback action \
 that is already explicit in the user's prompt, use the exact prompt clause instead of asking \
 again.

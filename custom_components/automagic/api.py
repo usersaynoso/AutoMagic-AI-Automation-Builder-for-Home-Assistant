@@ -78,6 +78,7 @@ _BACKEND_PROBE_INTERVAL_SECONDS = 10
 _DEFAULT_GENERATION_CONTEXT_LIMIT = 60
 _YAML_REPAIR_ATTEMPTS = 4
 _YAML_REGENERATION_ATTEMPTS = 2
+_MAX_REGENERATION_ROUNDS = 3
 _TIME_WINDOW_RE = re.compile(
     r"\bbetween\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s+(?:and|to|-)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b",
     re.IGNORECASE,
@@ -133,6 +134,10 @@ For example use - delay: "00:05:00", not - action: delay.
 - Do not wrap the YAML in markdown fences, yaml:, automation:, or a list item.
 - Put notify text under data: with a message key.
 - Preserve the user's thresholds, guards, delays, entities, and notification text.
+- When the prompt requests a specific colour or brightness for lights, every affected
+  light.turn_on action MUST include a data: block with at least one colour field
+  (color_temp in mireds, color_name, rgb_color, or kelvin) and brightness_pct.
+  Never drop colour or brightness attributes to resolve a different error.
 Do not ask for clarification. Return the final corrected JSON now."""
 _YAML_REGENERATION_SYSTEM_PROMPT = """\
 You are an expert Home Assistant automation generation assistant.
@@ -150,6 +155,10 @@ For example use - delay: "00:05:00", not - action: delay.
 - Do not wrap the YAML in markdown fences, yaml:, automation:, or a list item.
 - Put notify text under data: with a message key.
 - Preserve the user's thresholds, guards, delays, entities, and notification text.
+- When the prompt requests a specific colour or brightness for lights, every affected
+  light.turn_on action MUST include a data: block with at least one colour field
+  (color_temp in mireds, color_name, rgb_color, or kelvin) and brightness_pct.
+  Never drop colour or brightness attributes to resolve a different error.
 If prior drafts were invalid, ignore them and regenerate the automation cleanly from the original request and entity context.
 Do not ask for clarification unless the original request truly lacks a required detail. Return the final automation JSON now."""
 _ENTITY_REPAIR_SYSTEM_PROMPT = """\
@@ -189,6 +198,10 @@ For example use - delay: "00:05:00", not - action: delay.
 - Do not wrap the YAML in markdown fences, yaml:, automation:, or a list item.
 - Put notify text under data: with a message key.
 Preserve the user's thresholds, guards, delays, entities, and notification text.
+- When the prompt requests a specific colour or brightness for lights, every affected
+  light.turn_on action MUST include a data: block with at least one colour field
+  (color_temp in mireds, color_name, rgb_color, or kelvin) and brightness_pct.
+  Never drop colour or brightness attributes to resolve a different error.
 Do not ask for clarification. Return the final corrected JSON now."""
 
 
@@ -725,6 +738,25 @@ def _build_yaml_repair_hints(issues: list[str]) -> list[str]:
     if "color_name values should not use underscore" in combined:
         hints.append(
             "Use valid light color fields such as kelvin, color_temp, rgb_color, or a supported CSS color_name."
+        )
+    if (
+        "conditional notification" in combined
+        or "wrap the notify action in a choose" in combined
+    ):
+        hints.append(
+            "After a delay, use choose: to re-check the relevant state before notifying. "
+            "An unconditional notify after delay ignores whether the condition is still true. "
+            "Structure:\n"
+            "  - delay: \"HH:MM:SS\"\n"
+            "  - choose:\n"
+            "      - conditions:\n"
+            "          - condition: state\n"
+            "            entity_id: <relevant_entity>\n"
+            "            state: \"<still_active_state>\"\n"
+            "        sequence:\n"
+            "          - action: <notify_service>\n"
+            "            data:\n"
+            "              message: \"<message>\""
         )
     if "preserve all resolved guard entities" in combined:
         guard_entity_ids = _extract_multi_entity_guard_issue_entity_ids(issues, limit=2)
@@ -1558,6 +1590,49 @@ def _collect_generated_yaml_issues(
         issues.append(
             "Use a valid Home Assistant light color. color_name values should not use underscore-separated names such as warm_white; prefer kelvin, color_temp, or a valid CSS color name."
         )
+    colour_prompt_re = re.compile(
+        r"\b(warm white|warm light|colour|color|\d{4}k)\b", re.IGNORECASE
+    )
+    colour_data_re = re.compile(
+        r"\b(color_temp|kelvin|color_name|rgb_color|xy_color|brightness_pct|brightness)\b",
+        re.IGNORECASE,
+    )
+    if colour_prompt_re.search(prompt_text):
+        light_action_blocks = re.findall(
+            r"action:\s*light\.turn_on[\s\S]{0,400}?(?=\n\s*-\s|\Z)",
+            normalized_yaml,
+            re.IGNORECASE,
+        )
+        if light_action_blocks and not any(
+            colour_data_re.search(block) for block in light_action_blocks
+        ):
+            issues.append(
+                "The prompt requests a specific colour or brightness for lights, but no "
+                "light.turn_on action includes colour or brightness data. Add a data: block "
+                "with color_temp (in mireds, e.g. 370 for 2700K warm white), brightness_pct, "
+                "or another valid colour field to every affected light.turn_on action."
+            )
+    delay_notify_re = re.compile(
+        r"delay:[\s\S]{0,400}?action:\s*notify\.", re.IGNORECASE
+    )
+    delay_choose_re = re.compile(
+        r"delay:[\s\S]{0,400}?choose:", re.IGNORECASE
+    )
+    conditional_notify_prompt_re = re.compile(
+        r"\b(if.{0,60}(not finished|still|stuck|hasn.t|hasn't)|"
+        r"(notify|notification|message).{0,60}(if|only if|when))\b",
+        re.IGNORECASE,
+    )
+    if (
+        delay_notify_re.search(normalized_yaml)
+        and not delay_choose_re.search(normalized_yaml)
+        and conditional_notify_prompt_re.search(prompt_text)
+    ):
+        issues.append(
+            "After a delay the prompt requires a conditional notification — notify only if a "
+            "condition is still true. Wrap the notify action in a choose: block after the delay "
+            "that re-checks the relevant entity state before sending the notification."
+        )
 
     return list(dict.fromkeys(issue for issue in issues if issue))
 
@@ -2221,8 +2296,19 @@ async def _regenerate_generation_result(
     last_result: dict[str, Any] | None = None
     regeneration_attempt = 0
     repair_attempt = 0
+    regeneration_round = 0
 
     while True:
+        regeneration_round += 1
+        if regeneration_round > _MAX_REGENERATION_ROUNDS:
+            if job is not None:
+                _mark_job_error(
+                    job,
+                    "AutoMagic could not produce valid automation YAML after multiple correction attempts. "
+                    "Try rephrasing your request or switch to a larger model. More capable models handle "
+                    "complex multi-step automations significantly better than smaller local models.",
+                )
+            return last_result or {}
         for _attempt in range(_YAML_REGENERATION_ATTEMPTS):
             regeneration_attempt += 1
             if job is not None:
@@ -2499,7 +2585,7 @@ async def _run_generation_job(
                 err,
             )
             try:
-                return await _regenerate_generation_result(
+                regenerated = await _regenerate_generation_result(
                     client,
                     request_messages,
                     prompt_text,
@@ -2507,6 +2593,9 @@ async def _run_generation_job(
                     str(err),
                     job,
                 )
+                if job.get("status") == "error":
+                    return None
+                return regenerated
             except LLMConnectionError as regen_err:
                 _LOGGER.error(
                     "LLM connection error during regeneration fallback: %s",

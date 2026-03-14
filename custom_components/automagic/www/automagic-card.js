@@ -163,6 +163,10 @@ const SIMPLE_ACTION_DOMAINS = new Set([
   "input_boolean",
   "media_player",
 ]);
+const INVALID_SCENE_SERVICES = new Set([
+  "scene.turn_all_off",
+  "scene.turn_all_on",
+]);
 const DIRECT_COMPLEX_PROMPT_RE =
   /\b(if|then|else|otherwise|instead|wait|delay|unless|while|after|before|between|weekday|weekdays|weekend|weekends|above|below|exceeds|drops|greater than|less than|notification|notify|flash|brightness|whichever|triggered)\b/i;
 const DIRECT_SYSTEM_PROMPT = `You are an expert Home Assistant automation engineer.
@@ -206,6 +210,7 @@ OUTPUT RULES:
 - For follow-up change requests, revise the current automation and return the full updated YAML, not a partial diff.
 - For follow-up questions about the current automation, answer briefly in "summary" and also return the full current or updated YAML in "yaml".
 - For complex multi-step requests, use variables, choose blocks, delay/wait steps, and template conditions or template values as needed. Return one complete automation unless the user explicitly asks for multiple automations.
+- When the prompt requests a specific colour or brightness for lights, every affected light.turn_on action MUST include a data: block with at least one colour field (color_temp in mireds, color_name, rgb_color, or kelvin) and brightness_pct. Never drop colour or brightness attributes to resolve a different error.
 - Read the entire request as one combined condition/action sequence before deciding anything is missing. Do not ask about a sub-step when the needed threshold, guard, time window, or follow-up action is already stated elsewhere in the same prompt.
 - Interpret wattage/watts/kW as power, amps/amperage as current, and volts as voltage when matching sensor families from the provided entities.
 - Treat time-window guards or exclusions such as "not between 9am and 5pm on a weekday" as conditions, not as the automation's trigger schedule.
@@ -215,6 +220,7 @@ OUTPUT RULES:
 - When a matched entity has sibling variants such as left/right, L1/L2/L3, or numbered variants, and the user asks for all/both/three/every member of the set, include the full relevant sibling set.
 - When the user refers to any/all/both/three/every member of a sibling set, use the whole listed set together and do not ask which single entity to use if the set is already present.
 - When different threshold or state clauses clearly refer to different entity families, map each clause to its matching family and use all listed siblings in that family together. Do not ask the user to choose just one family when the prompt already distinguishes voltage vs current, temperature vs humidity, upstairs vs downstairs, or similar pairings.
+- When the prompt says to turn lights on while a device or process is active and off when it finishes, the automation MUST include an explicit off sequence. Use a state trigger on the device reaching its finished/idle/docked state, or a wait_for_trigger inside the actions block, followed by light.turn_off. Do not leave lights on indefinitely with no off path.
 - When the user refers to a named automation concept such as a balance, bedtime, heating, washing, or security automation, match the provided automation.* entities whose names share that concept. Use the matching automation entities as guards or conditions without asking which single automation to use when the concept is already specific enough.
 - When the user names a phone, tablet, or mobile device and a matching notify.* service is present in the provided list, use that notify service directly instead of asking again which notification target to use.
 - Preserve exact thresholds, colors, brightness, flash counts, delays, weekday/time exclusions, and guard conditions from the user's request unless they conflict.
@@ -1436,6 +1442,20 @@ class AutoMagicCard extends LitElement {
         "Action 0: bare 'condition:' inside actions: is not valid flow control. Use a 'choose:' block with a 'conditions:' list and 'sequence:' to branch, or move the condition to the top-level conditions: block."
       );
     }
+    let actionIndex = -1;
+    actionSection.split(/\r?\n/).forEach((line) => {
+      if (/^  -\s+/.test(line)) {
+        actionIndex += 1;
+      }
+      const actionMatch = line.match(/^  -\s*action\s*:\s*([^\s#]+)/i);
+      const actionValue = this._normalizeText(actionMatch?.[1]);
+      if (!actionValue || !INVALID_SCENE_SERVICES.has(actionValue)) {
+        return;
+      }
+      issues.push(
+        `Action ${actionIndex}: '${actionValue}' is not a valid Home Assistant service. Scenes are activated with 'action: scene.turn_on' and a 'target: entity_id:' field. There is no turn_all_off or turn_all_on scene service.`
+      );
+    });
     if (/^  -\s*trigger\s*:/m.test(actionSection)) {
       issues.push("Action items under actions: must not be triggers.");
     }
@@ -1653,6 +1673,35 @@ class AutoMagicCard extends LitElement {
     ) {
       issues.push("Preserve the requested full brightness in the fallback branch.");
     }
+    const colourPromptRe = /\b(warm white|warm light|colour|color|\d{4}k)\b/i;
+    const colourDataRe =
+      /\b(color_temp|kelvin|color_name|rgb_color|xy_color|brightness_pct|brightness)\b/i;
+    if (colourPromptRe.test(requestText)) {
+      const lightActionBlocks = text.match(
+        /action:\s*light\.turn_on[\s\S]{0,400}?(?=\n\s*-\s|$)/gi
+      );
+      if (
+        lightActionBlocks?.length &&
+        !lightActionBlocks.some((block) => colourDataRe.test(block))
+      ) {
+        issues.push(
+          "The prompt requests a specific colour or brightness for lights, but no light.turn_on action includes colour or brightness data. Add a data: block with color_temp (in mireds, e.g. 370 for 2700K warm white), brightness_pct, or another valid colour field to every affected light.turn_on action."
+        );
+      }
+    }
+    const delayNotifyRe = /delay:[\s\S]{0,400}?action:\s*notify\./i;
+    const delayChooseRe = /delay:[\s\S]{0,400}?choose:/i;
+    const conditionalNotifyPromptRe =
+      /\b(if.{0,60}(not finished|still|stuck|hasn.t|hasn't)|(notify|notification|message).{0,60}(if|only if|when))\b/i;
+    if (
+      delayNotifyRe.test(text) &&
+      !delayChooseRe.test(text) &&
+      conditionalNotifyPromptRe.test(requestText)
+    ) {
+      issues.push(
+        "After a delay the prompt requires a conditional notification — notify only if a condition is still true. Wrap the notify action in a choose: block after the delay that re-checks the relevant entity state before sending the notification."
+      );
+    }
     if (
       /\bdisable\b/i.test(requestText) &&
       /action:\s*switch\.turn_on[\s\S]*?entity_id:\s*switch\./m.test(text)
@@ -1829,6 +1878,26 @@ class AutoMagicCard extends LitElement {
     if (combined.includes("color_name values should not use underscore")) {
       hints.push(
         "Use valid light color fields such as kelvin, color_temp, rgb_color, or a supported CSS color_name."
+      );
+    }
+    if (
+      combined.includes("conditional notification") ||
+      combined.includes("wrap the notify action in a choose")
+    ) {
+      hints.push(
+        "After a delay, use choose: to re-check the relevant state before notifying. " +
+          "An unconditional notify after delay ignores whether the condition is still true. " +
+          "Structure:\n" +
+          '  - delay: "HH:MM:SS"\n' +
+          "  - choose:\n" +
+          "      - conditions:\n" +
+          "          - condition: state\n" +
+          "            entity_id: <relevant_entity>\n" +
+          '            state: "<still_active_state>"\n' +
+          "        sequence:\n" +
+          "          - action: <notify_service>\n" +
+          "            data:\n" +
+          '              message: "<message>"'
       );
     }
     if (combined.includes("preserve all resolved guard entities")) {

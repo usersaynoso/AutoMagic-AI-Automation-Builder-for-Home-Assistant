@@ -124,6 +124,10 @@ const DIRECT_PLANNER_MODEL_PREFERENCES = ["qwen2.5:0.5b-16k"];
 const DIRECT_MAX_TOKENS = 2048;
 const DIRECT_TEMPERATURE = 0.15;
 const DIRECT_FENCE_RE = /```(?:[a-z0-9_+-]+)?\s*\n?(.*?)\n?\s*```/is;
+const INVALID_SCENE_SERVICES = new Set([
+  "scene.turn_all_off",
+  "scene.turn_all_on",
+]);
 const DIRECT_SYSTEM_PROMPT = "Test system prompt";
 const DIRECT_RESOLVED_SYSTEM_PROMPT = "Test resolved system prompt";
 const DIRECT_PLANNER_SYSTEM_PROMPT = "Test planner prompt";
@@ -205,6 +209,7 @@ function buildMethod(name) {
     "DIRECT_REPAIR_ATTEMPTS",
     "DIRECT_REGENERATION_ATTEMPTS",
     "DIRECT_FENCE_RE",
+    "INVALID_SCENE_SERVICES",
     "DIRECT_SYSTEM_PROMPT",
     "DIRECT_RESOLVED_SYSTEM_PROMPT",
     "DIRECT_PLANNER_SYSTEM_PROMPT",
@@ -232,6 +237,7 @@ function buildMethod(name) {
     4,
     2,
     DIRECT_FENCE_RE,
+    INVALID_SCENE_SERVICES,
     DIRECT_SYSTEM_PROMPT,
     DIRECT_RESOLVED_SYSTEM_PROMPT,
     DIRECT_PLANNER_SYSTEM_PROMPT,
@@ -2576,6 +2582,31 @@ actions:
   );
 });
 
+test("YAML issue detection rejects invalid scene turn_all services", () => {
+  const harness = buildHarness();
+  const issues = harness._collectYamlIssues.call(
+    harness,
+    `alias: Broken Scene Example
+description: Example
+triggers:
+  - trigger: state
+    entity_id: binary_sensor.front_door
+    to: "on"
+conditions: []
+actions:
+  - action: scene.turn_all_off
+    target:
+      entity_id: scene.evening
+mode: single`
+  );
+
+  assert.ok(
+    issues.includes(
+      "Action 0: 'scene.turn_all_off' is not a valid Home Assistant service. Scenes are activated with 'action: scene.turn_on' and a 'target: entity_id:' field. There is no turn_all_off or turn_all_on scene service."
+    )
+  );
+});
+
 test("Prompt-aware repair issues catch missing grouped entities, notify targets, and follow-up branches", () => {
   const harness = buildHarness();
   const prompt =
@@ -2842,6 +2873,89 @@ mode: single`,
   );
 });
 
+test("Prompt-aware coverage issues catch missing light colour and brightness data", () => {
+  const harness = buildHarness();
+  const issues = harness._collectYamlCoverageIssues.call(
+    harness,
+    "When the front door opens, turn the bar lamp warm white at 20% brightness.",
+    `alias: Bar Lamp Warm White
+description: Example
+triggers:
+  - trigger: state
+    entity_id: binary_sensor.front_door
+    to: "on"
+conditions: []
+actions:
+  - action: light.turn_on
+    target:
+      entity_id: light.bar_lamp
+mode: single`,
+    {
+      entities: [
+        {
+          entity_id: "binary_sensor.front_door",
+          name: "Front Door",
+          domain: "binary_sensor",
+        },
+        {
+          entity_id: "light.bar_lamp",
+          name: "Bar Lamp",
+          domain: "light",
+        },
+      ],
+    }
+  );
+
+  assert.ok(
+    issues.includes(
+      "The prompt requests a specific colour or brightness for lights, but no light.turn_on action includes colour or brightness data. Add a data: block with color_temp (in mireds, e.g. 370 for 2700K warm white), brightness_pct, or another valid colour field to every affected light.turn_on action."
+    )
+  );
+});
+
+test("Prompt-aware coverage issues catch unconditional delayed notifications", () => {
+  const harness = buildHarness();
+  const issues = harness._collectYamlCoverageIssues.call(
+    harness,
+    "Start Janet cleaning now. If she hasn't finished after 90 minutes, send a notification to my iPhone.",
+    `alias: Janet Delay Notify
+description: Example
+triggers:
+  - trigger: time
+    at: "08:00:00"
+conditions: []
+actions:
+  - action: vacuum.start
+    target:
+      entity_id: vacuum.robot_vacuum
+  - delay: "01:30:00"
+  - action: notify.mobile_app_iphone_13
+    data:
+      message: "Janet is still cleaning"
+mode: single`,
+    {
+      entities: [
+        {
+          entity_id: "vacuum.robot_vacuum",
+          name: "Janet",
+          domain: "vacuum",
+        },
+        {
+          entity_id: "notify.mobile_app_iphone_13",
+          name: "Notify Iphone 13",
+          domain: "notify",
+        },
+      ],
+    }
+  );
+
+  assert.ok(
+    issues.includes(
+      "After a delay the prompt requires a conditional notification — notify only if a condition is still true. Wrap the notify action in a choose: block after the delay that re-checks the relevant entity state before sending the notification."
+    )
+  );
+});
+
 test("Guard placement only counts inside the top-level conditions block", () => {
   const harness = buildHarness();
 
@@ -2883,6 +2997,23 @@ mode: single`,
     ),
     false
   );
+});
+
+test("Repair hints explain delayed conditional notifications with a choose block", () => {
+  const harness = buildHarness();
+  const hints = harness._buildRepairHints.call(harness, [
+    "After a delay the prompt requires a conditional notification — notify only if a condition is still true. Wrap the notify action in a choose: block after the delay that re-checks the relevant entity state before sending the notification.",
+  ]);
+
+  assert.ok(
+    hints.some((hint) =>
+      hint.includes(
+        "After a delay, use choose: to re-check the relevant state before notifying."
+      )
+    )
+  );
+  assert.ok(hints.some((hint) => hint.includes("entity_id: <relevant_entity>")));
+  assert.ok(hints.some((hint) => hint.includes("action: <notify_service>")));
 });
 
 test("Prompt-aware coverage issues reject guards nested only inside choose branches", () => {
@@ -3578,4 +3709,14 @@ test("Source includes a dedicated syntax rewrite fallback for invalid YAML", () 
 test("Source encodes do-not-run guards as top-level conditions", () => {
   assert.match(cardSource, /top-level conditions: block/);
   assert.match(cardSource, /not as a choose: branch inside actions:/);
+});
+
+test("Source encodes light colour coverage and explicit light-off rules", () => {
+  assert.match(
+    cardSource,
+    /every affected light\.turn_on action MUST include a data: block/i
+  );
+  assert.match(cardSource, /brightness_pct/i);
+  assert.match(cardSource, /automation MUST include an explicit off sequence/i);
+  assert.match(cardSource, /Do not leave lights on indefinitely with no off path/i);
 });

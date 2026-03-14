@@ -197,6 +197,19 @@ class TestValidateAutomation:
         with pytest.raises(AutomationValidationError, match="<domain>.<service_name> format"):
             validate_automation(parsed)
 
+    def test_invalid_scene_service_rejected(self):
+        """Known-bad scene services should point to scene.turn_on with a target."""
+        parsed = {
+            "alias": "Test",
+            "triggers": [{"trigger": "state", "entity_id": "binary_sensor.door"}],
+            "actions": [{"action": "scene.turn_all_off"}],
+        }
+        with pytest.raises(
+            AutomationValidationError,
+            match="scene.turn_all_off.*not a valid Home Assistant service",
+        ):
+            validate_automation(parsed)
+
 
 # ---- Install tests ----
 

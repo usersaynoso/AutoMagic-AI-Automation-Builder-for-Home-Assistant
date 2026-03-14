@@ -68,6 +68,13 @@ class TestBuildPrompt:
         assert "top-level conditions: block" in SYSTEM_PROMPT
         assert "not as a choose: branch inside" in SYSTEM_PROMPT
 
+    def test_system_prompt_requires_light_colour_data_and_explicit_off_paths(self):
+        """System prompt should preserve requested light attributes and turn lights back off."""
+        assert "every affected light.turn_on action MUST include a data: block" in SYSTEM_PROMPT
+        assert "brightness_pct" in SYSTEM_PROMPT
+        assert "automation MUST include an explicit off sequence" in SYSTEM_PROMPT
+        assert "Do not leave lights on indefinitely with no off path." in SYSTEM_PROMPT
+
     def test_empty_entity_summary(self):
         """Should still produce valid messages with empty entity list."""
         result = build_prompt("Turn on lights", "")

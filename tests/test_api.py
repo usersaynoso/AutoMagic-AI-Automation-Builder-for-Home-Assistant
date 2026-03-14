@@ -637,6 +637,117 @@ async def test_run_generation_job_reasserts_resolved_clarification_once():
 
 
 @pytest.mark.asyncio
+async def test_run_generation_job_repairs_invalid_yaml_after_auto_clarification():
+    """Auto-answered clarification retries should still repair broken yaml before completion."""
+    hass = _make_hass()
+    job = _create_generation_job(
+        hass,
+        "Monitor all three AC output phases from the Victron",
+        None,
+    )
+
+    entities = [
+        {
+            "entity_id": "sensor.victron_mk3_ac_output_voltage",
+            "name": "AC Output Voltage",
+            "state": "230",
+            "domain": "sensor",
+            "device_class": "voltage",
+        },
+        {
+            "entity_id": "sensor.victron_mk3_ac_output_voltage_l2",
+            "name": "AC Output Voltage L2",
+            "state": "229",
+            "domain": "sensor",
+            "device_class": "voltage",
+        },
+        {
+            "entity_id": "sensor.victron_mk3_ac_output_voltage_l3",
+            "name": "AC Output Voltage L3",
+            "state": "228",
+            "domain": "sensor",
+            "device_class": "voltage",
+        },
+        {
+            "entity_id": "notify.mobile_app_iphone_13",
+            "name": "Notify Iphone 13",
+            "state": "service",
+            "domain": "notify",
+            "device_class": "service",
+        },
+    ]
+    fake_client = MagicMock()
+    fake_client._request_timeout = 420
+    fake_client.complete = AsyncMock(
+        side_effect=[
+            {
+                "yaml": None,
+                "summary": "Need a specific voltage sensor.",
+                "needs_clarification": True,
+                "clarifying_questions": [
+                    "Which sensor should I use for AC Output Voltage? (sensor.victron_mk3_ac_output_voltage or sensor.victron_mk3_ac_output_voltage_l2 or sensor.victron_mk3_ac_output_voltage_l3)"
+                ],
+            },
+            {
+                "yaml": (
+                    "alias: Victron Alert\n"
+                    "description: Turn on lights: phase alert\n"
+                    "triggers:\n"
+                    "  - trigger: template\n"
+                    "actions:\n"
+                    "  - action: notify.mobile_app_iphone_13\n"
+                ),
+                "summary": "Broken draft",
+                "needs_clarification": False,
+                "clarifying_questions": [],
+            },
+            {
+                "yaml": (
+                    "alias: Victron Alert\n"
+                    "description: Warns on phase imbalance.\n"
+                    "triggers:\n"
+                    "  - trigger: template\n"
+                    "conditions: []\n"
+                    "actions:\n"
+                    "  - action: notify.mobile_app_iphone_13\n"
+                    "mode: single\n"
+                ),
+                "summary": "Warns on phase imbalance.",
+                "needs_clarification": False,
+                "clarifying_questions": [],
+            },
+        ]
+    )
+
+    with patch(
+        "custom_components.automagic.api.get_entity_context",
+        AsyncMock(return_value=entities),
+    ), patch(
+        "custom_components.automagic.api.async_get_clientsession",
+        return_value=MagicMock(),
+    ), patch(
+        "custom_components.automagic.api.LLMClient.from_config",
+        return_value=fake_client,
+    ):
+        await _run_generation_job(
+            hass,
+            job["job_id"],
+            (
+                "Monitor all three AC output phases from the Victron. "
+                "If any single phase voltage drops below 210 volts, notify me."
+            ),
+            None,
+        )
+
+    assert job["status"] == "completed"
+    assert "description: Warns on phase imbalance." in job["yaml"]
+    assert fake_client.complete.await_count == 3
+    repair_messages = fake_client.complete.await_args_list[2].args[0]
+    assert repair_messages[-1]["role"] == "user"
+    assert "Problems to fix:" in repair_messages[-1]["content"]
+
+
+@pytest.mark.asyncio
 async def test_run_generation_job_surfaces_llm_connection_errors():
     """LLM timeouts should be stored on the job for polling clients."""
     hass = _make_hass()

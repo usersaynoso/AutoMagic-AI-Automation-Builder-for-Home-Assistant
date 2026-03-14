@@ -860,6 +860,34 @@ async def _run_generation_job(
             _mark_job_error(job, f"Unexpected generation error: {err}")
             return None
 
+    async def _complete_and_repair_messages(
+        request_messages: list[dict[str, str]],
+    ) -> dict[str, Any] | None:
+        result = await _complete_messages(request_messages)
+        if result is None:
+            return None
+
+        try:
+            return await _repair_generation_result(
+                client,
+                request_messages,
+                prompt_text,
+                prompt_entities,
+                result,
+            )
+        except LLMConnectionError as err:
+            _LOGGER.error("LLM connection error during YAML repair: %s", err)
+            _mark_job_error(job, str(err))
+            return None
+        except LLMResponseError as err:
+            _LOGGER.error("LLM response error during YAML repair: %s", err)
+            _mark_job_error(job, str(err))
+            return None
+        except Exception as err:  # pragma: no cover - defensive guard
+            _LOGGER.exception("Unexpected YAML repair error")
+            _mark_job_error(job, f"Unexpected generation error: {err}")
+            return None
+
     timeout_message = (
         f"Waiting for the model response. AutoMagic will wait up to {request_timeout}s."
         if request_timeout
@@ -871,28 +899,8 @@ async def _run_generation_job(
         timeout_message,
     )
 
-    result = await _complete_messages(messages)
+    result = await _complete_and_repair_messages(messages)
     if result is None:
-        return
-    try:
-        result = await _repair_generation_result(
-            client,
-            messages,
-            prompt_text,
-            prompt_entities,
-            result,
-        )
-    except LLMConnectionError as err:
-        _LOGGER.error("LLM connection error during YAML repair: %s", err)
-        _mark_job_error(job, str(err))
-        return
-    except LLMResponseError as err:
-        _LOGGER.error("LLM response error during YAML repair: %s", err)
-        _mark_job_error(job, str(err))
-        return
-    except Exception as err:  # pragma: no cover - defensive guard
-        _LOGGER.exception("Unexpected YAML repair error")
-        _mark_job_error(job, f"Unexpected generation error: {err}")
         return
 
     entities_used = [entity["entity_id"] for entity in prompt_entities]
@@ -924,7 +932,7 @@ async def _run_generation_job(
                 "Resolving an obvious grouped-entity clarification...",
                 "AutoMagic matched the grouped entity family from the original prompt and asked the model to continue.",
             )
-            result = await _complete_messages(auto_messages)
+            result = await _complete_and_repair_messages(auto_messages)
             if result is None:
                 return
 
@@ -962,7 +970,7 @@ async def _run_generation_job(
                     "Reasserting an already-resolved clarification...",
                     "AutoMagic restated the resolved entity and guard mappings from the original prompt and asked the model to continue.",
                 )
-                result = await _complete_messages(retry_messages)
+                result = await _complete_and_repair_messages(retry_messages)
                 if result is None:
                     return
 

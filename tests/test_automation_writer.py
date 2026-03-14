@@ -201,6 +201,30 @@ actions:
 
 
 @pytest.mark.asyncio
+async def test_install_salvages_malformed_json_wrapped_yaml_before_validation():
+    """Install should accept broken JSON wrappers that embed raw multiline yaml."""
+    hass = _make_hass()
+    yaml_string = """\
+{"yaml":"
+alias: Test Automation
+triggers:
+  - trigger: state
+    entity_id: binary_sensor.door
+    to: "on"
+actions:
+  - action: light.turn_on
+    target:
+      entity_id: light.hallway
+","summary":"Ready for repair","needs_clarification":false}
+"""
+    result = await install_automation(hass, yaml_string)
+
+    assert result["success"] is True
+    assert result["alias"] == "Test Automation"
+    hass.async_add_executor_job.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_install_legacy_syntax_rejected():
     """Test that legacy syntax is caught during install."""
     hass = _make_hass()

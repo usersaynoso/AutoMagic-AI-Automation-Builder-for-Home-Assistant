@@ -12,7 +12,7 @@ import yaml
 
 from homeassistant.core import HomeAssistant
 
-from .llm_client import _extract_loose_yaml_response
+from .llm_client import _normalize_automation_yaml_text
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -94,10 +94,7 @@ async def install_automation(
     Returns:
         A dict with success status, alias, filename, or error message.
     """
-    yaml_string = str(yaml_string or "").strip()
-    salvaged = _extract_loose_yaml_response(yaml_string)
-    if salvaged is not None and salvaged.get("yaml"):
-        yaml_string = str(salvaged["yaml"]).strip()
+    yaml_string = _normalize_automation_yaml_text(yaml_string)
 
     # Parse YAML
     try:

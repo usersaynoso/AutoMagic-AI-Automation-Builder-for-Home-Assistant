@@ -230,11 +230,77 @@ def _extract_loose_yaml_response(content: str) -> dict[str, Any] | None:
     }
 
 
+def _extract_malformed_json_yaml_response(content: str) -> dict[str, Any] | None:
+    """Salvage malformed JSON wrappers that embed raw multi-line YAML."""
+    text = str(content or "")
+    yaml_match = re.search(r'"yaml"\s*:\s*"', text)
+    if yaml_match is None:
+        return None
+
+    yaml_tail = text[yaml_match.end() :]
+    summary_match = re.search(r'([\s\S]*?)"\s*,\s*"summary"\s*:', yaml_tail)
+    yaml_only_match = re.search(r'([\s\S]*?)"\s*(?:,|\})', yaml_tail)
+
+    if summary_match is not None:
+        yaml_text = summary_match.group(1)
+    elif yaml_only_match is not None:
+        yaml_text = yaml_only_match.group(1)
+    else:
+        yaml_text = yaml_tail
+
+    yaml_text = (
+        yaml_text.replace("\\r", "")
+        .replace("\\n", "\n")
+        .replace('\\"', '"')
+        .replace("\\\\", "\\")
+        .rstrip('"')
+        .strip()
+    )
+    if not yaml_text:
+        return None
+
+    summary = ""
+    if summary_match is not None:
+        summary_tail = yaml_tail[summary_match.end() :]
+        if summary_tail.startswith('"'):
+            summary_tail = summary_tail[1:]
+        summary_end_match = re.search(
+            r'([\s\S]*?)"\s*,\s*"'
+            r'(?:needs_clarification|clarifying_questions|questions|follow_up_questions)'
+            r'"\s*:',
+            summary_tail,
+        )
+        if summary_end_match is not None:
+            summary = summary_end_match.group(1)
+        else:
+            summary = summary_tail.rstrip('"')
+        summary = _normalize_text(
+            summary.replace("\\r", "")
+            .replace("\\n", "\n")
+            .replace('\\"', '"')
+            .replace("\\\\", "\\")
+        )
+
+    if not re.search(r"^alias\s*:", yaml_text, re.MULTILINE):
+        return None
+
+    return {
+        "yaml": yaml_text,
+        "summary": summary,
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+
+
 def _normalize_automation_yaml_text(raw: Any) -> str:
     """Normalize wrapped YAML strings into a direct automation document."""
     text = _normalize_text(raw)
     if not text:
         return ""
+
+    malformed = _extract_malformed_json_yaml_response(text)
+    if malformed is not None:
+        return _normalize_text(malformed.get("yaml"))
 
     salvaged = _extract_loose_yaml_response(text)
     if salvaged is not None:
@@ -491,7 +557,9 @@ class LLMClient:
             try:
                 parsed = json.loads(content)
             except json.JSONDecodeError:
-                parsed = _extract_loose_yaml_response(content)
+                parsed = _extract_malformed_json_yaml_response(
+                    content
+                ) or _extract_loose_yaml_response(content)
                 if parsed is None:
                     raise
 

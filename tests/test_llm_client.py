@@ -361,6 +361,53 @@ async def test_complete_normalizes_wrapped_yaml_string_inside_json_payload():
 
 
 @pytest.mark.asyncio
+async def test_complete_salvages_malformed_json_wrapper_with_raw_yaml():
+    """Broken JSON wrappers with raw multiline yaml should still be accepted."""
+    raw = (
+        '{"yaml":"\n'
+        "alias: Victron Phase Imbalance Alert\n"
+        "description: Warn on a phase imbalance.\n"
+        "triggers:\n"
+        "  - trigger: template\n"
+        "actions:\n"
+        "  - action: light.turn_on\n"
+        '","summary":"Ready for repair","needs_clarification":false}'
+    )
+    resp = FakeResponse(200, _make_completion_response(raw))
+    session = FakeSession(resp)
+
+    client = LLMClient(
+        endpoint_url="http://localhost:11434",
+        model="llama3",
+        session=session,
+    )
+    result = await client.complete([{"role": "user", "content": "test"}])
+
+    assert result["needs_clarification"] is False
+    assert result["yaml"].startswith("alias: Victron Phase Imbalance Alert")
+    assert result["summary"] == "Ready for repair"
+
+
+@pytest.mark.asyncio
+async def test_complete_salvages_truncated_json_wrapper_with_partial_yaml():
+    """Partially truncated JSON wrappers should still surface the yaml for repair."""
+    raw = '{\n "yaml": "alias: Victron Phase Imbalance Monitor\\n"\n \t\t\n \t\t}'
+    resp = FakeResponse(200, _make_completion_response(raw))
+    session = FakeSession(resp)
+
+    client = LLMClient(
+        endpoint_url="http://localhost:11434",
+        model="llama3",
+        session=session,
+    )
+    result = await client.complete([{"role": "user", "content": "test"}])
+
+    assert result["needs_clarification"] is False
+    assert result["yaml"] == "alias: Victron Phase Imbalance Monitor"
+    assert result["summary"] == ""
+
+
+@pytest.mark.asyncio
 async def test_complete_salvages_fenced_yaml_block_scalars_with_single_item_lists():
     """Fenced yaml: | responses should unwrap into a single automation mapping."""
     raw = (

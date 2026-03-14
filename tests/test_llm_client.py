@@ -250,6 +250,41 @@ async def test_complete_salvages_loose_yaml_before_repairable_syntax_fixups():
 
 
 @pytest.mark.asyncio
+async def test_complete_normalizes_wrapped_yaml_string_inside_json_payload():
+    """JSON payloads with a wrapped yaml string should be flattened before returning."""
+    content = json.dumps(
+        {
+            "yaml": (
+                "yaml\n"
+                "yaml:\n"
+                "alias: Victron Phase Imbalance Alert\n"
+                "description: Warn on a phase imbalance.\n"
+                "triggers:\n"
+                "  - trigger: template\n"
+                "actions:\n"
+                "  - action: light.turn_on\n"
+            ),
+            "summary": "Ready to install",
+            "needs_clarification": False,
+            "clarifying_questions": [],
+        }
+    )
+    resp = FakeResponse(200, _make_completion_response(content))
+    session = FakeSession(resp)
+
+    client = LLMClient(
+        endpoint_url="http://localhost:11434",
+        model="llama3",
+        session=session,
+    )
+    result = await client.complete([{"role": "user", "content": "test"}])
+
+    assert result["needs_clarification"] is False
+    assert result["yaml"].startswith("alias: Victron Phase Imbalance Alert")
+    assert not result["yaml"].startswith("yaml")
+
+
+@pytest.mark.asyncio
 async def test_complete_salvages_fenced_yaml_block_scalars_with_single_item_lists():
     """Fenced yaml: | responses should unwrap into a single automation mapping."""
     raw = (

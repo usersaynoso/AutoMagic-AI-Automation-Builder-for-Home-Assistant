@@ -15,7 +15,7 @@
     "step": {
       "user": {
         "title": "Connect to LLM",
-        "description": "Enter the URL of your OpenAI-compatible LLM endpoint.\n\nOllama default: http://localhost:11434\n\nAutoMagic will auto-detect the best available model for the first AI service. You can add more services later with Home Assistant's Add service button.",
+        "description": "Enter the URL of your OpenAI-compatible LLM endpoint.\n\nOllama default: http://localhost:11434\n\nAutoMagic will auto-detect the best available model for the first AI service. You can add more services later with Home Assistant's Add model button.",
         "data": {
           "endpoint_url": "LLM Endpoint URL"
         }
@@ -45,7 +45,7 @@
       "title": "AI service",
       "entry_type": "Service",
       "initiate_flow": {
-        "user": "Add service"
+        "user": "Add model"
       },
       "abort": {
         "already_exists": "That AI service is already configured.",
@@ -61,7 +61,7 @@
       },
       "step": {
         "user": {
-          "title": "Add Service",
+          "title": "Add Model",
           "description": "Choose whether to add a Local LLM or an OpenAI API key.",
           "data": {
             "service_type": "Service Type"

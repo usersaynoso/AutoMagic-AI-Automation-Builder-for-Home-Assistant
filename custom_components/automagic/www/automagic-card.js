@@ -475,13 +475,18 @@ class AutoMagicCard extends LitElement {
   }
 
   _appendChatMessage(message) {
+    const nextMessage = {
+      role: "assistant",
+      type: "text",
+      ...message,
+    };
+    if (nextMessage.type === "yaml") {
+      nextMessage.yaml = this._normalizeAutomationYamlText(nextMessage.yaml);
+      nextMessage.parsedAutomation = this._parseYaml(nextMessage.yaml);
+    }
     this._chatMessages = [
       ...this._chatMessages,
-      {
-        role: "assistant",
-        type: "text",
-        ...message,
-      },
+      nextMessage,
     ];
     return this._chatMessages.length - 1;
   }
@@ -1066,6 +1071,13 @@ class AutoMagicCard extends LitElement {
     };
   }
 
+  _normalizeAutomationYamlText(rawYaml) {
+    const text = this._normalizeText(rawYaml);
+    if (!text) return "";
+
+    return this._extractLooseYamlResponse(text)?.yaml || text;
+  }
+
   _buildClarificationMessage(summary, clarifyingQuestions) {
     const parts = [];
     const summaryText = this._normalizeText(summary);
@@ -1171,6 +1183,28 @@ class AutoMagicCard extends LitElement {
     if (/^\s*(?:-\s*)?service\s*:/m.test(text)) {
       issues.push("Inside each action item, use action: instead of service:.");
     }
+    const triggerSection = this._extractTopLevelSectionBlock(text, "triggers");
+    if (
+      /\btrigger\s*:\s*state\b[\s\S]*?\n\s+(?:above|below)\s*:/i.test(
+        triggerSection
+      ) ||
+      /\btrigger\s*:\s*state\b[\s\S]*?\n\s+to\s*:\s*["']?(?:above|below)["']?/i.test(
+        triggerSection
+      )
+    ) {
+      issues.push("Use numeric_state triggers for numeric thresholds, not state triggers with above:/below:.");
+    }
+    const conditionSection = this._extractTopLevelSectionBlock(text, "conditions");
+    if (
+      /\bcondition\s*:\s*state\b[\s\S]*?\n\s+(?:above|below)\s*:/i.test(
+        conditionSection
+      ) ||
+      /\bcondition\s*:\s*state\b[\s\S]*?\n\s+state\s*:\s*["']?(?:above|below)["']?/i.test(
+        conditionSection
+      )
+    ) {
+      issues.push("Use numeric_state conditions for numeric thresholds, not state conditions with above:/below:.");
+    }
     if (/^\s*automation\s*:/m.test(text)) {
       issues.push("Do not wrap the automation in a top-level automation: block.");
     }
@@ -1192,7 +1226,6 @@ class AutoMagicCard extends LitElement {
     if ((text.match(/^actions\s*:/gm) || []).length > 1) {
       issues.push("Use a single top-level actions: section.");
     }
-    const triggerSection = this._extractTopLevelSectionBlock(text, "triggers");
     if (/^\s*-\s*condition\s*:/m.test(triggerSection)) {
       issues.push("Trigger items under triggers: must use - trigger:, not - condition:.");
     }
@@ -1214,6 +1247,12 @@ class AutoMagicCard extends LitElement {
     }
     if (/^\s*-\s*template\s*:/m.test(text)) {
       issues.push("Use valid actions such as action:, variables:, choose:, delay:, or conditions:, not - template:.");
+    }
+    if (
+      /-\s*action:\s*notify\.[^\n]+[\s\S]*?\n\s+message\s*:/i.test(actionSection) &&
+      !/-\s*action:\s*notify\.[^\n]+[\s\S]*?\n\s+data\s*:/i.test(actionSection)
+    ) {
+      issues.push("Put notify message text under data:, not directly under the action.");
     }
     if (/\bstate\s*:\s*active\b/i.test(text)) {
       issues.push("Use real Home Assistant entity states such as on or off, not active.");
@@ -1300,6 +1339,36 @@ class AutoMagicCard extends LitElement {
     ) {
       issues.push(`Use the resolved automation guard ${automationMatches[0].entity_id}.`);
     }
+
+    const timeWindowGuard = this._extractTimeWindowGuard(requestText);
+    if (
+      timeWindowGuard?.after &&
+      timeWindowGuard?.before &&
+      (!text.includes(`after: "${timeWindowGuard.after}"`) ||
+        !text.includes(`before: "${timeWindowGuard.before}"`) ||
+        !/\bcondition:\s*(?:time|not)\b/i.test(text))
+    ) {
+      issues.push(
+        `Preserve the requested time window between ${timeWindowGuard.after} and ${timeWindowGuard.before} as a condition.`
+      );
+    }
+
+    const explicitStateGuards = this._extractExplicitStateGuardSpecs(
+      requestText,
+      entities
+    );
+    explicitStateGuards.forEach((guard) => {
+      const expectedState = guard.requiredState || guard.blockedState;
+      const statePattern = new RegExp(
+        `entity_id:\\s*${guard.entity_id.replace(".", "\\.")}[\\s\\S]{0,160}?state:\\s*["']?${expectedState}["']?`,
+        "i"
+      );
+      if (!statePattern.test(text)) {
+        issues.push(
+          `Respect the explicit guard ${guard.entity_id} before running the actions.`
+        );
+      }
+    });
 
     if (/\b(wait|delay)\b/i.test(requestText) && !/^\s*-\s*delay:|^\s*delay:/m.test(text)) {
       issues.push("Include a delay action for the requested wait.");
@@ -2098,6 +2167,9 @@ class AutoMagicCard extends LitElement {
       /\b(?:not|except|outside)\s+between\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s+(?:and|to|-)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/.test(
         text
       ) ||
+      /\bbetween\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s+(?:and|to|-)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/.test(
+        text
+      ) ||
       /\bbetween\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s+(?:and|to|-)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s+on a weekday\b/.test(
         text
       )
@@ -2153,6 +2225,88 @@ class AutoMagicCard extends LitElement {
       .map(([, short]) => short);
 
     return weekdays.length > 0 ? weekdays : null;
+  }
+
+  _extractTimeWindowGuard(prompt) {
+    const text = this._normalizeText(prompt);
+    if (!text) return null;
+
+    const match = text.match(
+      /\b(not\s+|except\s+|outside\s+)?between\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s+(?:and|to|-)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b/i
+    );
+    if (!match) return null;
+
+    const after = this._parseSimpleTime(match[2]);
+    const before = this._parseSimpleTime(match[3]);
+    if (!after || !before) return null;
+
+    return {
+      after,
+      before,
+      negate: /\b(?:not|except|outside)\b/i.test(match[1] || ""),
+      weekdays: this._extractWeekdays(text),
+    };
+  }
+
+  _invertEntityState(state) {
+    const normalized = this._normalizeText(state).toLowerCase();
+    const opposites = {
+      active: "inactive",
+      closed: "open",
+      home: "not_home",
+      inactive: "active",
+      locked: "unlocked",
+      not_home: "home",
+      off: "on",
+      on: "off",
+      open: "closed",
+      unlocked: "locked",
+    };
+    return opposites[normalized] || "";
+  }
+
+  _extractExplicitStateGuardSpecs(prompt, entities) {
+    const text = this._normalizeText(prompt);
+    const pool = Array.isArray(entities) ? entities : [];
+    if (!text || pool.length === 0) return [];
+
+    const patterns = [
+      /(?:don't|do not)\s+run(?: any of this| this)?\s+if\s+(.+?)\s+is\s+already\s+(on|off|open|closed|locked|unlocked|active|inactive)\b/gi,
+      /\bunless\s+(.+?)\s+is\s+(on|off|open|closed|locked|unlocked|active|inactive)\b/gi,
+    ];
+    const guards = [];
+
+    patterns.forEach((pattern) => {
+      for (const match of text.matchAll(pattern)) {
+        const entityPhrase = this._normalizeText(match[1]);
+        const blockedState = this._normalizeText(match[2]).toLowerCase();
+        if (!entityPhrase || !blockedState) continue;
+
+        const candidates = [
+          ...this._findObviousNamedEntities(entityPhrase, pool, 4),
+          ...this._findEntitiesByPhrase(entityPhrase, pool, 4),
+        ].filter(
+          (entity, index, items) =>
+            items.findIndex(
+              (candidate) => candidate.entity_id === entity.entity_id
+            ) === index
+        );
+        const entity = candidates[0];
+        if (!entity?.entity_id) continue;
+
+        guards.push({
+          entity_id: entity.entity_id,
+          blockedState,
+          requiredState: this._invertEntityState(blockedState),
+        });
+      }
+    });
+
+    return guards.filter(
+      (guard, index, items) =>
+        items.findIndex((candidate) => candidate.entity_id === guard.entity_id) ===
+        index
+    );
   }
 
   _buildSimpleAutomationYaml({
@@ -2578,6 +2732,33 @@ class AutoMagicCard extends LitElement {
     ];
   }
 
+  _buildExplicitStateGuardConditionLines(guards) {
+    const items = Array.isArray(guards) ? guards : [];
+    const lines = [];
+
+    items.forEach((guard) => {
+      if (!guard?.entity_id || !guard?.blockedState) return;
+      if (guard.requiredState) {
+        lines.push("  - condition: state");
+        lines.push(`    entity_id: ${guard.entity_id}`);
+        lines.push(`    state: "${guard.requiredState}"`);
+        return;
+      }
+
+      lines.push("  - condition: not");
+      lines.push("    conditions:");
+      lines.push("      - condition: state");
+      lines.push(`        entity_id: ${guard.entity_id}`);
+      lines.push(`        state: "${guard.blockedState}"`);
+    });
+
+    return lines;
+  }
+
+  _normalizeConditionalSentenceLead(text) {
+    return this._normalizeText(text).replace(/^(?:and|then|also|but)\s+/i, "").trim();
+  }
+
   _buildDeterministicActionSequence(text, entities, options = {}) {
     const normalized = this._normalizeText(text);
     if (!normalized || !Array.isArray(entities) || entities.length === 0) {
@@ -2777,18 +2958,7 @@ class AutoMagicCard extends LitElement {
     });
     if (triggerSpecs.length === 0) return null;
 
-    const timeWindowMatch = conditionText.match(
-      /\bnot between\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s+(?:and|to|-)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b/i
-    );
-    const guardAfter = timeWindowMatch
-      ? this._parseSimpleTime(timeWindowMatch[1])
-      : "";
-    const guardBefore = timeWindowMatch
-      ? this._parseSimpleTime(timeWindowMatch[2])
-      : "";
-    const guardWeekdays = /\bweekday\b/i.test(conditionText)
-      ? ["mon", "tue", "wed", "thu", "fri"]
-      : this._extractWeekdays(conditionText);
+    const timeWindowGuard = this._extractTimeWindowGuard(conditionText);
 
     const automationGuardIds = this._relevantDomainMatches(
       requestText,
@@ -2797,6 +2967,10 @@ class AutoMagicCard extends LitElement {
       2,
       8
     ).map((entity) => entity.entity_id);
+    const explicitStateGuards = this._extractExplicitStateGuardSpecs(
+      requestText,
+      entities
+    );
     const notifyService =
       this._relevantDomainMatches(requestText, entities, "notify", 1, 4)[0]
         ?.entity_id || "";
@@ -2834,21 +3008,25 @@ class AutoMagicCard extends LitElement {
       let fallbackSentence = "";
       let collectingTrueBranch = false;
       postWaitSentences.forEach((sentence) => {
-        if (/^don't run\b/i.test(sentence)) {
+        const normalizedSentence = this._normalizeConditionalSentenceLead(sentence);
+        if (!normalizedSentence) {
           return;
         }
-        if (/^\.*\s*if\b/i.test(sentence) && /\binstead\b/i.test(sentence)) {
-          fallbackSentence = sentence;
+        if (/^don't run\b/i.test(normalizedSentence)) {
+          return;
+        }
+        if (/^if\b/i.test(normalizedSentence) && /\binstead\b/i.test(normalizedSentence)) {
+          fallbackSentence = normalizedSentence;
           collectingTrueBranch = false;
           return;
         }
-        if (/^\.*\s*if\b/i.test(sentence)) {
+        if (/^if\b/i.test(normalizedSentence)) {
           collectingTrueBranch = true;
-          trueBranchSentences.push(sentence);
+          trueBranchSentences.push(normalizedSentence);
           return;
         }
         if (collectingTrueBranch) {
-          trueBranchSentences.push(sentence);
+          trueBranchSentences.push(normalizedSentence);
         }
       });
       const trueBranchText = trueBranchSentences.join(" ").trim();
@@ -2913,20 +3091,39 @@ class AutoMagicCard extends LitElement {
         );
       }
     });
-    if (guardAfter && guardBefore) {
-      lines.push("  - condition: not");
-      lines.push("    conditions:");
-      lines.push("      - condition: time");
-      lines.push(`        after: "${guardAfter}"`);
-      lines.push(`        before: "${guardBefore}"`);
-      if (Array.isArray(guardWeekdays) && guardWeekdays.length > 0) {
-        lines.push("        weekday:");
-        guardWeekdays.forEach((weekday) => {
-          lines.push(`          - ${weekday}`);
-        });
+    if (timeWindowGuard?.after && timeWindowGuard?.before) {
+      if (timeWindowGuard.negate) {
+        lines.push("  - condition: not");
+        lines.push("    conditions:");
+        lines.push("      - condition: time");
+        lines.push(`        after: "${timeWindowGuard.after}"`);
+        lines.push(`        before: "${timeWindowGuard.before}"`);
+        if (
+          Array.isArray(timeWindowGuard.weekdays) &&
+          timeWindowGuard.weekdays.length > 0
+        ) {
+          lines.push("        weekday:");
+          timeWindowGuard.weekdays.forEach((weekday) => {
+            lines.push(`          - ${weekday}`);
+          });
+        }
+      } else {
+        lines.push("  - condition: time");
+        lines.push(`    after: "${timeWindowGuard.after}"`);
+        lines.push(`    before: "${timeWindowGuard.before}"`);
+        if (
+          Array.isArray(timeWindowGuard.weekdays) &&
+          timeWindowGuard.weekdays.length > 0
+        ) {
+          lines.push("    weekday:");
+          timeWindowGuard.weekdays.forEach((weekday) => {
+            lines.push(`      - ${weekday}`);
+          });
+        }
       }
     }
     lines.push(...this._buildAutomationGuardConditionLines(automationGuardIds));
+    lines.push(...this._buildExplicitStateGuardConditionLines(explicitStateGuards));
 
     lines.push("actions:");
     lines.push("  - variables:");
@@ -2993,7 +3190,7 @@ class AutoMagicCard extends LitElement {
   _setPreviewResult(result) {
     this._generationJobId = "";
     this._clearClarificationState();
-    this._yaml = result?.yaml || "";
+    this._yaml = this._normalizeAutomationYamlText(result?.yaml);
     this._summary = result?.summary || "";
     this._parsedAutomation = this._parseYaml(this._yaml);
     this._clearGenerationPolling();
@@ -4864,7 +5061,7 @@ class AutoMagicCard extends LitElement {
       throw new Error("LLM response is not a JSON object");
     }
 
-    const yaml = this._normalizeText(parsed.yaml);
+    const yaml = this._normalizeAutomationYamlText(parsed.yaml);
     let summary = this._normalizeText(parsed.summary);
     let needsClarification = Boolean(parsed.needs_clarification);
     let clarifyingQuestions = this._normalizeQuestions(
@@ -5602,7 +5799,9 @@ class AutoMagicCard extends LitElement {
   async _handleInstall(messageIndex = -1) {
     const targetMessage =
       messageIndex >= 0 ? this._chatMessages[messageIndex] : null;
-    const yaml = targetMessage?.yaml || this._yaml;
+    const yaml = this._normalizeAutomationYamlText(
+      targetMessage?.yaml || this._yaml
+    );
     if (!yaml) return;
 
     if (messageIndex >= 0) {
@@ -5774,7 +5973,7 @@ class AutoMagicCard extends LitElement {
           this._error = "The model finished without returning automation YAML.";
           return;
         }
-        this._yaml = result.yaml || "";
+        this._yaml = this._normalizeAutomationYamlText(result.yaml);
         this._summary = result.summary || "";
         this._parsedAutomation = this._parseYaml(this._yaml);
         this._generationJobId = "";

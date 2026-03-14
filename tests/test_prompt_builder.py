@@ -65,6 +65,7 @@ class TestBuildPrompt:
         assert '"clarifying_questions"' in SYSTEM_PROMPT
         assert "JSON" in SYSTEM_PROMPT
         assert "Keep the YAML concise" in SYSTEM_PROMPT
+        assert "must start directly with alias:" in SYSTEM_PROMPT
 
     def test_system_prompt_forbids_invented_entities(self):
         """System prompt must tell LLM not to invent entity IDs."""
@@ -98,6 +99,7 @@ class TestBuildPrompt:
         assert 'not between 9am and 5pm on a weekday' in SYSTEM_PROMPT
         assert "conditions, not as the automation's trigger schedule" in SYSTEM_PROMPT
         assert "boolean logic exactly when they combine OR and AND clauses" in SYSTEM_PROMPT
+        assert "put the notification text under data:" in SYSTEM_PROMPT
 
     def test_system_prompt_accepts_explicit_entity_ids_and_sun_trigger(self):
         """Explicit entity IDs and the built-in sun trigger should not force extra clarification."""

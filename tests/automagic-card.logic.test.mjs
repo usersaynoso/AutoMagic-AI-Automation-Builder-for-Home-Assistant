@@ -244,6 +244,7 @@ function buildHarness() {
     "_extractWrappedAutomationDocument",
     "_extractLooseYamlResponse",
     "_extractMalformedJsonYamlResponse",
+    "_normalizeAutomationYamlText",
     "_extractJsonObjectText",
     "_buildAutomationContextMessage",
     "_extractTopLevelSectionBlock",
@@ -291,8 +292,10 @@ function buildHarness() {
     "_relevantDomainMatches",
     "_parseSimpleTime",
     "_extractWeekdays",
+    "_extractTimeWindowGuard",
     "_hasClearSchedule",
     "_hasTimeWindowGuard",
+    "_invertEntityState",
     "_buildSimpleAutomationYaml",
     "_isSpeakerLike",
     "_candidateEntitiesForTarget",
@@ -308,6 +311,9 @@ function buildHarness() {
     "_buildServiceActionLines",
     "_reindentYamlLines",
     "_buildAutomationGuardConditionLines",
+    "_extractExplicitStateGuardSpecs",
+    "_buildExplicitStateGuardConditionLines",
+    "_normalizeConditionalSentenceLead",
     "_buildDeterministicActionSequence",
     "_buildDeterministicComplexAutomationResult",
     "_tryDeterministicGeneration",
@@ -453,6 +459,48 @@ const victronComplexEntities = [
     entity_id: "automation.electricity_balance_low",
     name: "Electricity balance low",
     domain: "automation",
+  },
+];
+
+const lowPowerLightsPrompt =
+  'When the AC output power from the Victron drops below 200 watts and it\'s between 11pm and 6am, turn off the lounge lamp and both lounge strip lights immediately, then wait 5 minutes and if the AC output power is still below 200 watts, also turn off the bar lamp and send a notification to my iPhone saying "Shore power is critically low - lights turned off automatically". But don\'t run this if the electricity supply switch for The Architeuthis (3378) is already off.';
+
+const lowPowerLightsEntities = [
+  {
+    entity_id: "sensor.victron_mk3_ac_output_power",
+    name: "AC Output Power",
+    domain: "sensor",
+    device_class: "power",
+  },
+  {
+    entity_id: "light.lounge_lamp",
+    name: "Lounge Lamp",
+    domain: "light",
+  },
+  {
+    entity_id: "light.lounge_strip_lights_left",
+    name: "Lounge Strip Lights Left",
+    domain: "light",
+  },
+  {
+    entity_id: "light.lounge_strip_lights_right",
+    name: "Lounge Strip Lights Right",
+    domain: "light",
+  },
+  {
+    entity_id: "light.bar_lamp",
+    name: "Bar Lamp",
+    domain: "light",
+  },
+  {
+    entity_id: "notify.mobile_app_iphone_13",
+    name: "Notify Iphone 13",
+    domain: "notify",
+  },
+  {
+    entity_id: "switch.meter_macs_the_architeuthis_electricity_supply_switch",
+    name: "The Architeuthis (3378) Electricity Supply Switch",
+    domain: "switch",
   },
 ];
 
@@ -1909,6 +1957,29 @@ test("Loose YAML responses are still salvaged before repair when legacy section 
   assert.match(result.yaml, /^action:/m);
 });
 
+test("JSON payload yaml strings are normalized before returning", () => {
+  const harness = buildHarness();
+  const result = harness._parseDirectResponse.call(harness, {
+    choices: [
+      {
+        message: {
+          content: JSON.stringify({
+            yaml:
+              "yaml\nyaml:\nalias: Phase Imbalance Alert\ndescription: Test\ntriggers:\n  - trigger: template\nactions:\n  - action: light.turn_on\n",
+            summary: "Ready to install",
+            needs_clarification: false,
+            clarifying_questions: [],
+          }),
+        },
+      },
+    ],
+  });
+
+  assert.equal(result.needs_clarification, false);
+  assert.match(result.yaml, /^alias: Phase Imbalance Alert/m);
+  assert.doesNotMatch(result.yaml, /^yaml/m);
+});
+
 test("Malformed JSON wrappers with a raw yaml string are salvaged", () => {
   const harness = buildHarness();
   const result = harness._parseDirectResponse.call(harness, {
@@ -2201,6 +2272,55 @@ actions:
   );
 });
 
+test("Prompt-aware repair issues catch missing time-window and explicit switch guards", () => {
+  const harness = buildHarness();
+  const issues = harness._collectRepairIssues.call(
+    harness,
+    lowPowerLightsPrompt,
+    `alias: Turn Off Lights on Low AC Power
+description: Test
+triggers:
+  - trigger: numeric_state
+    entity_id: sensor.victron_mk3_ac_output_power
+    below: 200
+conditions: []
+actions:
+  - action: light.turn_off
+    target:
+      entity_id:
+        - light.lounge_lamp
+        - light.lounge_strip_lights_left
+        - light.lounge_strip_lights_right
+  - delay: "00:05:00"
+  - choose:
+      - conditions:
+          - condition: numeric_state
+            entity_id: sensor.victron_mk3_ac_output_power
+            below: 200
+        sequence:
+          - action: light.turn_off
+            target:
+              entity_id: light.bar_lamp
+          - action: notify.mobile_app_iphone_13
+            data:
+              message: "Shore power is critically low - lights turned off automatically"`,
+    { entities: lowPowerLightsEntities }
+  );
+
+  assert.ok(
+    issues.some((issue) =>
+      issue.includes("Preserve the requested time window between 23:00:00 and 06:00:00")
+    )
+  );
+  assert.ok(
+    issues.some((issue) =>
+      issue.includes(
+        "Respect the explicit guard switch.meter_macs_the_architeuthis_electricity_supply_switch"
+      )
+    )
+  );
+});
+
 test("Group clause mappings split comma-delimited action branches cleanly", () => {
   const harness = buildHarness();
   const mappings = harness._buildGroupClauseMappings.call(
@@ -2271,6 +2391,106 @@ test("Deterministic complex builder compiles the Victron prompt into valid YAML"
   assert.match(result.yaml, /triggered_sensor_value/);
   assert.match(result.yaml, /color_name: "white"/);
   assert.match(result.yaml, /brightness_pct: 100/);
+});
+
+test("Deterministic complex builder compiles the low-power lights prompt into valid YAML", () => {
+  const harness = buildHarness();
+  const result = harness._buildDeterministicComplexAutomationResult.call(
+    harness,
+    lowPowerLightsPrompt,
+    { entities: lowPowerLightsEntities }
+  );
+
+  assert.ok(result);
+  assert.equal(result.needs_clarification, false);
+  assert.match(result.yaml, /^alias: AC Output Power Monitor/m);
+  assert.match(result.yaml, /^triggers:/m);
+  assert.match(
+    result.yaml,
+    /- trigger: numeric_state[\s\S]*entity_id: sensor\.victron_mk3_ac_output_power[\s\S]*below: 200/
+  );
+  assert.match(
+    result.yaml,
+    /condition: time[\s\S]*after: "23:00:00"[\s\S]*before: "06:00:00"/
+  );
+  assert.match(
+    result.yaml,
+    /condition: state[\s\S]*entity_id: switch\.meter_macs_the_architeuthis_electricity_supply_switch[\s\S]*state: "on"/
+  );
+  assert.match(result.yaml, /light\.lounge_lamp/);
+  assert.match(result.yaml, /light\.lounge_strip_lights_left/);
+  assert.match(result.yaml, /light\.lounge_strip_lights_right/);
+  assert.match(result.yaml, /delay: "00:05:00"/);
+  assert.match(
+    result.yaml,
+    /choose:[\s\S]*condition: numeric_state[\s\S]*entity_id: sensor\.victron_mk3_ac_output_power[\s\S]*below: 200/
+  );
+  assert.match(result.yaml, /light\.bar_lamp/);
+  assert.match(result.yaml, /action: notify\.mobile_app_iphone_13/);
+  assert.match(
+    result.yaml,
+    /data:\n\s+message: "Shore power is critically low - lights turned off automatically"/
+  );
+});
+
+test("Complex repair returns the deterministic fallback for the low-power lights prompt", async () => {
+  const harness = buildHarness();
+  harness._regenerateAutomationYamlFromScratch = async () => {
+    throw new Error("regen should not run when deterministic fallback succeeds");
+  };
+  harness._rewriteInvalidAutomationYaml = async () => {
+    throw new Error("rewrite should not run when deterministic fallback succeeds");
+  };
+  harness._directChatCompletion = async () => {
+    throw new Error("chat repair should not run when deterministic fallback succeeds");
+  };
+
+  const result = await harness._repairGeneratedYamlIfNeeded.call(
+    harness,
+    lowPowerLightsPrompt,
+    [{ role: "user", content: lowPowerLightsPrompt }],
+    {
+      yaml: `alias: Turn Off Lights on Low AC Power
+description: Turn off lounge lamp and strip lights when AC output power drops below 200 watts between 11pm and 6am, then check again after 5 minutes.
+triggers:
+  - trigger: state
+    entity_id: sensor.victron_mk3_ac_output_power
+    to: "below"
+    below: 200
+conditions:
+  - condition: time
+    after: "23:00"
+    before: "06:00"
+actions:
+  - action: light.turn_off
+    target:
+      entity_id:
+        - light.lounge_lamp
+        - light.lounge_strip_lights_left
+        - light.lounge_strip_lights_right
+  - delay: "00:05:00"
+  - condition: state
+    entity_id: sensor.victron_mk3_ac_output_power
+    state: "below"
+    below: 200
+  - action: light.turn_off
+    target:
+      entity_id: light.bar_lamp
+  - action: notify.mobile_app_iphone_13
+    message: "Shore power is critically low - lights turned off automatically"`,
+      summary: "Broken draft",
+      needs_clarification: false,
+      clarifying_questions: [],
+    },
+    {
+      entities: lowPowerLightsEntities,
+    }
+  );
+
+  assert.match(result.yaml, /^alias: AC Output Power Monitor/m);
+  assert.match(result.yaml, /state: "on"/);
+  assert.match(result.yaml, /delay: "00:05:00"/);
+  assert.match(result.yaml, /action: notify\.mobile_app_iphone_13/);
 });
 
 test("Complex repair returns the deterministic fallback before extra model retries", async () => {

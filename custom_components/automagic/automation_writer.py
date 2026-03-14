@@ -12,6 +12,8 @@ import yaml
 
 from homeassistant.core import HomeAssistant
 
+from .llm_client import _extract_loose_yaml_response
+
 _LOGGER = logging.getLogger(__name__)
 
 # Legacy keys that must NOT appear in new-syntax automations
@@ -92,6 +94,11 @@ async def install_automation(
     Returns:
         A dict with success status, alias, filename, or error message.
     """
+    yaml_string = str(yaml_string or "").strip()
+    salvaged = _extract_loose_yaml_response(yaml_string)
+    if salvaged is not None and salvaged.get("yaml"):
+        yaml_string = str(salvaged["yaml"]).strip()
+
     # Parse YAML
     try:
         parsed = yaml.safe_load(yaml_string)

@@ -177,6 +177,30 @@ async def test_install_invalid_yaml():
 
 
 @pytest.mark.asyncio
+async def test_install_salvages_wrapped_yaml_before_validation():
+    """Install should accept wrapped yaml strings and extract the automation body."""
+    hass = _make_hass()
+    yaml_string = """\
+yaml
+yaml:
+alias: Test Automation
+triggers:
+  - trigger: state
+    entity_id: binary_sensor.door
+    to: "on"
+actions:
+  - action: light.turn_on
+    target:
+      entity_id: light.hallway
+"""
+    result = await install_automation(hass, yaml_string)
+
+    assert result["success"] is True
+    assert result["alias"] == "Test Automation"
+    hass.async_add_executor_job.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_install_legacy_syntax_rejected():
     """Test that legacy syntax is caught during install."""
     hass = _make_hass()

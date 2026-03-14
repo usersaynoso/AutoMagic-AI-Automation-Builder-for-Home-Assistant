@@ -217,6 +217,19 @@ def _extract_loose_yaml_response(content: str) -> dict[str, Any] | None:
     }
 
 
+def _normalize_automation_yaml_text(raw: Any) -> str:
+    """Normalize wrapped YAML strings into a direct automation document."""
+    text = _normalize_text(raw)
+    if not text:
+        return ""
+
+    salvaged = _extract_loose_yaml_response(text)
+    if salvaged is not None:
+        return _normalize_text(salvaged.get("yaml"))
+
+    return text
+
+
 class LLMClient:
     """Client for OpenAI-compatible /v1/chat/completions endpoints."""
 
@@ -413,7 +426,7 @@ class LLMClient:
                     f"LLM response is not a JSON object: {type(parsed)}"
                 )
 
-            yaml_text = _normalize_text(parsed.get("yaml"))
+            yaml_text = _normalize_automation_yaml_text(parsed.get("yaml"))
             summary = _normalize_text(parsed.get("summary"))
             needs_clarification = bool(parsed.get("needs_clarification"))
             clarifying_questions = _normalize_questions(

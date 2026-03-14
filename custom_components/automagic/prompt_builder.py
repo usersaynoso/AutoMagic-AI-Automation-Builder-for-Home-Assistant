@@ -70,8 +70,11 @@ service names in actions. Do not invent notify services.
     "needs_clarification": true or false
     "clarifying_questions": an array of 0-3 short, specific questions
 - Do not include any explanation, preamble, or markdown code fences outside the JSON.
+- The yaml string itself must start directly with alias:. Do not prefix it with yaml, \
+yaml:, automation:, sequence:, a list item, or markdown fences.
 - Keep the YAML concise. Do not add comments or explanatory prose inside or after the YAML.
 - The YAML must include: alias, description, triggers, and actions at minimum.
+- For notify.* actions, put the notification text under data: with a message key.
 - Use the most appropriate trigger type for the request. Prefer state triggers over \
 template triggers where possible.
 - If an entity_id is listed in the provided entity list, treat it as available for YAML \

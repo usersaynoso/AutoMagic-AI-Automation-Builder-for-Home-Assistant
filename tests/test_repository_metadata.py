@@ -38,7 +38,7 @@ def test_manifest_declares_single_config_entry_service_integration():
     assert manifest["config_flow"] is True
     assert manifest["integration_type"] == "service"
     assert manifest["single_config_entry"] is True
-    assert manifest["version"] == "0.2.9"
+    assert manifest["version"] == "0.2.10"
 
 
 def test_manifest_keys_follow_home_assistant_ordering_rules():
@@ -82,11 +82,18 @@ def test_subentry_translations_define_initiate_flow_labels():
 
     assert strings["config_subentries"]["service"]["title"] == "AI service"
     assert translation["config_subentries"]["service"]["title"] == "AI service"
-    assert strings["config_subentries"]["service"]["initiate_flow"]["user"] == "Add service"
+    assert strings["config_subentries"]["service"]["initiate_flow"]["user"] == "Add model"
     assert (
         translation["config_subentries"]["service"]["initiate_flow"]["user"]
-        == "Add service"
+        == "Add model"
     )
+    assert strings["config_subentries"]["service"]["step"]["user"]["title"] == "Add Model"
+    assert (
+        translation["config_subentries"]["service"]["step"]["user"]["title"]
+        == "Add Model"
+    )
+    assert "Add model button" in strings["config"]["step"]["user"]["description"]
+    assert "Add model button" in translation["config"]["step"]["user"]["description"]
 
 
 def test_reconfigure_translations_exist_for_config_entries_and_subentries():

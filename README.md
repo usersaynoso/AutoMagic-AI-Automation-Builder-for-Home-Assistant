@@ -1,7 +1,7 @@
 # AutoMagic - AI Automation Builder for Home Assistant
 [![HACS](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://hacs.xyz)
 [![HA Version](https://img.shields.io/badge/Home%20Assistant-2024.10%2B-blue.svg)](https://www.home-assistant.io)
-[![GitHub](https://img.shields.io/badge/GitHub-usersaynoso%2FAutoMagic-blue.svg)](https://github.com/usersaynoso/AutoMagic---AI-Automation-Builder-for-Home-Assistant)
+[![GitHub](https://img.shields.io/badge/GitHub-usersaynoso%2FAutoMagic-blue.svg)](https://github.com/usersaynoso/AutoMagic-AI-Automation-Builder-for-Home-Assistant)
 
 **AutoMagic** is an interactive AI-powered automation builder for Home Assistant. Describe what you want in plain English, preview the result, and install it with one click. No YAML editing required.
 
@@ -33,7 +33,7 @@
 ### HACS (Until Approval, via Custom Repository)
 1. Open HACS in Home Assistant
 2. Click the three dots menu → **Custom repositories**
-3. Add `https://github.com/usersaynoso/AutoMagic---AI-Automation-Builder-for-Home-Assistant` and select **Integration** as the category
+3. Add `https://github.com/usersaynoso/AutoMagic-AI-Automation-Builder-for-Home-Assistant` and select **Integration** as the category
 4. Install **AutoMagic - AI Automation Builder**
 5. Restart Home Assistant
 

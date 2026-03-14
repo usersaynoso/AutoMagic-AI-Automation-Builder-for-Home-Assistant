@@ -18,6 +18,11 @@ STRINGS_PATH = REPO_ROOT / "custom_components" / "automagic" / "strings.json"
 TRANSLATION_PATH = (
     REPO_ROOT / "custom_components" / "automagic" / "translations" / "en.json"
 )
+README_PATH = REPO_ROOT / "README.md"
+CANONICAL_REPO_URL = (
+    "https://github.com/usersaynoso/"
+    "AutoMagic-AI-Automation-Builder-for-Home-Assistant"
+)
 
 
 def _read_json(path: Path) -> dict:
@@ -36,9 +41,11 @@ def test_manifest_declares_single_config_entry_service_integration():
 
     assert manifest["domain"] == "automagic"
     assert manifest["config_flow"] is True
+    assert manifest["documentation"] == CANONICAL_REPO_URL
     assert manifest["integration_type"] == "service"
+    assert manifest["issue_tracker"] == f"{CANONICAL_REPO_URL}/issues"
     assert manifest["single_config_entry"] is True
-    assert manifest["version"] == "0.2.13"
+    assert manifest["version"] == "0.2.14"
 
 
 def test_manifest_keys_follow_home_assistant_ordering_rules():
@@ -57,6 +64,14 @@ def test_hacs_config_targets_supported_home_assistant_version():
     assert hacs_config["name"] == "AutoMagic - AI Automation Builder"
     assert hacs_config["render_readme"] is True
     assert hacs_config["homeassistant"] == "2024.10.0"
+
+
+def test_readme_uses_canonical_repository_url():
+    """Repository links in the README should match the live GitHub repo URL."""
+    content = README_PATH.read_text(encoding="utf-8")
+
+    assert CANONICAL_REPO_URL in content
+    assert "AutoMagic---AI-Automation-Builder-for-Home-Assistant" not in content
 
 
 def test_repo_agents_file_documents_release_bumps():

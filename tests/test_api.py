@@ -14,8 +14,12 @@ from custom_components.automagic.api import (
     AutoMagicGenerateView,
     AutoMagicGenerateStatusView,
     AutoMagicHistoryEntryView,
+    _build_yaml_regeneration_messages,
+    _build_yaml_repair_hints,
+    _build_yaml_repair_messages,
     _collect_generated_yaml_issues,
     _create_generation_job,
+    _extract_negated_state_guards,
     _extract_entity_ids_from_yaml,
     _find_hallucinated_entities,
     _get_config_data,
@@ -1642,14 +1646,105 @@ def test_collect_generated_yaml_issues_flags_semantic_mismatches_for_vacuum_prom
     )
 
     issues = _collect_generated_yaml_issues(prompt, entities, yaml_text)
+    negated_guard_issue = next(
+        issue
+        for issue in issues
+        if 'sensor.iphone_13_audio_output must NOT be "Speaker"' in issue
+    )
 
     assert any("weekday schedule" in issue for issue in issues)
-    assert any(
-        'sensor.iphone_13_audio_output must not be "Speaker"' in issue
-        for issue in issues
+    assert 'Guard sensor.iphone_13_audio_output must NOT be "Speaker".' in negated_guard_issue
+    assert (
+        "condition: not / conditions: / - condition: state / entity_id: "
+        "sensor.iphone_13_audio_output / state: \"Speaker\""
+    ) in negated_guard_issue
+    assert (
+        'value_template: "{{ states(\'sensor.iphone_13_audio_output\') != \'Speaker\' }}"'
+        in negated_guard_issue
     )
     assert any("Respect the explicit guard switch.router_led_right" in issue for issue in issues)
     assert any("color_name values should not use underscore-separated names" in issue for issue in issues)
+
+
+def test_extract_negated_state_guards_matches_iphone_audio_output_phrase():
+    """Prompt parsing should resolve the blocked iPhone audio-output state."""
+    prompt = (
+        "Start cleaning at 8am, making sure the iPhone 13 audio output is not "
+        '"Speaker" before the vacuum runs.'
+    )
+    entities = [
+        {
+            "entity_id": "sensor.iphone_13_audio_output",
+            "name": "iPhone 13 Audio Output",
+            "state": "AirPlay",
+            "domain": "sensor",
+        }
+    ]
+
+    guards = _extract_negated_state_guards(prompt, entities)
+
+    assert guards == [{"entity_id": "sensor.iphone_13_audio_output", "state": "Speaker"}]
+
+
+def test_negated_state_guard_repairs_include_concrete_yaml_examples():
+    """Repair hints and retry prompts should embed the exact blocked-state YAML shape."""
+    issues = [
+        (
+            'Guard sensor.iphone_13_audio_output must NOT be "Speaker". '
+            "Use a condition entry like: "
+            '- condition: not / conditions: / - condition: state / entity_id: '
+            'sensor.iphone_13_audio_output / state: "Speaker" or '
+            '- condition: template / value_template: '
+            '"{{ states(\'sensor.iphone_13_audio_output\') != \'Speaker\' }}"'
+        )
+    ]
+    request_messages = [{"role": "user", "content": "prompt"}]
+    result = {
+        "yaml": "alias: Test\ndescription: Test\ntriggers: []\nconditions: []\nactions: []\nmode: single\n",
+        "summary": "Test automation",
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+
+    hints = _build_yaml_repair_hints(issues)
+    repair_messages = _build_yaml_repair_messages(
+        request_messages,
+        result,
+        issues,
+        attempt_number=2,
+    )
+    regeneration_messages = _build_yaml_regeneration_messages(
+        request_messages,
+        issues,
+        attempt_number=3,
+    )
+
+    assert any(
+        "For sensor.iphone_13_audio_output != \"Speaker\", use a condition entry like"
+        in hint
+        for hint in hints
+    )
+    assert any(
+        'value_template: "{{ states(\'sensor.iphone_13_audio_output\') != \'Speaker\' }}"'
+        in hint
+        for hint in hints
+    )
+    assert "Concrete YAML examples for blocked-state guards:" in repair_messages[-1]["content"]
+    assert "Use this condition entry:" in repair_messages[-1]["content"]
+    assert "entity_id: sensor.iphone_13_audio_output" in repair_messages[-1]["content"]
+    assert (
+        'value_template: "{{ states(\'sensor.iphone_13_audio_output\') != \'Speaker\' }}"'
+        in repair_messages[-1]["content"]
+    )
+    assert (
+        "Concrete YAML examples for blocked-state guards:"
+        in regeneration_messages[-1]["content"]
+    )
+    assert "entity_id: sensor.iphone_13_audio_output" in regeneration_messages[-1]["content"]
+    assert (
+        'value_template: "{{ states(\'sensor.iphone_13_audio_output\') != \'Speaker\' }}"'
+        in regeneration_messages[-1]["content"]
+    )
 
 
 @pytest.mark.asyncio
@@ -1839,7 +1934,13 @@ async def test_run_generation_job_repairs_prompt_coverage_issues_before_completi
     repair_messages = fake_client.complete.await_args_list[1].args[0]
     assert repair_messages[-1]["role"] == "user"
     assert "weekday schedule" in repair_messages[-1]["content"]
-    assert 'must not be "Speaker"' in repair_messages[-1]["content"]
+    assert 'must NOT be "Speaker"' in repair_messages[-1]["content"]
+    assert "Concrete YAML examples for blocked-state guards:" in repair_messages[-1]["content"]
+    assert "entity_id: sensor.iphone_13_audio_output" in repair_messages[-1]["content"]
+    assert (
+        'value_template: "{{ states(\'sensor.iphone_13_audio_output\') != \'Speaker\' }}"'
+        in repair_messages[-1]["content"]
+    )
 
 
 @pytest.mark.asyncio
@@ -2114,9 +2215,11 @@ async def test_run_generation_job_keeps_repairing_latest_yaml_before_regeneratio
     final_repair_messages = fake_client.complete.await_args_list[3].args[0]
     assert "Problems from earlier failed drafts that must stay fixed too:" in final_repair_messages[-1]["content"]
     assert "switch.router_led_right" in final_repair_messages[-1]["content"]
-    assert 'must not be "Speaker"' in final_repair_messages[-1]["content"]
+    assert 'must NOT be "Speaker"' in final_repair_messages[-1]["content"]
+    assert "Concrete YAML examples for blocked-state guards:" in final_repair_messages[-1]["content"]
+    assert "entity_id: sensor.iphone_13_audio_output" in final_repair_messages[-1]["content"]
     assert any("does not match the required <domain>.<service_name> format" in detail for detail in details_seen)
-    assert any('must not be "Speaker"' in detail for detail in details_seen)
+    assert any('must NOT be "Speaker"' in detail for detail in details_seen)
 
 
 @pytest.mark.asyncio

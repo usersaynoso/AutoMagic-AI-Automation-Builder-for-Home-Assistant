@@ -110,6 +110,10 @@ _NEGATED_STATE_GUARD_PATTERNS = (
         re.IGNORECASE,
     ),
 )
+_NEGATED_STATE_GUARD_ISSUE_RE = re.compile(
+    r"(?P<entity_id>[a-z0-9_]+\.[a-z0-9_]+)\s+must\s+not\s+be\s+\"(?P<state>[^\"]+)\"",
+    re.IGNORECASE,
+)
 _YAML_REPAIR_SYSTEM_PROMPT = """\
 You are an expert Home Assistant automation syntax repair assistant.
 Return only a JSON object with exactly four keys: yaml, summary, needs_clarification, clarifying_questions.
@@ -513,6 +517,86 @@ def _summarize_issue_list(
     return " ".join(normalized) or "The model returned invalid automation YAML."
 
 
+def _extract_negated_state_guard_issue_specs(
+    issues: str | list[str] | tuple[str, ...] | set[str] | None,
+    *,
+    limit: int = 6,
+) -> list[tuple[str, str]]:
+    """Extract entity/state pairs from negated-state-guard issue strings."""
+    specs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for issue in _normalize_issue_list(issues, limit=limit):
+        match = _NEGATED_STATE_GUARD_ISSUE_RE.search(issue)
+        if match is None:
+            continue
+        entity_id = str(match.group("entity_id") or "").strip()
+        state = str(match.group("state") or "").strip()
+        if not entity_id or not state:
+            continue
+        key = (entity_id, state)
+        if key in seen:
+            continue
+        specs.append(key)
+        seen.add(key)
+    return specs
+
+
+def _format_negated_state_guard_template_expression(
+    entity_id: str,
+    state: str,
+) -> str:
+    """Build a template expression that preserves entity != state."""
+    escaped_entity_id = str(entity_id or "").replace("\\", "\\\\").replace("'", "\\'")
+    escaped_state = str(state or "").replace("\\", "\\\\").replace("'", "\\'")
+    return "{{ states('%s') != '%s' }}" % (escaped_entity_id, escaped_state)
+
+
+def _build_negated_state_guard_issue_text(entity_id: str, state: str) -> str:
+    """Describe the exact YAML structure required for a blocked-state guard."""
+    entity_text = str(entity_id or "").strip()
+    state_text = str(state or "").strip()
+    template_expr = _format_negated_state_guard_template_expression(
+        entity_text, state_text
+    )
+    return (
+        f'Guard {entity_text} must NOT be "{state_text}". '
+        "Use a condition entry like: "
+        f"- condition: not / conditions: / - condition: state / entity_id: {entity_text} / state: \"{state_text}\" "
+        "or "
+        f"- condition: template / value_template: \"{template_expr}\""
+    )
+
+
+def _build_negated_state_guard_example_block(
+    issues: str | list[str] | tuple[str, ...] | set[str] | None,
+    *,
+    limit: int = 2,
+) -> str:
+    """Return concrete YAML snippets for blocked-state guard repair issues."""
+    specs = _extract_negated_state_guard_issue_specs(issues, limit=limit * 3)
+    if not specs:
+        return ""
+
+    blocks: list[str] = []
+    for entity_id, state in specs[:limit]:
+        template_expr = _format_negated_state_guard_template_expression(
+            entity_id, state
+        )
+        blocks.append(
+            f'{entity_id} must not be "{state}":\n'
+            "Use this condition entry:\n"
+            "  - condition: not\n"
+            "    conditions:\n"
+            "      - condition: state\n"
+            f"        entity_id: {entity_id}\n"
+            f'        state: "{state}"\n'
+            "Alternative template condition:\n"
+            "  - condition: template\n"
+            f'    value_template: "{template_expr}"'
+        )
+    return "Concrete YAML examples for blocked-state guards:\n" + "\n\n".join(blocks)
+
+
 def _build_yaml_repair_hints(issues: list[str]) -> list[str]:
     """Return generic repair guidance derived from the current issue set."""
     combined = " ".join(_normalize_issue_list(issues, limit=12)).lower()
@@ -542,7 +626,18 @@ def _build_yaml_repair_hints(issues: list[str]) -> list[str]:
         hints.append(
             "Preserve requested weekday restrictions explicitly in weekday: or an equivalent weekday condition."
         )
-    if "must not be" in combined or "explicit guard" in combined:
+    negated_guard_specs = _extract_negated_state_guard_issue_specs(issues, limit=4)
+    if negated_guard_specs:
+        for entity_id, state in negated_guard_specs[:2]:
+            template_expr = _format_negated_state_guard_template_expression(
+                entity_id, state
+            )
+            hints.append(
+                f'For {entity_id} != "{state}", use a condition entry like '
+                f'- condition: not / conditions: / - condition: state / entity_id: {entity_id} / state: "{state}", '
+                f'or - condition: template / value_template: "{template_expr}".'
+            )
+    elif "must not be" in combined or "explicit guard" in combined:
         hints.append(
             "Encode blocked-state guards as executable YAML conditions such as condition: not with a nested state condition, or a valid template condition that requires entity != state."
         )
@@ -576,6 +671,12 @@ def _build_yaml_repair_issue_block(
     hints = _build_yaml_repair_hints([*current_issues, *prior_issues[:3]])
     if hints:
         sections.append("Repair rules:\n- " + "\n- ".join(hints))
+
+    negated_guard_examples = _build_negated_state_guard_example_block(
+        [*current_issues, *prior_issues[:3]]
+    )
+    if negated_guard_examples:
+        sections.append(negated_guard_examples)
 
     return "\n\n".join(section for section in sections if section)
 
@@ -1210,7 +1311,9 @@ def _collect_generated_yaml_issues(
         ):
             continue
         issues.append(
-            f'Preserve the requested guard that {guard["entity_id"]} must not be "{guard["state"]}".'
+            _build_negated_state_guard_issue_text(
+                guard["entity_id"], guard["state"]
+            )
         )
 
     if re.search(

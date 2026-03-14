@@ -263,6 +263,9 @@ function buildHarness() {
     "_collectRepairIssues",
     "_normalizeRepairIssues",
     "_buildRepairHints",
+    "_extractNegatedStateGuardIssueSpecs",
+    "_formatNegatedStateGuardTemplateExpression",
+    "_buildNegatedStateGuardExampleText",
     "_buildRepairIssueText",
     "_entitySummary",
     "_humanizeIdentifier",
@@ -429,13 +432,28 @@ test("Direct repair status only appends when the returned issue changes", () => 
   harness._pushRepairStatus.call(harness, "Action 1 is invalid.");
   harness._pushRepairStatus.call(
     harness,
-    'Preserve the requested guard that sensor.iphone_13_audio_output must not be "Speaker".'
+    'Guard sensor.iphone_13_audio_output must NOT be "Speaker". Use a condition entry like: - condition: not / conditions: / - condition: state / entity_id: sensor.iphone_13_audio_output / state: "Speaker" or - condition: template / value_template: "{{ states(\'sensor.iphone_13_audio_output\') != \'Speaker\' }}"'
   );
 
   assert.equal(appended.length, 2);
   assert.match(appended[0].text, /Action 1 is invalid/);
-  assert.match(appended[1].text, /must not be "Speaker"/);
-  assert.match(harness._loadingDetail, /must not be "Speaker"/);
+  assert.match(appended[1].text, /must not be "Speaker"/i);
+  assert.match(harness._loadingDetail, /must not be "Speaker"/i);
+});
+
+test("Repair issue text appends concrete YAML examples for negated state guards", () => {
+  const harness = buildHarness();
+  const issueText = harness._buildRepairIssueText.call(harness, [
+    'Guard sensor.phone_audio_output must NOT be "Speaker". Use a condition entry like: - condition: not / conditions: / - condition: state / entity_id: sensor.phone_audio_output / state: "Speaker" or - condition: template / value_template: "{{ states(\'sensor.phone_audio_output\') != \'Speaker\' }}"',
+  ]);
+
+  assert.match(issueText, /Concrete YAML examples for blocked-state guards:/);
+  assert.match(issueText, /Use this condition entry:/);
+  assert.match(issueText, /entity_id: sensor\.phone_audio_output/);
+  assert.match(
+    issueText,
+    /value_template: "\{\{ states\('sensor\.phone_audio_output'\) != 'Speaker' \}\}"/
+  );
 });
 
 test("History delete only runs for failed or deleted entries", async () => {
@@ -3231,7 +3249,7 @@ test("Direct repair keeps retrying beyond the old cap until a later regeneration
   harness._collectRepairIssues = (_prompt, yaml) =>
     String(yaml || "").includes("mode: single")
       ? []
-      : ['Preserve the requested guard that sensor.phone_audio_output must not be "Speaker".'];
+      : ['Guard sensor.phone_audio_output must NOT be "Speaker". Use a condition entry like: - condition: not / conditions: / - condition: state / entity_id: sensor.phone_audio_output / state: "Speaker" or - condition: template / value_template: "{{ states(\'sensor.phone_audio_output\') != \'Speaker\' }}"'];
   harness._directChatCompletion = async () => {
     directCalls += 1;
     return invalidResult;

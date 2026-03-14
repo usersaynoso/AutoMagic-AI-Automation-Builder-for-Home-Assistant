@@ -1689,7 +1689,18 @@ class AutoMagicCard extends LitElement {
         "Preserve requested weekday restrictions explicitly in weekday: or an equivalent weekday condition."
       );
     }
-    if (combined.includes("must not be") || combined.includes("explicit guard")) {
+    const negatedGuardSpecs = this._extractNegatedStateGuardIssueSpecs(issues, 4);
+    if (negatedGuardSpecs.length > 0) {
+      negatedGuardSpecs.slice(0, 2).forEach(({ entityId, state }) => {
+        const templateExpr = this._formatNegatedStateGuardTemplateExpression(
+          entityId,
+          state
+        );
+        hints.push(
+          `For ${entityId} != "${state}", use a condition entry like - condition: not / conditions: / - condition: state / entity_id: ${entityId} / state: "${state}", or - condition: template / value_template: "${templateExpr}".`
+        );
+      });
+    } else if (combined.includes("must not be") || combined.includes("explicit guard")) {
       hints.push(
         "Encode blocked-state guards as executable YAML conditions such as condition: not with a nested state condition, or a valid template condition that requires entity != state."
       );
@@ -1703,6 +1714,67 @@ class AutoMagicCard extends LitElement {
       );
     }
     return hints.filter((hint, index, items) => hint && items.indexOf(hint) === index);
+  }
+
+  _extractNegatedStateGuardIssueSpecs(issues = [], limit = 6) {
+    const specs = [];
+    const seen = new Set();
+    this._normalizeRepairIssues(issues, limit).forEach((issue) => {
+      const match = String(issue || "").match(
+        /([a-z0-9_]+\.[a-z0-9_]+)\s+must\s+not\s+be\s+"([^"]+)"/i
+      );
+      if (!match) {
+        return;
+      }
+      const entityId = String(match[1] || "").trim();
+      const state = String(match[2] || "").trim();
+      if (!entityId || !state) {
+        return;
+      }
+      const key = `${entityId}\u0000${state}`;
+      if (seen.has(key)) {
+        return;
+      }
+      seen.add(key);
+      specs.push({ entityId, state });
+    });
+    return specs;
+  }
+
+  _formatNegatedStateGuardTemplateExpression(entityId, state) {
+    const escapedEntityId = String(entityId || "")
+      .replace(/\\/g, "\\\\")
+      .replace(/'/g, "\\'");
+    const escapedState = String(state || "")
+      .replace(/\\/g, "\\\\")
+      .replace(/'/g, "\\'");
+    return `{{ states('${escapedEntityId}') != '${escapedState}' }}`;
+  }
+
+  _buildNegatedStateGuardExampleText(issues = [], limit = 2) {
+    const specs = this._extractNegatedStateGuardIssueSpecs(issues, limit * 3);
+    if (specs.length === 0) {
+      return "";
+    }
+    const blocks = specs.slice(0, limit).map(({ entityId, state }) => {
+      const templateExpr = this._formatNegatedStateGuardTemplateExpression(
+        entityId,
+        state
+      );
+      return (
+        `${entityId} must not be "${state}":\n` +
+        "Use this condition entry:\n" +
+        "  - condition: not\n" +
+        "    conditions:\n" +
+        "      - condition: state\n" +
+        `        entity_id: ${entityId}\n` +
+        `        state: "${state}"\n` +
+        "Alternative template condition:\n" +
+        "  - condition: template\n" +
+        `    value_template: "${templateExpr}"`
+      );
+    });
+    return `Concrete YAML examples for blocked-state guards:\n${blocks.join("\n\n")}`;
   }
 
   _buildRepairIssueText(issues = [], issueHistory = []) {
@@ -1727,6 +1799,14 @@ class AutoMagicCard extends LitElement {
     ]);
     if (hints.length > 0) {
       sections.push(`Repair rules:\n- ${hints.join("\n- ")}`);
+    }
+
+    const negatedGuardExamples = this._buildNegatedStateGuardExampleText([
+      ...currentIssues,
+      ...priorIssues.slice(0, 3),
+    ]);
+    if (negatedGuardExamples) {
+      sections.push(negatedGuardExamples);
     }
 
     return sections.join("\n\n");

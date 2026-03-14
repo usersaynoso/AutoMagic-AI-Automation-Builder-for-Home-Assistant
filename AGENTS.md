@@ -11,6 +11,7 @@ When the user asks to `commit and push` a change intended for HACS users:
    - GitHub release/tag `v0.2.1`
 4. Do not reuse the previous HACS version number once a newer user-visible update is being shipped.
 5. Treat the GitHub release as required for HACS to see the new downloadable version.
+6. A `commit and push` task is not complete until the matching GitHub Release has been created or updated on GitHub and the Releases page shows that new version as the latest published release.
 
 ## Validation
 

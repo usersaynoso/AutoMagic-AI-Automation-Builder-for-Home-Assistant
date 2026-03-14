@@ -67,6 +67,7 @@ def test_repo_agents_file_documents_release_bumps():
     assert "commit and push" in content
     assert "manifest.json" in content
     assert "GitHub release/tag" in content
+    assert "latest published release" in content
 
 
 def test_local_brand_assets_exist_for_hacs_validation():

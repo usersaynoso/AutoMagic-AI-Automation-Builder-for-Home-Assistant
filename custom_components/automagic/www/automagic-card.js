@@ -1119,11 +1119,55 @@ class AutoMagicCard extends LitElement {
     };
   }
 
+  _sanitizePlainYamlScalars(text) {
+    const normalized = this._normalizeText(text);
+    if (!normalized) return "";
+    const openBrace = String.fromCharCode(123);
+    const flowStartChars = new Set([
+      "'",
+      '"',
+      "[",
+      openBrace,
+      "|",
+      ">",
+      "!",
+      "&",
+      "*",
+    ]);
+
+    return normalized
+      .split(/\r?\n/)
+      .map((line) => {
+        const match = line.match(
+          /^(\s*(?:-\s+)?[A-Za-z_][A-Za-z0-9_]*\s*:\s*)(.+?)\s*$/
+        );
+        if (!match) return line;
+
+        const [, prefix, rawValue] = match;
+        const value = this._normalizeText(rawValue);
+        const firstChar = value.charAt(0);
+        if (
+          !value ||
+          !value.includes(":") ||
+          flowStartChars.has(firstChar) ||
+          value.startsWith(openBrace + openBrace) ||
+          value.startsWith(openBrace + "%")
+        ) {
+          return line;
+        }
+
+        return `${prefix}${JSON.stringify(value)}`;
+      })
+      .join("\n");
+  }
+
   _normalizeAutomationYamlText(rawYaml) {
     const text = this._normalizeText(rawYaml);
     if (!text) return "";
 
-    return this._extractLooseYamlResponse(text)?.yaml || text;
+    return this._sanitizePlainYamlScalars(
+      this._extractLooseYamlResponse(text)?.yaml || text
+    );
   }
 
   _buildClarificationMessage(summary, clarifyingQuestions) {

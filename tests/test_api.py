@@ -503,12 +503,12 @@ async def test_run_generation_job_repairs_invalid_yaml_before_marking_complete()
             {
                 "yaml": (
                     "alias: Kitchen Lights\n"
-                    "description: Turn on lights: kitchen alert\n"
-                    "triggers:\n"
-                    "  - trigger: state\n"
+                    "description: Broken draft.\n"
+                    "trigger:\n"
+                    "  - platform: state\n"
                     "    entity_id: light.kitchen\n"
-                    "actions:\n"
-                    "  - action: light.turn_on\n"
+                    "action:\n"
+                    "  - service: light.turn_on\n"
                     "    target:\n"
                     "      entity_id: light.kitchen\n"
                 ),
@@ -567,6 +567,217 @@ async def test_run_generation_job_repairs_invalid_yaml_before_marking_complete()
     repair_messages = fake_client.complete.await_args_list[1].args[0]
     assert repair_messages[-1]["role"] == "user"
     assert "Problems to fix:" in repair_messages[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_run_generation_job_sanitizes_plain_scalar_yaml_values_with_colons():
+    """Generation should accept otherwise-valid YAML with unquoted colons in plain scalars."""
+    hass = _make_hass()
+    job = _create_generation_job(hass, "Notify my iPhone when the kitchen light turns on", None)
+
+    entities = [
+        {
+            "entity_id": "light.kitchen",
+            "name": "Kitchen",
+            "state": "off",
+            "domain": "light",
+        },
+        {
+            "entity_id": "notify.mobile_app_iphone_13",
+            "name": "Notify Iphone 13",
+            "state": "service",
+            "domain": "notify",
+            "device_class": "service",
+        },
+    ]
+    fake_client = MagicMock()
+    fake_client._request_timeout = 420
+    fake_client.complete = AsyncMock(
+        return_value={
+            "yaml": (
+                "alias: Janet cleaning: weekday morning\n"
+                "description: Every weekday morning: check if Janet cleaned recently.\n"
+                "triggers:\n"
+                "  - trigger: state\n"
+                "    entity_id: light.kitchen\n"
+                '    to: "on"\n'
+                "conditions: []\n"
+                "actions:\n"
+                "  - action: notify.mobile_app_iphone_13\n"
+                "    data:\n"
+                "      message: Warning: Janet might be stuck\n"
+                "mode: single\n"
+            ),
+            "summary": "Sends the warning notification.",
+            "needs_clarification": False,
+            "clarifying_questions": [],
+        }
+    )
+
+    with patch(
+        "custom_components.automagic.api.get_entity_context",
+        AsyncMock(return_value=entities),
+    ), patch(
+        "custom_components.automagic.api.build_prompt",
+        return_value=[{"role": "user", "content": "prompt"}],
+    ), patch(
+        "custom_components.automagic.api.async_get_clientsession",
+        return_value=MagicMock(),
+    ), patch(
+        "custom_components.automagic.api.LLMClient.from_config",
+        return_value=fake_client,
+    ):
+        await _run_generation_job(
+            hass,
+            job["job_id"],
+            "Notify my iPhone when the kitchen light turns on",
+            None,
+        )
+
+    assert job["status"] == "completed"
+    assert _validate_generated_yaml(job["yaml"]) is None
+    assert 'alias: "Janet cleaning: weekday morning"' in job["yaml"]
+    assert (
+        'description: "Every weekday morning: check if Janet cleaned recently."'
+        in job["yaml"]
+    )
+    assert 'message: "Warning: Janet might be stuck"' in job["yaml"]
+
+
+@pytest.mark.asyncio
+async def test_run_generation_job_sanitizes_colon_heavy_yaml_for_reported_janet_prompt():
+    """The reported Janet prompt should not fail when the model leaves plain scalars unquoted."""
+    hass = _make_hass()
+    prompt = (
+        "Every weekday morning, check if Janet (the robot vacuum) has done a clean in the last 24 hours. "
+        "If she hasn't, start her cleaning at 8am, but only if everyone has already left home - check this "
+        'by making sure the iPhone 13 audio output is not "Speaker" (meaning the phone is not actively being '
+        "used at home). While Janet is cleaning, turn the lounge strip lights and bar lamp to a dim warm white "
+        "at 20% brightness so she can see. When she finishes, turn those lights back off. If Janet doesn't "
+        'finish within 90 minutes of starting, send a notification to my iPhone saying "Janet is still cleaning '
+        'after 90 minutes - she might be stuck". Don\'t start her at all if either of the router LED switches '
+        "are already off, as that means the network is down and her cloud connection won't work."
+    )
+    job = _create_generation_job(hass, prompt, None)
+
+    entities = [
+        {
+            "entity_id": "vacuum.janet",
+            "name": "Janet",
+            "state": "docked",
+            "domain": "vacuum",
+        },
+        {
+            "entity_id": "sensor.iphone_13_audio_output",
+            "name": "iPhone 13 Audio Output",
+            "state": "AirPlay",
+            "domain": "sensor",
+        },
+        {
+            "entity_id": "switch.router_led_left",
+            "name": "Router LED Left",
+            "state": "on",
+            "domain": "switch",
+        },
+        {
+            "entity_id": "switch.router_led_right",
+            "name": "Router LED Right",
+            "state": "on",
+            "domain": "switch",
+        },
+        {
+            "entity_id": "light.lounge_strip_lights_left",
+            "name": "Lounge Strip Lights Left",
+            "state": "off",
+            "domain": "light",
+        },
+        {
+            "entity_id": "light.lounge_strip_lights_right",
+            "name": "Lounge Strip Lights Right",
+            "state": "off",
+            "domain": "light",
+        },
+        {
+            "entity_id": "light.bar_lamp",
+            "name": "Bar Lamp",
+            "state": "off",
+            "domain": "light",
+        },
+        {
+            "entity_id": "notify.mobile_app_iphone_13",
+            "name": "Notify Iphone 13",
+            "state": "service",
+            "domain": "notify",
+            "device_class": "service",
+        },
+    ]
+    fake_client = MagicMock()
+    fake_client._request_timeout = 420
+    fake_client.complete = AsyncMock(
+        return_value={
+            "yaml": (
+                "alias: Janet cleaning: weekday morning\n"
+                "description: Every weekday morning: check if Janet has cleaned in the last 24 hours.\n"
+                "triggers:\n"
+                "  - trigger: time\n"
+                "    at: 08:00:00\n"
+                "    weekday:\n"
+                "      - mon\n"
+                "      - tue\n"
+                "      - wed\n"
+                "      - thu\n"
+                "      - fri\n"
+                "conditions:\n"
+                "  - condition: state\n"
+                "    entity_id: switch.router_led_left\n"
+                '    state: "on"\n'
+                "actions:\n"
+                "  - action: vacuum.start\n"
+                "    target:\n"
+                "      entity_id: vacuum.janet\n"
+                "  - action: notify.mobile_app_iphone_13\n"
+                "    data:\n"
+                "      message: Janet is still cleaning after 90 minutes: she might be stuck\n"
+                "mode: single\n"
+            ),
+            "summary": "Starts Janet if the conditions are met.",
+            "needs_clarification": False,
+            "clarifying_questions": [],
+        }
+    )
+
+    with patch(
+        "custom_components.automagic.api.get_entity_context",
+        AsyncMock(return_value=entities),
+    ), patch(
+        "custom_components.automagic.api.build_prompt",
+        return_value=[{"role": "user", "content": "prompt"}],
+    ), patch(
+        "custom_components.automagic.api.async_get_clientsession",
+        return_value=MagicMock(),
+    ), patch(
+        "custom_components.automagic.api.LLMClient.from_config",
+        return_value=fake_client,
+    ):
+        await _run_generation_job(
+            hass,
+            job["job_id"],
+            prompt,
+            None,
+        )
+
+    assert job["status"] == "completed"
+    assert _validate_generated_yaml(job["yaml"]) is None
+    assert 'alias: "Janet cleaning: weekday morning"' in job["yaml"]
+    assert (
+        'description: "Every weekday morning: check if Janet has cleaned in the last 24 hours."'
+        in job["yaml"]
+    )
+    assert 'at: "08:00:00"' in job["yaml"]
+    assert (
+        'message: "Janet is still cleaning after 90 minutes: she might be stuck"'
+        in job["yaml"]
+    )
 
 
 @pytest.mark.asyncio
@@ -851,11 +1062,11 @@ async def test_run_generation_job_repairs_invalid_yaml_after_auto_clarification(
             {
                 "yaml": (
                     "alias: Victron Alert\n"
-                    "description: Turn on lights: phase alert\n"
-                    "triggers:\n"
-                    "  - trigger: template\n"
-                    "actions:\n"
-                    "  - action: notify.mobile_app_iphone_13\n"
+                    "description: Broken draft.\n"
+                    "trigger:\n"
+                    "  - platform: template\n"
+                    "action:\n"
+                    "  - service: notify.mobile_app_iphone_13\n"
                 ),
                 "summary": "Broken draft",
                 "needs_clarification": False,

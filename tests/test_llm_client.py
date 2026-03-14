@@ -361,6 +361,47 @@ async def test_complete_normalizes_wrapped_yaml_string_inside_json_payload():
 
 
 @pytest.mark.asyncio
+async def test_complete_quotes_plain_scalar_yaml_values_with_extra_colons():
+    """JSON payload yaml strings should be sanitized before downstream validation."""
+    content = json.dumps(
+        {
+            "yaml": (
+                "alias: Janet cleaning: weekday morning\n"
+                "description: Every weekday morning: check if Janet cleaned recently.\n"
+                "triggers:\n"
+                "  - trigger: time\n"
+                "    at: 08:00:00\n"
+                "actions:\n"
+                "  - action: notify.mobile_app_iphone_13\n"
+                "    data:\n"
+                "      message: Warning: Janet might be stuck\n"
+                "mode: single\n"
+            ),
+            "summary": "Ready to install",
+            "needs_clarification": False,
+            "clarifying_questions": [],
+        }
+    )
+    resp = FakeResponse(200, _make_completion_response(content))
+    session = FakeSession(resp)
+
+    client = LLMClient(
+        endpoint_url="http://localhost:11434",
+        model="llama3",
+        session=session,
+    )
+    result = await client.complete([{"role": "user", "content": "test"}])
+
+    assert result["yaml"].startswith('alias: "Janet cleaning: weekday morning"')
+    assert (
+        'description: "Every weekday morning: check if Janet cleaned recently."'
+        in result["yaml"]
+    )
+    assert 'at: "08:00:00"' in result["yaml"]
+    assert 'message: "Warning: Janet might be stuck"' in result["yaml"]
+
+
+@pytest.mark.asyncio
 async def test_complete_salvages_malformed_json_wrapper_with_raw_yaml():
     """Broken JSON wrappers with raw multiline yaml should still be accepted."""
     raw = (

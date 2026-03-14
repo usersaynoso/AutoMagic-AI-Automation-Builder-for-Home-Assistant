@@ -225,6 +225,33 @@ actions:
 
 
 @pytest.mark.asyncio
+async def test_install_quotes_plain_scalar_values_with_colons_before_validation():
+    """Install should recover YAML when plain scalar lines contain extra colons."""
+    hass = _make_hass()
+    yaml_string = """\
+alias: Janet cleaning: weekday morning
+description: Every weekday morning: check if Janet cleaned recently.
+triggers:
+  - trigger: time
+    at: 08:00:00
+actions:
+  - action: notify.mobile_app_iphone_13
+    data:
+      message: Warning: Janet might be stuck
+mode: single
+"""
+    result = await install_automation(hass, yaml_string)
+
+    assert result["success"] is True
+    assert result["alias"] == "Janet cleaning: weekday morning"
+    hass.async_add_executor_job.assert_called_once()
+    call_args = hass.async_add_executor_job.call_args
+    assert call_args[0][2]["description"] == (
+        "Every weekday morning: check if Janet cleaned recently."
+    )
+
+
+@pytest.mark.asyncio
 async def test_install_legacy_syntax_rejected():
     """Test that legacy syntax is caught during install."""
     hass = _make_hass()

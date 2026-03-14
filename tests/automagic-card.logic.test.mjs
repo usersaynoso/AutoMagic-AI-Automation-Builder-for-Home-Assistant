@@ -246,6 +246,7 @@ function buildHarness() {
     "_extractWrappedAutomationDocument",
     "_extractLooseYamlResponse",
     "_extractMalformedJsonYamlResponse",
+    "_sanitizePlainYamlScalars",
     "_normalizeAutomationYamlText",
     "_extractJsonObjectText",
     "_buildAutomationContextMessage",
@@ -2085,6 +2086,40 @@ test("JSON payload yaml strings are normalized before returning", () => {
   assert.equal(result.needs_clarification, false);
   assert.match(result.yaml, /^alias: Phase Imbalance Alert/m);
   assert.doesNotMatch(result.yaml, /^yaml/m);
+});
+
+test("JSON payload yaml strings quote plain scalar values that contain extra colons", () => {
+  const harness = buildHarness();
+  const result = harness._parseDirectResponse.call(harness, {
+    choices: [
+      {
+        message: {
+          content: JSON.stringify({
+            yaml:
+              "alias: Janet cleaning: weekday morning\ndescription: Every weekday morning: check if Janet cleaned recently.\ntriggers:\n  - trigger: time\n    at: 08:00:00\nactions:\n  - action: notify.mobile_app_iphone_13\n    data:\n      message: Warning: Janet might be stuck\n",
+            summary: "Ready to install",
+            needs_clarification: false,
+            clarifying_questions: [],
+          }),
+        },
+      },
+    ],
+  });
+
+  assert.equal(result.needs_clarification, false);
+  assert.match(
+    result.yaml,
+    /^alias: "Janet cleaning: weekday morning"$/m
+  );
+  assert.match(
+    result.yaml,
+    /^description: "Every weekday morning: check if Janet cleaned recently\."$/m
+  );
+  assert.match(
+    result.yaml,
+    /^\s+message: "Warning: Janet might be stuck"$/m
+  );
+  assert.match(result.yaml, /^\s+at: "08:00:00"$/m);
 });
 
 test("Malformed JSON wrappers with a raw yaml string are salvaged", () => {

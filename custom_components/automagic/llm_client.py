@@ -44,6 +44,9 @@ _FIELD_LINE_RE = re.compile(
     r"^\s*(summary|needs_clarification|clarifying_questions|questions|follow_up_questions)\s*:",
     re.IGNORECASE,
 )
+_PLAIN_SCALAR_LINE_RE = re.compile(
+    r"^(\s*(?:-\s+)?[A-Za-z_][A-Za-z0-9_]*\s*:\s*)(.+?)\s*$"
+)
 
 STATUS_PROBE_TIMEOUT = 5
 COMPLETION_RETRY_ATTEMPTS = 3
@@ -292,6 +295,37 @@ def _extract_malformed_json_yaml_response(content: str) -> dict[str, Any] | None
     }
 
 
+def _sanitize_plain_yaml_scalars(text: str) -> str:
+    """Quote plain scalar values that contain ':' so YAML stays parseable."""
+    normalized = _normalize_text(text)
+    if not normalized:
+        return ""
+    if not re.search(r"^\s*(?:-\s*)?alias\s*:", normalized, re.MULTILINE):
+        return normalized
+
+    sanitized_lines: list[str] = []
+    for line in normalized.splitlines():
+        match = _PLAIN_SCALAR_LINE_RE.match(line)
+        if match is None:
+            sanitized_lines.append(line)
+            continue
+
+        prefix, raw_value = match.groups()
+        value = raw_value.strip()
+        if (
+            not value
+            or ":" not in value
+            or value.startswith(("'", '"', "[", "{", "|", ">", "!", "&", "*"))
+            or value.startswith(("{{", "{%"))
+        ):
+            sanitized_lines.append(line)
+            continue
+
+        sanitized_lines.append(f"{prefix}{json.dumps(value)}")
+
+    return "\n".join(sanitized_lines)
+
+
 def _normalize_automation_yaml_text(raw: Any) -> str:
     """Normalize wrapped YAML strings into a direct automation document."""
     text = _normalize_text(raw)
@@ -300,13 +334,13 @@ def _normalize_automation_yaml_text(raw: Any) -> str:
 
     malformed = _extract_malformed_json_yaml_response(text)
     if malformed is not None:
-        return _normalize_text(malformed.get("yaml"))
+        return _sanitize_plain_yaml_scalars(_normalize_text(malformed.get("yaml")))
 
     salvaged = _extract_loose_yaml_response(text)
     if salvaged is not None:
-        return _normalize_text(salvaged.get("yaml"))
+        return _sanitize_plain_yaml_scalars(_normalize_text(salvaged.get("yaml")))
 
-    return text
+    return _sanitize_plain_yaml_scalars(text)
 
 
 def _is_retryable_http_status(status: int) -> bool:

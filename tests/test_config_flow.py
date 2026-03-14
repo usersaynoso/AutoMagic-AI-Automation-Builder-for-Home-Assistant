@@ -10,18 +10,23 @@ from custom_components.automagic.config_flow import (
     AutoMagicConfigFlow,
     AutoMagicServiceSubentryFlow,
     DEFAULT_OPENAI_MODEL,
+    ENTRY_TITLE,
     LOCAL_LLM_SERVICE_LABEL,
     OPENAI_MODEL_OPTIONS,
     _async_fetch_openai_models,
     _async_resolve_openai_service,
+    _entry_title,
 )
 from custom_components.automagic.const import (
     CONF_API_KEY,
     CONF_ENDPOINT_URL,
     CONF_MODEL,
     CONF_PROVIDER,
+    CONF_REQUEST_TIMEOUT,
+    CONF_SERVICE_ID,
     PROVIDER_OPENAI,
 )
+from custom_components.automagic.service_config import build_service_config
 
 
 class FakeResponse:
@@ -149,3 +154,106 @@ def test_service_flow_labels_match_local_llm_and_supported_openai_models():
     assert LOCAL_LLM_SERVICE_LABEL == "Local LLM"
     assert DEFAULT_OPENAI_MODEL == "gpt-4o-mini"
     assert tuple(OPENAI_MODEL_OPTIONS) == ("gpt-4o-mini", "gpt-4o")
+
+
+def test_entry_title_stays_generic_when_multiple_services_exist():
+    """The parent config entry should not look like one model owns the others."""
+    assert _entry_title({CONF_MODEL: "qwen2.5:7b"}) == ENTRY_TITLE
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_local_updates_primary_service_without_model_title():
+    """Primary-service reconfigure should keep a stable AutoMagic entry title."""
+    flow = AutoMagicConfigFlow()
+    flow.hass = MagicMock()
+    flow.async_update_reload_and_abort = MagicMock(return_value={"type": "abort"})
+
+    config_entry = MagicMock()
+    config_entry.data = build_service_config(
+        "http://localhost:11434",
+        "qwen2.5:7b",
+        service_id="primary",
+        request_timeout=420,
+    )
+    config_entry.subentries = {}
+    flow._get_reconfigure_entry = MagicMock(return_value=config_entry)
+
+    updated_service = build_service_config(
+        "http://localhost:11434",
+        "qwen2.5:14b",
+        service_id="primary",
+        request_timeout=900,
+    )
+
+    with patch(
+        "custom_components.automagic.config_flow._async_resolve_endpoint_service",
+        AsyncMock(return_value=(updated_service, None)),
+    ):
+        result = await flow.async_step_reconfigure_local(
+            {
+                CONF_ENDPOINT_URL: "http://localhost:11434",
+                CONF_MODEL: "qwen2.5:14b",
+                CONF_REQUEST_TIMEOUT: 900,
+            }
+        )
+
+    assert result == {"type": "abort"}
+    flow.async_update_reload_and_abort.assert_called_once()
+    _, kwargs = flow.async_update_reload_and_abort.call_args
+    assert kwargs["title"] == ENTRY_TITLE
+    assert kwargs["data"][CONF_MODEL] == "qwen2.5:14b"
+    assert kwargs["data"][CONF_SERVICE_ID] == "primary"
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_openai_subentry_preserves_existing_key_and_updates_title():
+    """OpenAI subentries should allow model changes without re-entering the key."""
+    flow = AutoMagicServiceSubentryFlow()
+    flow.hass = MagicMock()
+    flow.async_abort = MagicMock(
+        return_value={"type": "abort", "reason": "reconfigure_successful"}
+    )
+
+    config_entry = MagicMock()
+    config_entry.entry_id = "entry-1"
+    config_subentry = MagicMock()
+    config_subentry.data = build_service_config(
+        "",
+        "gpt-4o-mini",
+        service_id="openai-service",
+        provider=PROVIDER_OPENAI,
+        api_key="sk-existing",
+        request_timeout=480,
+    )
+    flow._get_entry = MagicMock(return_value=config_entry)
+    flow._get_reconfigure_subentry = MagicMock(return_value=config_subentry)
+
+    updated_service = build_service_config(
+        "",
+        "gpt-4o",
+        service_id="openai-service",
+        provider=PROVIDER_OPENAI,
+        api_key="sk-existing",
+        request_timeout=600,
+    )
+
+    with patch(
+        "custom_components.automagic.config_flow._async_resolve_openai_service",
+        AsyncMock(return_value=(updated_service, None)),
+    ) as resolve_openai:
+        result = await flow.async_step_reconfigure_openai(
+            {
+                CONF_API_KEY: "",
+                CONF_MODEL: "gpt-4o",
+                CONF_REQUEST_TIMEOUT: 600,
+            }
+        )
+
+    assert result == {"type": "abort", "reason": "reconfigure_successful"}
+    resolve_openai.assert_awaited_once()
+    assert resolve_openai.await_args.kwargs["existing_api_key"] == "sk-existing"
+    flow.hass.config_entries.async_update_subentry.assert_called_once()
+    _, kwargs = flow.hass.config_entries.async_update_subentry.call_args
+    assert kwargs["title"] == "OpenAI: gpt-4o"
+    assert kwargs["data"][CONF_MODEL] == "gpt-4o"
+    flow.hass.config_entries.async_schedule_reload.assert_called_once_with("entry-1")

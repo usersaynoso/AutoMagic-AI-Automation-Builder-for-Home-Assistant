@@ -1,15 +1,7 @@
 {
   "config": {
-    "step": {
-      "user": {
-        "title": "Connect to LLM",
-        "description": "Enter the URL of your OpenAI-compatible LLM endpoint.\n\nOllama default: http://localhost:11434\n\nAutoMagic will auto-detect the best available model for the first AI service. You can add more services later with Home Assistant's Add service button.",
-        "data": {
-          "endpoint_url": "LLM Endpoint URL"
-        }
-      }
-    },
     "error": {
+      "already_exists": "That AI service is already configured.",
       "cannot_connect": "Cannot connect to LLM endpoint. Check the URL and ensure the server is running.",
       "invalid_api_key": "OpenAI rejected that API key. Paste a valid key and try again.",
       "missing_api_key": "Paste an OpenAI API key to continue.",
@@ -17,19 +9,50 @@
       "unsupported_model": "Choose either gpt-4o-mini or gpt-4o."
     },
     "abort": {
-      "already_configured": "AutoMagic is already configured."
+      "already_configured": "AutoMagic is already configured.",
+      "reconfigure_successful": "[%key:common::config_flow::abort::reconfigure_successful%]"
+    },
+    "step": {
+      "user": {
+        "title": "Connect to LLM",
+        "description": "Enter the URL of your OpenAI-compatible LLM endpoint.\n\nOllama default: http://localhost:11434\n\nAutoMagic will auto-detect the best available model for the first AI service. You can add more services later with Home Assistant's Add service button.",
+        "data": {
+          "endpoint_url": "LLM Endpoint URL"
+        }
+      },
+      "reconfigure_local": {
+        "title": "Update Primary AI Service",
+        "description": "Change the endpoint, model, or timeout for the primary local AI service.",
+        "data": {
+          "endpoint_url": "LLM Endpoint URL",
+          "model": "Model (leave empty for auto-detect)",
+          "request_timeout": "Generation timeout (seconds)"
+        }
+      },
+      "reconfigure_openai": {
+        "title": "Update Primary AI Service",
+        "description": "Change the OpenAI model or timeout for the primary AI service. Leave the API key blank to keep the current key.",
+        "data": {
+          "api_key": "OpenAI API Key",
+          "model": "Model",
+          "request_timeout": "Generation timeout (seconds)"
+        }
+      }
     }
   },
   "config_subentries": {
     "service": {
+      "title": "AI service",
       "entry_type": "Service",
       "initiate_flow": {
         "user": "Add service"
       },
       "abort": {
-        "already_exists": "That AI service is already configured."
+        "already_exists": "That AI service is already configured.",
+        "reconfigure_successful": "[%key:common::config_flow::abort::reconfigure_successful%]"
       },
       "error": {
+        "already_exists": "That AI service is already configured.",
         "cannot_connect": "Cannot connect to the AI service. Check the details and try again.",
         "invalid_api_key": "OpenAI rejected that API key. Paste a valid key and try again.",
         "missing_api_key": "Paste an OpenAI API key to continue.",
@@ -56,6 +79,24 @@
         "openai_service": {
           "title": "Add OpenAI Key",
           "description": "Add an OpenAI service by pasting an API key. AutoMagic uses OpenAI's hosted endpoint automatically, so no model URL is needed. Choose either gpt-4o-mini or gpt-4o.",
+          "data": {
+            "api_key": "OpenAI API Key",
+            "model": "Model",
+            "request_timeout": "Generation timeout (seconds)"
+          }
+        },
+        "reconfigure_local": {
+          "title": "Update AI Service",
+          "description": "Change the endpoint, model, or timeout for this local AI service.",
+          "data": {
+            "endpoint_url": "LLM Endpoint URL",
+            "model": "Model (leave empty for auto-detect)",
+            "request_timeout": "Generation timeout (seconds)"
+          }
+        },
+        "reconfigure_openai": {
+          "title": "Update AI Service",
+          "description": "Change the OpenAI model or timeout for this AI service. Leave the API key blank to keep the current key.",
           "data": {
             "api_key": "OpenAI API Key",
             "model": "Model",

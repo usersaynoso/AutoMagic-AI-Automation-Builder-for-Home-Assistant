@@ -39,6 +39,7 @@ from .service_config import (
     pick_default_model,
 )
 
+ENTRY_TITLE = "AutoMagic"
 LOCAL_LLM_SERVICE_LABEL = "Local LLM"
 OPENAI_MODEL_OPTIONS = {
     "gpt-4o-mini": "gpt-4o-mini",
@@ -230,18 +231,58 @@ async def _async_resolve_openai_service(
 
 def _entry_title(config_data: dict[str, Any]) -> str:
     """Return the config-entry title."""
-    services = get_configured_services(config_data)
-    default_service_id = get_default_service_id(config_data)
-    service = next(
-        (
-            item
-            for item in services
-            if item.get(CONF_SERVICE_ID) == default_service_id
-        ),
-        services[0] if services else None,
+    del config_data
+    return ENTRY_TITLE
+
+
+def _custom_service_schema(
+    *,
+    endpoint_url: str,
+    model: str,
+    request_timeout: int,
+) -> vol.Schema:
+    """Return the schema for a local/custom AI service."""
+    return vol.Schema(
+        {
+            vol.Required(
+                CONF_ENDPOINT_URL,
+                default=endpoint_url,
+            ): str,
+            vol.Optional(CONF_MODEL, default=model): str,
+            vol.Optional(
+                CONF_REQUEST_TIMEOUT,
+                default=request_timeout,
+            ): vol.All(int, vol.Range(min=60, max=1800)),
+        }
     )
-    model = service.get(CONF_MODEL, "") if service else ""
-    return f"AutoMagic ({model})" if model else "AutoMagic"
+
+
+def _openai_service_schema(
+    *,
+    api_key_required: bool,
+    api_key: str,
+    model: str,
+    request_timeout: int,
+) -> vol.Schema:
+    """Return the schema for an OpenAI-backed AI service."""
+    api_key_field = (
+        vol.Required(CONF_API_KEY, default=api_key)
+        if api_key_required
+        else vol.Optional(CONF_API_KEY, default=api_key)
+    )
+    return vol.Schema(
+        {
+            api_key_field: str,
+            vol.Required(
+                CONF_MODEL,
+                default=model,
+            ): vol.In(OPENAI_MODEL_OPTIONS),
+            vol.Optional(
+                CONF_REQUEST_TIMEOUT,
+                default=request_timeout,
+            ): vol.All(int, vol.Range(min=60, max=1800)),
+        }
+    )
 
 
 class AutoMagicConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -283,6 +324,127 @@ class AutoMagicConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         default=DEFAULT_ENDPOINT,
                     ): str,
                 }
+            ),
+            errors=errors,
+        )
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Reconfigure the primary AI service."""
+        config_entry = self._get_reconfigure_entry()
+        provider = str(config_entry.data.get(CONF_PROVIDER, "") or "").strip().lower()
+        if provider == PROVIDER_OPENAI:
+            return await self.async_step_reconfigure_openai(user_input)
+        return await self.async_step_reconfigure_local(user_input)
+
+    async def async_step_reconfigure_local(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Reconfigure the primary local AI service."""
+        errors: dict[str, str] = {}
+        config_entry = self._get_reconfigure_entry()
+        service_id = str(config_entry.data.get(CONF_SERVICE_ID, "") or "").strip() or None
+        current_timeout = int(
+            config_entry.data.get(CONF_REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT)
+        )
+
+        if user_input is not None:
+            service, error = await _async_resolve_endpoint_service(
+                self.hass,
+                user_input[CONF_ENDPOINT_URL],
+                user_input.get(CONF_MODEL, ""),
+                user_input.get(CONF_REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT),
+                service_id=service_id,
+            )
+            if service is not None:
+                if _service_exists(
+                    config_entry,
+                    service,
+                    ignore_service_id=service.get(CONF_SERVICE_ID, ""),
+                ):
+                    errors["base"] = "already_exists"
+                else:
+                    data = _persist_primary_service(
+                        service,
+                        config_entry.data,
+                        default_service_id=get_default_service_id(
+                            config_entry.data,
+                            _entry_subentries(config_entry),
+                        ),
+                    )
+                    return self.async_update_reload_and_abort(
+                        config_entry,
+                        data=data,
+                        title=_entry_title(normalize_config_data(data)),
+                    )
+            elif error:
+                errors["base"] = error
+
+        return self.async_show_form(
+            step_id="reconfigure_local",
+            data_schema=_custom_service_schema(
+                endpoint_url=str(
+                    config_entry.data.get(CONF_ENDPOINT_URL, "") or DEFAULT_ENDPOINT
+                ),
+                model=str(config_entry.data.get(CONF_MODEL, "") or ""),
+                request_timeout=current_timeout,
+            ),
+            errors=errors,
+        )
+
+    async def async_step_reconfigure_openai(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Reconfigure the primary OpenAI-backed AI service."""
+        errors: dict[str, str] = {}
+        config_entry = self._get_reconfigure_entry()
+        service_id = str(config_entry.data.get(CONF_SERVICE_ID, "") or "").strip() or None
+        current_timeout = int(
+            config_entry.data.get(CONF_REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT)
+        )
+        current_api_key = str(config_entry.data.get(CONF_API_KEY, "") or "")
+
+        if user_input is not None:
+            service, error = await _async_resolve_openai_service(
+                self.hass,
+                user_input.get(CONF_API_KEY, ""),
+                user_input.get(CONF_MODEL, ""),
+                user_input.get(CONF_REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT),
+                service_id=service_id,
+                existing_api_key=current_api_key,
+            )
+            if service is not None:
+                if _service_exists(
+                    config_entry,
+                    service,
+                    ignore_service_id=service.get(CONF_SERVICE_ID, ""),
+                ):
+                    errors["base"] = "already_exists"
+                else:
+                    data = _persist_primary_service(
+                        service,
+                        config_entry.data,
+                        default_service_id=get_default_service_id(
+                            config_entry.data,
+                            _entry_subentries(config_entry),
+                        ),
+                    )
+                    return self.async_update_reload_and_abort(
+                        config_entry,
+                        data=data,
+                        title=_entry_title(normalize_config_data(data)),
+                    )
+            elif error:
+                errors["base"] = error
+
+        return self.async_show_form(
+            step_id="reconfigure_openai",
+            data_schema=_openai_service_schema(
+                api_key_required=False,
+                api_key="",
+                model=str(config_entry.data.get(CONF_MODEL, "") or DEFAULT_OPENAI_MODEL),
+                request_timeout=current_timeout,
             ),
             errors=errors,
         )
@@ -350,18 +512,10 @@ class AutoMagicServiceSubentryFlow(config_entries.ConfigSubentryFlow):
 
         return self.async_show_form(
             step_id="custom_service",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(
-                        CONF_ENDPOINT_URL,
-                        default=DEFAULT_ENDPOINT,
-                    ): str,
-                    vol.Optional(CONF_MODEL, default=""): str,
-                    vol.Optional(
-                        CONF_REQUEST_TIMEOUT,
-                        default=DEFAULT_REQUEST_TIMEOUT,
-                    ): vol.All(int, vol.Range(min=60, max=1800)),
-                }
+            data_schema=_custom_service_schema(
+                endpoint_url=DEFAULT_ENDPOINT,
+                model="",
+                request_timeout=DEFAULT_REQUEST_TIMEOUT,
             ),
             errors=errors,
         )
@@ -393,18 +547,126 @@ class AutoMagicServiceSubentryFlow(config_entries.ConfigSubentryFlow):
 
         return self.async_show_form(
             step_id="openai_service",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(CONF_API_KEY): str,
-                    vol.Required(
-                        CONF_MODEL,
-                        default=DEFAULT_OPENAI_MODEL,
-                    ): vol.In(OPENAI_MODEL_OPTIONS),
-                    vol.Optional(
-                        CONF_REQUEST_TIMEOUT,
-                        default=DEFAULT_REQUEST_TIMEOUT,
-                    ): vol.All(int, vol.Range(min=60, max=1800)),
-                }
+            data_schema=_openai_service_schema(
+                api_key_required=True,
+                api_key="",
+                model=DEFAULT_OPENAI_MODEL,
+                request_timeout=DEFAULT_REQUEST_TIMEOUT,
+            ),
+            errors=errors,
+        )
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Reconfigure an existing AI service subentry."""
+        config_subentry = self._get_reconfigure_subentry()
+        provider = str(config_subentry.data.get(CONF_PROVIDER, "") or "").strip().lower()
+        if provider == PROVIDER_OPENAI:
+            return await self.async_step_reconfigure_openai(user_input)
+        return await self.async_step_reconfigure_local(user_input)
+
+    async def async_step_reconfigure_local(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Reconfigure a local AI service subentry."""
+        errors: dict[str, str] = {}
+        config_entry = self._get_entry()
+        config_subentry = self._get_reconfigure_subentry()
+        service_id = str(config_subentry.data.get(CONF_SERVICE_ID, "") or "").strip() or None
+        current_timeout = int(
+            config_subentry.data.get(CONF_REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT)
+        )
+
+        if user_input is not None:
+            service, error = await _async_resolve_endpoint_service(
+                self.hass,
+                user_input[CONF_ENDPOINT_URL],
+                user_input.get(CONF_MODEL, ""),
+                user_input.get(CONF_REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT),
+                service_id=service_id,
+            )
+            if service is not None:
+                if _service_exists(
+                    config_entry,
+                    service,
+                    ignore_service_id=service.get(CONF_SERVICE_ID, ""),
+                ):
+                    errors["base"] = "already_exists"
+                else:
+                    self.hass.config_entries.async_update_subentry(
+                        entry=config_entry,
+                        subentry=config_subentry,
+                        data=service,
+                        title=build_service_label(service),
+                    )
+                    self.hass.config_entries.async_schedule_reload(config_entry.entry_id)
+                    return self.async_abort(reason="reconfigure_successful")
+            elif error:
+                errors["base"] = error
+
+        return self.async_show_form(
+            step_id="reconfigure_local",
+            data_schema=_custom_service_schema(
+                endpoint_url=str(
+                    config_subentry.data.get(CONF_ENDPOINT_URL, "") or DEFAULT_ENDPOINT
+                ),
+                model=str(config_subentry.data.get(CONF_MODEL, "") or ""),
+                request_timeout=current_timeout,
+            ),
+            errors=errors,
+        )
+
+    async def async_step_reconfigure_openai(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Reconfigure an OpenAI AI service subentry."""
+        errors: dict[str, str] = {}
+        config_entry = self._get_entry()
+        config_subentry = self._get_reconfigure_subentry()
+        service_id = str(config_subentry.data.get(CONF_SERVICE_ID, "") or "").strip() or None
+        current_timeout = int(
+            config_subentry.data.get(CONF_REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT)
+        )
+        current_api_key = str(config_subentry.data.get(CONF_API_KEY, "") or "")
+
+        if user_input is not None:
+            service, error = await _async_resolve_openai_service(
+                self.hass,
+                user_input.get(CONF_API_KEY, ""),
+                user_input.get(CONF_MODEL, ""),
+                user_input.get(CONF_REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT),
+                service_id=service_id,
+                existing_api_key=current_api_key,
+            )
+            if service is not None:
+                if _service_exists(
+                    config_entry,
+                    service,
+                    ignore_service_id=service.get(CONF_SERVICE_ID, ""),
+                ):
+                    errors["base"] = "already_exists"
+                else:
+                    self.hass.config_entries.async_update_subentry(
+                        entry=config_entry,
+                        subentry=config_subentry,
+                        data=service,
+                        title=build_service_label(service),
+                    )
+                    self.hass.config_entries.async_schedule_reload(config_entry.entry_id)
+                    return self.async_abort(reason="reconfigure_successful")
+            elif error:
+                errors["base"] = error
+
+        return self.async_show_form(
+            step_id="reconfigure_openai",
+            data_schema=_openai_service_schema(
+                api_key_required=False,
+                api_key="",
+                model=str(
+                    config_subentry.data.get(CONF_MODEL, "") or DEFAULT_OPENAI_MODEL
+                ),
+                request_timeout=current_timeout,
             ),
             errors=errors,
         )

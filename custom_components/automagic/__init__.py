@@ -19,8 +19,8 @@ from .api import (
     AutoMagicInstallView,
     AutoMagicServicesView,
 )
-from .const import CONF_DEFAULT_SERVICE_ID, CONF_MODEL, DOMAIN
-from .service_config import build_service_config, get_service_config, normalize_config_data
+from .const import CONF_DEFAULT_SERVICE_ID, DOMAIN
+from .service_config import build_service_config, normalize_config_data
 from .ws_api import async_register_websocket_commands
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
@@ -35,9 +35,8 @@ _LOGGER = logging.getLogger(__name__)
 
 def _entry_title(data: dict) -> str:
     """Return the config-entry title for the current default service."""
-    service = get_service_config(data)
-    model = service.get(CONF_MODEL, "") if service else ""
-    return f"AutoMagic ({model})" if model else "AutoMagic"
+    del data
+    return "AutoMagic"
 
 
 def _entry_runtime_config(entry: ConfigEntry) -> dict:
@@ -79,6 +78,10 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up AutoMagic from a config entry."""
+    desired_title = _entry_title(entry.data)
+    if entry.title != desired_title:
+        hass.config_entries.async_update_entry(entry, title=desired_title)
+
     domain_data = hass.data.setdefault(DOMAIN, {})
     domain_data[entry.entry_id] = _entry_runtime_config(entry)
 

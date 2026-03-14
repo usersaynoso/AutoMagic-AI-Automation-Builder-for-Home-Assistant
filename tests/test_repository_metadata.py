@@ -38,7 +38,7 @@ def test_manifest_declares_single_config_entry_service_integration():
     assert manifest["config_flow"] is True
     assert manifest["integration_type"] == "service"
     assert manifest["single_config_entry"] is True
-    assert manifest["version"] == "0.2.7"
+    assert manifest["version"] == "0.2.8"
 
 
 def test_manifest_keys_follow_home_assistant_ordering_rules():
@@ -80,11 +80,28 @@ def test_subentry_translations_define_initiate_flow_labels():
     strings = _read_json(STRINGS_PATH)
     translation = _read_json(TRANSLATION_PATH)
 
+    assert strings["config_subentries"]["service"]["title"] == "AI service"
+    assert translation["config_subentries"]["service"]["title"] == "AI service"
     assert strings["config_subentries"]["service"]["initiate_flow"]["user"] == "Add service"
     assert (
         translation["config_subentries"]["service"]["initiate_flow"]["user"]
         == "Add service"
     )
+
+
+def test_reconfigure_translations_exist_for_config_entries_and_subentries():
+    """Reconfigure flows should have explicit labels in both translation files."""
+    strings = _read_json(STRINGS_PATH)
+    translation = _read_json(TRANSLATION_PATH)
+
+    assert "reconfigure_local" in strings["config"]["step"]
+    assert "reconfigure_openai" in strings["config"]["step"]
+    assert "reconfigure_local" in translation["config"]["step"]
+    assert "reconfigure_openai" in translation["config"]["step"]
+    assert "reconfigure_local" in strings["config_subentries"]["service"]["step"]
+    assert "reconfigure_openai" in strings["config_subentries"]["service"]["step"]
+    assert "reconfigure_local" in translation["config_subentries"]["service"]["step"]
+    assert "reconfigure_openai" in translation["config_subentries"]["service"]["step"]
 
 
 def test_validate_workflow_runs_hacs_without_skipping_brands():

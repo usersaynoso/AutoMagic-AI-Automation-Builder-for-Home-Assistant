@@ -57,18 +57,26 @@ class FakeResponse:
 class FakeSession:
     """Minimal mock aiohttp session."""
 
-    def __init__(self, response: FakeResponse):
-        self._response = response
+    def __init__(self, response: FakeResponse | list[FakeResponse]):
+        self._responses = response if isinstance(response, list) else [response]
         self.last_post = None
         self.last_get = None
+        self.post_calls = []
+        self.get_calls = []
+
+    def _next_response(self, calls: list[dict], responses: list[FakeResponse]) -> FakeResponse:
+        index = min(len(calls), len(responses) - 1)
+        return responses[index]
 
     def post(self, url, **kwargs):
         self.last_post = {"url": url, "kwargs": kwargs}
-        return self._response
+        self.post_calls.append(self.last_post)
+        return self._next_response(self.post_calls[:-1], self._responses)
 
     def get(self, url, **kwargs):
         self.last_get = {"url": url, "kwargs": kwargs}
-        return self._response
+        self.get_calls.append(self.last_get)
+        return self._next_response(self.get_calls[:-1], self._responses)
 
     async def close(self):
         pass
@@ -98,6 +106,9 @@ async def test_complete_success():
     assert result["summary"] == "A test automation"
     assert result["needs_clarification"] is False
     assert result["clarifying_questions"] == []
+    assert session.last_post["kwargs"]["json"]["response_format"] == {
+        "type": "json_object"
+    }
 
 
 @pytest.mark.asyncio
@@ -159,6 +170,71 @@ async def test_complete_http_error():
     )
     with pytest.raises(LLMResponseError, match="HTTP 500"):
         await client.complete([{"role": "user", "content": "test"}])
+
+
+@pytest.mark.asyncio
+async def test_complete_retries_transient_http_errors_before_succeeding():
+    """Transient upstream failures should be retried silently."""
+    content = json.dumps(
+        {
+            "yaml": "alias: Test",
+            "summary": "A test automation",
+            "needs_clarification": False,
+            "clarifying_questions": [],
+        }
+    )
+    session = FakeSession(
+        [
+            FakeResponse(503, "Service Unavailable"),
+            FakeResponse(502, "Bad Gateway"),
+            FakeResponse(200, _make_completion_response(content)),
+        ]
+    )
+
+    client = LLMClient(
+        endpoint_url="https://api.openai.com",
+        model="gpt-4o-mini",
+        session=session,
+    )
+    with patch(
+        "custom_components.automagic.llm_client._sleep_before_retry",
+        AsyncMock(),
+    ):
+        result = await client.complete([{"role": "user", "content": "test"}])
+
+    assert result["yaml"] == "alias: Test"
+    assert len(session.post_calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_complete_falls_back_without_response_format_when_provider_rejects_it():
+    """Compatibility fallback should retry once without response_format."""
+    content = json.dumps(
+        {
+            "yaml": "alias: Test",
+            "summary": "A test automation",
+            "needs_clarification": False,
+            "clarifying_questions": [],
+        }
+    )
+    session = FakeSession(
+        [
+            FakeResponse(400, '{"error":"response_format json_object not supported"}'),
+            FakeResponse(200, _make_completion_response(content)),
+        ]
+    )
+
+    client = LLMClient(
+        endpoint_url="http://localhost:11434",
+        model="llama3",
+        session=session,
+    )
+    result = await client.complete([{"role": "user", "content": "test"}])
+
+    assert result["yaml"] == "alias: Test"
+    assert len(session.post_calls) == 2
+    assert "response_format" in session.post_calls[0]["kwargs"]["json"]
+    assert "response_format" not in session.post_calls[1]["kwargs"]["json"]
 
 
 @pytest.mark.asyncio

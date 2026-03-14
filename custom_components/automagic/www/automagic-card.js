@@ -795,6 +795,54 @@ class AutoMagicCard extends LitElement {
     );
   }
 
+  _isLikelyDirectFallbackHost(hostname) {
+    const normalizedHost = this._normalizeText(hostname).toLowerCase();
+    if (!normalizedHost) return false;
+    if (
+      normalizedHost === "localhost" ||
+      normalizedHost === "127.0.0.1" ||
+      normalizedHost === "::1" ||
+      normalizedHost === "[::1]"
+    ) {
+      return true;
+    }
+
+    const currentHost = this._normalizeText(
+      window?.location?.hostname || ""
+    ).toLowerCase();
+    if (currentHost && normalizedHost === currentHost) {
+      return true;
+    }
+
+    if (normalizedHost.endsWith(".local")) {
+      return true;
+    }
+
+    return (
+      /^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(normalizedHost) ||
+      /^192\.168\.\d{1,3}\.\d{1,3}$/.test(normalizedHost) ||
+      /^172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(normalizedHost)
+    );
+  }
+
+  _canUseDirectGenerationFallback(service = this._selectedService()) {
+    const endpoint = this._normalizeText(service?.endpoint_url);
+    if (!endpoint) return false;
+
+    try {
+      const parsed = new URL(endpoint);
+      const port =
+        this._normalizeText(parsed.port) ||
+        (parsed.protocol === "https:" ? "443" : "80");
+      return (
+        port === DIRECT_ENDPOINT_PORT &&
+        this._isLikelyDirectFallbackHost(parsed.hostname)
+      );
+    } catch {
+      return false;
+    }
+  }
+
   _buildGenerationRequestPayload(prompt, continueJobId = "") {
     const payload = { prompt };
     const serviceId = this._normalizeText(this._selectedService()?.service_id);
@@ -3187,6 +3235,31 @@ class AutoMagicCard extends LitElement {
     this._clarificationContext = null;
   }
 
+  _buildEntityPool(rawEntities = []) {
+    return [...(Array.isArray(rawEntities) ? rawEntities : []), ...this._notificationServiceEntries()]
+      .filter(
+        (entity, index, items) =>
+          this._normalizeText(entity?.entity_id) &&
+          items.findIndex(
+            (candidate) =>
+              this._normalizeText(candidate?.entity_id) ===
+              this._normalizeText(entity?.entity_id)
+          ) === index
+      );
+  }
+
+  async _ensureEntityPool(allEntities = null) {
+    const rawEntityPool =
+      Array.isArray(allEntities) && allEntities.length > 0
+        ? allEntities
+        : this._lastEntityPool.length > 0
+          ? this._lastEntityPool
+          : (await this._requestEntities())?.entities || [];
+    const entityPool = this._buildEntityPool(rawEntityPool);
+    this._lastEntityPool = entityPool;
+    return entityPool;
+  }
+
   _setPreviewResult(result) {
     this._generationJobId = "";
     this._clearClarificationState();
@@ -3246,15 +3319,65 @@ class AutoMagicCard extends LitElement {
   }
 
   _deriveClarificationCandidates(prompt, result, entities) {
-    const combinedText = this._normalizePhrase(
-      `${prompt || ""} ${result?.summary || ""} ${(result?.clarifying_questions || []).join(" ")}`
+    const questions = this._normalizeQuestions(
+      result?.clarifying_questions || result?.questions
     );
+    const rawCombinedText = [prompt || "", result?.summary || "", ...questions]
+      .map((text) => this._normalizeText(text))
+      .filter(Boolean)
+      .join(" ");
+    const combinedText = this._normalizePhrase(
+      rawCombinedText
+    );
+    const entityPool = Array.isArray(entities) ? entities : [];
 
     if (
       /\b(tv|television)\b/.test(combinedText) &&
       /\b(entity|entity id|device|media player)\b/.test(combinedText)
     ) {
-      return this._candidateEntitiesForTarget("tv", entities);
+      return this._candidateEntitiesForTarget("tv", entityPool);
+    }
+
+    const explicitEntityIds = [...rawCombinedText.matchAll(/\b[a-z0-9_]+\.[a-z0-9_]+\b/gi)]
+      .map((match) => this._normalizeText(match[0]).toLowerCase())
+      .filter(Boolean);
+    const explicitEntityMatches = entityPool.filter((entity) =>
+      explicitEntityIds.includes(this._normalizeText(entity?.entity_id).toLowerCase())
+    );
+    if (explicitEntityMatches.length > 0) {
+      return explicitEntityMatches;
+    }
+
+    const optionTexts = questions
+      .flatMap((question) => {
+        const matches = [];
+        const parentheticalOptions = question.match(/\(([^)]+)\)/g) || [];
+        parentheticalOptions.forEach((segment) => {
+          matches.push(segment.replace(/^[()]+|[()]+$/g, ""));
+        });
+        const targetMatch = question.match(
+          /\bwhich\s+(?:single\s+)?(?:entity|entity id|device|sensor|light|switch|automation|media player)\s+should\s+i\s+use\s+for\s+(.+?)\?/i
+        );
+        if (targetMatch?.[1]) {
+          matches.push(targetMatch[1]);
+        }
+        return matches;
+      })
+      .flatMap((segment) =>
+        segment.split(/\s*(?:,|\bor\b)\s*/i).map((item) => this._normalizeText(item))
+      )
+      .filter(Boolean);
+    const optionMatches = optionTexts.flatMap((option) =>
+      this._findEntitiesByPhrase(option, entityPool, 8)
+    );
+    const dedupedOptionMatches = optionMatches.filter(
+      (entity, index, items) =>
+        items.findIndex(
+          (candidate) => candidate.entity_id === entity.entity_id
+        ) === index
+    );
+    if (dedupedOptionMatches.length > 0) {
+      return dedupedOptionMatches;
     }
 
     return [];
@@ -4938,6 +5061,10 @@ class AutoMagicCard extends LitElement {
       candidates.push(endpoint);
     };
 
+    const selectedServiceEndpoint = this._canUseDirectGenerationFallback()
+      ? this._normalizeText(this._selectedService()?.endpoint_url)
+      : "";
+    pushCandidate(selectedServiceEndpoint);
     pushCandidate(this._configuredDirectEndpoint);
 
     const hostname = this._normalizeText(
@@ -5198,6 +5325,7 @@ class AutoMagicCard extends LitElement {
     }
 
     if (finalJob.status === "needs_clarification") {
+      const entityPool = await this._ensureEntityPool();
       this._conversationMessages = null;
       this._clarificationSummary = finalJob.summary || "";
       this._clarifyingQuestions = finalJob.clarifying_questions || [];
@@ -5207,7 +5335,7 @@ class AutoMagicCard extends LitElement {
           summary: finalJob.summary || "",
           clarifying_questions: finalJob.clarifying_questions || [],
         },
-        this._lastEntityPool
+        entityPool
       );
       this._clarificationAnswer = "";
       this._clarificationContext = null;
@@ -5258,19 +5386,7 @@ class AutoMagicCard extends LitElement {
       `Using ${loadingTarget.model} on ${loadingTarget.endpoint}.`
     );
 
-    const rawEntityPool = Array.isArray(allEntities)
-      ? allEntities
-      : (await this._requestEntities())?.entities || [];
-    const entityPool = [
-      ...rawEntityPool,
-      ...this._notificationServiceEntries(),
-    ].filter(
-      (entity, index, items) =>
-        items.findIndex(
-          (candidate) => candidate.entity_id === entity.entity_id
-        ) === index
-    );
-    this._lastEntityPool = entityPool;
+    const entityPool = await this._ensureEntityPool(allEntities);
     const explicitEntities = this._findExplicitEntities(prompt, entityPool);
     const obviousEntities = this._findObviousNamedEntities(prompt, entityPool);
     const heuristicEntities = this._collectHeuristicEntities(prompt, entityPool);
@@ -5422,19 +5538,7 @@ class AutoMagicCard extends LitElement {
       `Using ${loadingTarget.model} on ${loadingTarget.endpoint}.`
     );
 
-    const rawEntityPool = Array.isArray(allEntities)
-      ? allEntities
-      : (await this._requestEntities())?.entities || [];
-    const entityPool = [
-      ...rawEntityPool,
-      ...this._notificationServiceEntries(),
-    ].filter(
-      (entity, index, items) =>
-        items.findIndex(
-          (candidate) => candidate.entity_id === entity.entity_id
-        ) === index
-    );
-    this._lastEntityPool = entityPool;
+    const entityPool = await this._ensureEntityPool(allEntities);
     const explicitEntities = this._findExplicitEntities(prompt, entityPool);
     const obviousEntities = this._findObviousNamedEntities(prompt, entityPool);
     const heuristicEntities = this._collectHeuristicEntities(prompt, entityPool);
@@ -5725,6 +5829,7 @@ class AutoMagicCard extends LitElement {
         !previousConversationMessages
           ? previousGenerationJobId
           : "";
+      const canUseDirectFallback = this._canUseDirectGenerationFallback();
       if (continueBackendJobId || this._shouldUseBackendGeneration(aiText)) {
         try {
           await this._runBackendGeneration(
@@ -5734,7 +5839,7 @@ class AutoMagicCard extends LitElement {
           );
           return;
         } catch (backendErr) {
-          if (continueBackendJobId) {
+          if (continueBackendJobId || !canUseDirectFallback) {
             throw backendErr;
           }
           this._appendChatMessage({

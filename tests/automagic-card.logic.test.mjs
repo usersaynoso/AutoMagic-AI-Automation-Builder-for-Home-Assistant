@@ -196,6 +196,7 @@ function buildMethod(name) {
     "DIRECT_QUESTION_STARTERS",
     "SIMPLE_ACTION_DOMAINS",
     "DIRECT_COMPLEX_PROMPT_RE",
+    "DIRECT_ENDPOINT_PORT",
     "DIRECT_MAX_TOKENS",
     "DIRECT_TEMPERATURE",
     "DIRECT_MODEL_PREFERENCES",
@@ -220,6 +221,7 @@ function buildMethod(name) {
     DIRECT_QUESTION_STARTERS,
     SIMPLE_ACTION_DOMAINS,
     DIRECT_COMPLEX_PROMPT_RE,
+    "11434",
     DIRECT_MAX_TOKENS,
     DIRECT_TEMPERATURE,
     DIRECT_MODEL_PREFERENCES,
@@ -259,6 +261,8 @@ function buildHarness() {
     "_shouldRetryBackendStatus",
     "_serviceLabel",
     "_selectedService",
+    "_isLikelyDirectFallbackHost",
+    "_canUseDirectGenerationFallback",
     "_buildGenerationRequestPayload",
     "_notificationServiceEntries",
     "_collectSemanticPromptMatches",
@@ -317,8 +321,11 @@ function buildHarness() {
     "_buildDeterministicActionSequence",
     "_buildDeterministicComplexAutomationResult",
     "_tryDeterministicGeneration",
+    "_buildEntityPool",
+    "_ensureEntityPool",
     "_resolveClarificationCandidate",
     "_buildExplicitEntityAnswer",
+    "_deriveClarificationCandidates",
     "_siblingGroupLabel",
     "_buildAutoClarificationAnswer",
     "_buildDirectMessages",
@@ -330,6 +337,7 @@ function buildHarness() {
     "_repairGeneratedYamlIfNeeded",
     "_parsePlanningResponse",
     "_parseDirectResponse",
+    "_buildDirectEndpointCandidates",
   ].forEach((name) => {
     harness[name] = buildMethod(name);
   });
@@ -538,6 +546,58 @@ test("Clarification answer resolves to the matching TV entity", () => {
   );
 
   assert.equal(result?.entity_id, "media_player.living_room");
+});
+
+test("Clarification candidates are rebuilt from explicitly listed entity ids", () => {
+  const harness = buildHarness();
+  const result = harness._deriveClarificationCandidates.call(
+    harness,
+    victronComplexPrompt,
+    {
+      summary:
+        "AC Output Voltage entities are sensor.victron_mk3_ac_output_voltage_l2, sensor.victron_mk3_ac_output_voltage_l3, and sensor.victron_mk3_ac_output_voltage. The automation YAML is missing these details.",
+      clarifying_questions: [
+        "Which single entity should I use for AC Output Voltage? (sensor.victron_mk3_ac_output_voltage_l2, sensor.victron_mk3_ac_output_voltage_l3, or sensor.victron_mk3_ac_output_voltage)",
+      ],
+    },
+    victronComplexEntities
+  );
+
+  assert.deepEqual(
+    result.map((candidate) => candidate.entity_id),
+    [
+      "sensor.victron_mk3_ac_output_voltage",
+      "sensor.victron_mk3_ac_output_voltage_l2",
+      "sensor.victron_mk3_ac_output_voltage_l3",
+    ]
+  );
+});
+
+test("Entity pool is fetched and augmented when backend clarification arrives first", async () => {
+  const harness = buildHarness();
+  harness._lastEntityPool = [];
+  harness._requestEntities = async () => ({
+    entities: victronComplexEntities.filter(
+      (entity) => entity.domain !== "notify"
+    ),
+  });
+  harness.hass = {
+    services: {
+      notify: {
+        mobile_app_iphone_13: {},
+      },
+    },
+  };
+
+  const entityPool = await harness._ensureEntityPool.call(harness);
+  const entityIds = entityPool.map((entity) => entity.entity_id);
+
+  assert.ok(entityIds.includes("sensor.victron_mk3_ac_output_voltage"));
+  assert.ok(entityIds.includes("notify.mobile_app_iphone_13"));
+  assert.equal(
+    entityIds.filter((entityId) => entityId === "notify.mobile_app_iphone_13").length,
+    1
+  );
 });
 
 test("Selected TV produces deterministic automation YAML", () => {
@@ -1639,6 +1699,53 @@ test("Prompts prefer backend generation and keep direct generation as a fallback
     ),
     true
   );
+});
+
+test("Direct local fallback is disabled for remote OpenAI services", () => {
+  const harness = buildHarness();
+  harness._services = [
+    {
+      service_id: "openai",
+      model: "gpt-4o-mini",
+      endpoint_url: "https://api.openai.com",
+      is_default: true,
+    },
+  ];
+  harness._selectedServiceId = "openai";
+
+  assert.equal(harness._canUseDirectGenerationFallback.call(harness), false);
+});
+
+test("Direct local fallback reuses the selected Ollama endpoint when it is local", () => {
+  const harness = buildHarness();
+  const originalWindow = globalThis.window;
+  globalThis.window = {
+    location: {
+      hostname: "ha.local",
+      protocol: "http:",
+    },
+  };
+
+  try {
+    harness._services = [
+      {
+        service_id: "local",
+        model: "qwen2.5:14b",
+        endpoint_url: "http://192.168.1.5:11434",
+        is_default: true,
+      },
+    ];
+    harness._selectedServiceId = "local";
+
+    assert.equal(harness._canUseDirectGenerationFallback.call(harness), true);
+    assert.deepEqual(harness._buildDirectEndpointCandidates.call(harness), [
+      "http://192.168.1.5:11434",
+      "http://ha.local:11434",
+      "http://localhost:11434",
+    ]);
+  } finally {
+    globalThis.window = originalWindow;
+  }
 });
 
 test("Transient backend polling errors are retried", () => {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -45,6 +46,18 @@ _FIELD_LINE_RE = re.compile(
 )
 
 STATUS_PROBE_TIMEOUT = 5
+COMPLETION_RETRY_ATTEMPTS = 3
+_RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+_RETRYABLE_PARSE_ERROR_MARKERS = (
+    "failed to parse llm response",
+    "empty content in llm response",
+    "no choices in llm response",
+)
+_RESPONSE_FORMAT_UNSUPPORTED_RE = re.compile(
+    r"(?:response_format|json_object)[\s\S]{0,120}?(?:unsupported|not supported|invalid|unknown)"
+    r"|(?:unsupported|not supported|invalid|unknown)[\s\S]{0,120}?(?:response_format|json_object)",
+    re.IGNORECASE,
+)
 
 
 class LLMConnectionError(Exception):
@@ -230,6 +243,29 @@ def _normalize_automation_yaml_text(raw: Any) -> str:
     return text
 
 
+def _is_retryable_http_status(status: int) -> bool:
+    """Return True when the provider response is transient enough to retry."""
+    return status in _RETRYABLE_HTTP_STATUS_CODES or 500 <= status <= 599
+
+
+def _should_retry_parse_error(err: Exception) -> bool:
+    """Retry transient malformed replies from otherwise successful providers."""
+    text = _normalize_text(err).lower()
+    return any(marker in text for marker in _RETRYABLE_PARSE_ERROR_MARKERS)
+
+
+def _response_format_is_unsupported(status: int, body: str) -> bool:
+    """Detect providers that reject OpenAI-style json_object output mode."""
+    if status not in {400, 404, 415, 422}:
+        return False
+    return bool(_RESPONSE_FORMAT_UNSUPPORTED_RE.search(_normalize_text(body)))
+
+
+async def _sleep_before_retry(attempt: int) -> None:
+    """Back off slightly between transient provider failures."""
+    await asyncio.sleep(min(float(attempt), 2.0))
+
+
 class LLMClient:
     """Client for OpenAI-compatible /v1/chat/completions endpoints."""
 
@@ -291,39 +327,77 @@ class LLMClient:
             "max_tokens": self._max_tokens,
             "temperature": self._temperature,
             "stream": False,
+            "response_format": {"type": "json_object"},
         }
-
         timeout = aiohttp.ClientTimeout(total=self._request_timeout)
+        payload_variants = [
+            payload,
+            {key: value for key, value in payload.items() if key != "response_format"},
+        ]
 
+        session = self._session or aiohttp.ClientSession()
         try:
-            session = self._session or aiohttp.ClientSession()
-            try:
-                async with session.post(
-                    url,
-                    json=payload,
-                    timeout=timeout,
-                    headers=self._request_headers(),
-                ) as resp:
-                    if resp.status != 200:
-                        body = await resp.text()
-                        raise LLMResponseError(
-                            f"LLM returned HTTP {resp.status} from {url}: {body[:500]}"
-                        )
-                    data = await resp.json()
-            finally:
-                if self._session is None:
-                    await session.close()
+            for variant_index, request_payload in enumerate(payload_variants):
+                for attempt in range(1, COMPLETION_RETRY_ATTEMPTS + 1):
+                    try:
+                        async with session.post(
+                            url,
+                            json=request_payload,
+                            timeout=timeout,
+                            headers=self._request_headers(),
+                        ) as resp:
+                            if resp.status != 200:
+                                body = await resp.text()
+                                if (
+                                    variant_index == 0
+                                    and _response_format_is_unsupported(
+                                        resp.status, body
+                                    )
+                                ):
+                                    break
+                                if (
+                                    attempt < COMPLETION_RETRY_ATTEMPTS
+                                    and _is_retryable_http_status(resp.status)
+                                ):
+                                    await _sleep_before_retry(attempt)
+                                    continue
+                                raise LLMResponseError(
+                                    f"LLM returned HTTP {resp.status} from {url}: {body[:500]}"
+                                )
+                            data = await resp.json()
 
-            return self._parse_response(data)
+                        try:
+                            return self._parse_response(data)
+                        except LLMResponseError as err:
+                            if (
+                                attempt < COMPLETION_RETRY_ATTEMPTS
+                                and _should_retry_parse_error(err)
+                            ):
+                                await _sleep_before_retry(attempt)
+                                continue
+                            raise
 
-        except TimeoutError:
-            raise LLMConnectionError(
-                f"LLM request timed out after {self._request_timeout}s to {url}"
-            ) from None
-        except aiohttp.ClientError as err:
-            raise LLMConnectionError(
-                f"Cannot connect to LLM endpoint {url}: {err}"
-            ) from err
+                    except TimeoutError:
+                        if attempt < COMPLETION_RETRY_ATTEMPTS:
+                            await _sleep_before_retry(attempt)
+                            continue
+                        raise LLMConnectionError(
+                            f"LLM request timed out after {self._request_timeout}s to {url}"
+                        ) from None
+                    except aiohttp.ClientError as err:
+                        if attempt < COMPLETION_RETRY_ATTEMPTS:
+                            await _sleep_before_retry(attempt)
+                            continue
+                        raise LLMConnectionError(
+                            f"Cannot connect to LLM endpoint {url}: {err}"
+                        ) from err
+
+            raise LLMResponseError(
+                f"LLM endpoint {url} rejected structured JSON responses and did not return a compatible reply."
+            )
+        finally:
+            if self._session is None:
+                await session.close()
 
     async def probe_generation_status(self) -> dict[str, Any]:
         """Probe backend status while a long-running request is in flight.

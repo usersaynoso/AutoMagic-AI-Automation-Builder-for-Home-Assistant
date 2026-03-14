@@ -38,7 +38,7 @@ def test_manifest_declares_single_config_entry_service_integration():
     assert manifest["config_flow"] is True
     assert manifest["integration_type"] == "service"
     assert manifest["single_config_entry"] is True
-    assert manifest["version"] == "0.2.11"
+    assert manifest["version"] == "0.2.12"
 
 
 def test_manifest_keys_follow_home_assistant_ordering_rules():

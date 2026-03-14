@@ -392,7 +392,7 @@ class AutoMagicCard extends LitElement {
     this._directEndpoint = "";
     this._directModel = "";
     this._wsUnavailable = false;
-    this._repairNoticeShown = false;
+    this._lastRepairDetail = "";
   }
 
   setConfig(config) {
@@ -5377,16 +5377,16 @@ class AutoMagicCard extends LitElement {
       try {
         const payload = await this._requestGenerationStatusWithToken(jobId);
 
-        if (payload?.repair_in_progress && !this._repairNoticeShown) {
-          this._repairNoticeShown = true;
-          this._loadingMessage = payload.message || "Fixing a YAML formatting issue…";
-          this._loadingDetail = payload.detail || "AutoMagic detected invalid YAML and is asking the AI to correct it.";
+        if (payload?.repair_in_progress && (payload.detail || "") !== this._lastRepairDetail) {
+          this._lastRepairDetail = payload.detail || "";
+          this._loadingMessage = payload.message || "Fixing an issue…";
+          this._loadingDetail = payload.detail || "AutoMagic is asking the AI to correct an issue.";
           this._appendChatMessage({
             role: "assistant",
             type: "status",
             tone: "warning",
             text: payload.detail ||
-              "AutoMagic detected that the generated YAML had a formatting issue and has " +
+              "AutoMagic detected an issue with the generated automation and has " +
               "automatically sent the specific error back to the AI, asking for a correction.",
           });
         } else if (payload?.message && !payload?.repair_in_progress) {
@@ -5416,7 +5416,7 @@ class AutoMagicCard extends LitElement {
   }
 
   async _runBackendGeneration(prompt, requestText = null, continueJobId = "") {
-    this._repairNoticeShown = false;
+    this._lastRepairDetail = "";
     const selectedService = this._selectedService();
     this._startLoadingTicker(
       "Waiting for your model to respond...",
@@ -6124,7 +6124,7 @@ class AutoMagicCard extends LitElement {
     this._lastEntityPool = [];
     this._directEndpoint = "";
     this._directModel = "";
-    this._repairNoticeShown = false;
+    this._lastRepairDetail = "";
   }
 
   _handleRetry() {
@@ -6172,14 +6172,14 @@ class AutoMagicCard extends LitElement {
 
       this._updateLoadingState(result);
 
-      if (result.repair_in_progress && !this._repairNoticeShown) {
-        this._repairNoticeShown = true;
+      if (result.repair_in_progress && (result.detail || "") !== this._lastRepairDetail) {
+        this._lastRepairDetail = result.detail || "";
         this._appendChatMessage({
           role: "assistant",
           type: "status",
           tone: "warning",
           text: result.detail ||
-            "AutoMagic detected that the generated YAML had a formatting issue and has " +
+            "AutoMagic detected an issue with the generated automation and has " +
             "automatically sent the specific error back to the AI, asking for a correction.",
         });
       }

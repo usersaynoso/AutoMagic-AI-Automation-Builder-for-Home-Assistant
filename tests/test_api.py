@@ -15,6 +15,8 @@ from custom_components.automagic.api import (
     AutoMagicGenerateStatusView,
     AutoMagicHistoryEntryView,
     _create_generation_job,
+    _extract_entity_ids_from_yaml,
+    _find_hallucinated_entities,
     _get_config_data,
     _run_generation_job,
     _validate_generated_yaml,
@@ -1325,6 +1327,13 @@ async def test_run_generation_job_auto_resolves_grouped_sensor_clarification():
             "domain": "sensor",
             "device_class": "voltage",
         },
+        {
+            "entity_id": "notify.mobile_app_iphone_13",
+            "name": "Notify Iphone 13",
+            "state": "service",
+            "domain": "notify",
+            "device_class": "service",
+        },
     ]
     fake_client = MagicMock()
     fake_client._request_timeout = 420
@@ -1405,6 +1414,13 @@ async def test_run_generation_job_reasserts_resolved_clarification_once():
             "state": "228",
             "domain": "sensor",
             "device_class": "voltage",
+        },
+        {
+            "entity_id": "notify.mobile_app_iphone_13",
+            "name": "Notify Iphone 13",
+            "state": "service",
+            "domain": "notify",
+            "device_class": "service",
         },
         {
             "entity_id": "automation.electricity_balance_above_ps1",
@@ -1724,3 +1740,209 @@ async def test_generate_status_view_survives_backend_probe_failures():
     assert result["status_code"] == 202
     assert result["status"] == "running"
     assert result["detail"] == "Still processing."
+
+
+# ---------------------------------------------------------------------------
+# Entity extraction & hallucination detection
+# ---------------------------------------------------------------------------
+
+
+def test_extract_entity_ids_from_yaml_basic():
+    """Extract entity_id values and notify actions from automation YAML."""
+    yaml_text = (
+        "alias: Test\n"
+        "triggers:\n"
+        "  - trigger: state\n"
+        "    entity_id: sensor.temperature\n"
+        "conditions:\n"
+        "  - condition: state\n"
+        "    entity_id: binary_sensor.door\n"
+        "actions:\n"
+        "  - action: light.turn_on\n"
+        "    target:\n"
+        "      entity_id:\n"
+        "        - light.kitchen\n"
+        "        - light.bedroom\n"
+        "  - action: notify.mobile_app_iphone\n"
+        "    data:\n"
+        "      message: Hello\n"
+        "mode: single\n"
+    )
+    ids = _extract_entity_ids_from_yaml(yaml_text)
+    assert ids == {
+        "sensor.temperature",
+        "binary_sensor.door",
+        "light.kitchen",
+        "light.bedroom",
+        "notify.mobile_app_iphone",
+    }
+
+
+def test_extract_entity_ids_ignores_service_calls():
+    """Service calls like light.turn_on should not be extracted as entity IDs."""
+    yaml_text = (
+        "alias: Test\n"
+        "triggers:\n"
+        "  - trigger: state\n"
+        "    entity_id: sensor.x\n"
+        "actions:\n"
+        "  - action: light.turn_on\n"
+        "    target:\n"
+        "      entity_id: light.kitchen\n"
+        "  - action: homeassistant.restart\n"
+        "mode: single\n"
+    )
+    ids = _extract_entity_ids_from_yaml(yaml_text)
+    # action: light.turn_on and action: homeassistant.restart are NOT entities
+    assert "light.turn_on" not in ids
+    assert "homeassistant.restart" not in ids
+    assert ids == {"sensor.x", "light.kitchen"}
+
+
+def test_extract_entity_ids_empty_input():
+    """Empty or invalid input returns an empty set."""
+    assert _extract_entity_ids_from_yaml("") == set()
+    assert _extract_entity_ids_from_yaml("not: {valid: yaml: {{}}") == set()
+
+
+def test_find_hallucinated_entities():
+    """Entities not in the known set are detected as hallucinated."""
+    yaml_text = (
+        "alias: Test\n"
+        "triggers:\n"
+        "  - trigger: state\n"
+        "    entity_id: sensor.real_sensor\n"
+        "conditions: []\n"
+        "actions:\n"
+        "  - action: light.turn_on\n"
+        "    target:\n"
+        "      entity_id: light.fake_light\n"
+        "  - action: notify.fake_notify\n"
+        "    data:\n"
+        "      message: test\n"
+        "mode: single\n"
+    )
+    known = {"sensor.real_sensor", "light.real_light", "notify.real_notify"}
+    hallucinated = _find_hallucinated_entities(yaml_text, known)
+    assert hallucinated == ["light.fake_light", "notify.fake_notify"]
+
+
+def test_find_hallucinated_entities_all_valid():
+    """When all referenced entities are known, returns an empty list."""
+    yaml_text = (
+        "alias: Test\n"
+        "triggers:\n"
+        "  - trigger: state\n"
+        "    entity_id: sensor.temp\n"
+        "conditions: []\n"
+        "actions:\n"
+        "  - action: light.turn_on\n"
+        "    target:\n"
+        "      entity_id: light.kitchen\n"
+        "mode: single\n"
+    )
+    known = {"sensor.temp", "light.kitchen"}
+    assert _find_hallucinated_entities(yaml_text, known) == []
+
+
+# ---------------------------------------------------------------------------
+# Entity repair integration test
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_generation_job_repairs_hallucinated_entities():
+    """When the LLM generates YAML with entity IDs that don't exist, entities are sent back for repair."""
+    hass = _make_hass()
+    job = _create_generation_job(hass, "Turn on the kitchen lights", ["light"])
+
+    entities = [
+        {"entity_id": "light.kitchen", "name": "Kitchen Light", "state": "off", "domain": "light"},
+        {"entity_id": "sensor.temperature", "name": "Temperature", "state": "22", "domain": "sensor"},
+    ]
+
+    # First response: valid YAML structure but with a hallucinated entity
+    hallucinated_response = {
+        "yaml": (
+            "alias: Kitchen Lights\n"
+            "description: \"Turns on the kitchen lights.\"\n"
+            "triggers:\n"
+            "  - trigger: state\n"
+            "    entity_id: sensor.temperature\n"
+            '    to: "22"\n'
+            "conditions: []\n"
+            "actions:\n"
+            "  - action: light.turn_on\n"
+            "    target:\n"
+            "      entity_id: light.nonexistent_light\n"
+            "mode: single\n"
+        ),
+        "summary": "Turns on a nonexistent light.",
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+
+    # Second response: fixed — uses real entity
+    fixed_response = {
+        "yaml": (
+            "alias: Kitchen Lights\n"
+            "description: \"Turns on the kitchen lights.\"\n"
+            "triggers:\n"
+            "  - trigger: state\n"
+            "    entity_id: sensor.temperature\n"
+            '    to: "22"\n'
+            "conditions: []\n"
+            "actions:\n"
+            "  - action: light.turn_on\n"
+            "    target:\n"
+            "      entity_id: light.kitchen\n"
+            "mode: single\n"
+        ),
+        "summary": "Turns on the kitchen lights.",
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+
+    entity_repair_seen = []
+
+    async def _tracking_complete(messages):
+        entity_repair_seen.append(bool(job.get("repair_in_progress")))
+        # Check if the message is an entity repair request
+        last_msg = messages[-1]["content"] if messages else ""
+        if "do not exist" in last_msg.lower() or "invalid entity" in last_msg.lower():
+            return fixed_response
+        return hallucinated_response
+
+    fake_client = MagicMock()
+    fake_client._request_timeout = 420
+    fake_client.complete = AsyncMock(side_effect=_tracking_complete)
+
+    with patch(
+        "custom_components.automagic.api.get_entity_context",
+        AsyncMock(return_value=entities),
+    ), patch(
+        "custom_components.automagic.api.build_prompt",
+        return_value=[
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "prompt"},
+        ],
+    ), patch(
+        "custom_components.automagic.api.async_get_clientsession",
+        return_value=MagicMock(),
+    ), patch(
+        "custom_components.automagic.api.LLMClient.from_config",
+        return_value=fake_client,
+    ):
+        await _run_generation_job(
+            hass, job["job_id"], "Turn on the kitchen lights", ["light"]
+        )
+
+    assert job["status"] == "completed"
+    assert not job.get("repair_in_progress")
+    # The entity repair path must have been active
+    assert any(entity_repair_seen), (
+        "repair_in_progress was never set during entity repair"
+    )
+    # The final YAML should reference the real entity
+    assert "light.kitchen" in job["yaml"]
+    assert "light.nonexistent_light" not in job["yaml"]

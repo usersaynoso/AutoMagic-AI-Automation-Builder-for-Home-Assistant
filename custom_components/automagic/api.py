@@ -74,6 +74,7 @@ _BACKEND_PROBE_INTERVAL_SECONDS = 10
 _DEFAULT_GENERATION_CONTEXT_LIMIT = 60
 _YAML_REPAIR_ATTEMPTS = 2
 _YAML_REGENERATION_ATTEMPTS = 1
+_ENTITY_REPAIR_ATTEMPTS = 2
 _TIME_WINDOW_RE = re.compile(
     r"\bbetween\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s+(?:and|to|-)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b",
     re.IGNORECASE,
@@ -126,6 +127,21 @@ Use Home Assistant 2024.10+ syntax only.
 - Preserve the user's thresholds, guards, delays, entities, and notification text.
 If prior drafts were invalid, ignore them and regenerate the automation cleanly from the original request and entity context.
 Do not ask for clarification unless the original request truly lacks a required detail. Return the final automation JSON now."""
+_ENTITY_REPAIR_SYSTEM_PROMPT = """\
+You are an expert Home Assistant automation entity correction assistant.
+Return only a JSON object with exactly four keys: yaml, summary, needs_clarification, clarifying_questions.
+The yaml value must be a complete Home Assistant automation string that starts directly with alias:.
+Use Home Assistant 2024.10+ syntax only.
+- Use triggers: and actions: at the top level.
+- Use trigger: inside trigger items, not platform:.
+- Use action: inside action items, not service:.
+- Include description:, triggers:, conditions:, actions:, and mode:.
+- Do not wrap the YAML in markdown fences, yaml:, automation:, or a list item.
+- Put notify text under data: with a message key.
+The previous automation YAML referenced entity_ids that do not exist in this Home Assistant instance.
+Replace every invalid entity_id with the closest correct entity_id from the provided entity list.
+Preserve all thresholds, guards, delays, and notification messages.
+Do not ask for clarification. Return the corrected automation JSON now."""
 
 
 def _history_path(hass: HomeAssistant) -> str:
@@ -587,6 +603,53 @@ def _validate_generated_yaml(yaml_text: str) -> str | None:
         return str(err)
 
     return None
+
+
+def _walk_for_entity_ids(obj: Any, entity_ids: set[str]) -> None:
+    """Recursively walk a parsed YAML structure collecting entity references."""
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key == "entity_id":
+                if isinstance(value, str) and "." in value:
+                    entity_ids.add(value)
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, str) and "." in item:
+                            entity_ids.add(item)
+            elif (
+                key == "action"
+                and isinstance(value, str)
+                and value.startswith("notify.")
+            ):
+                entity_ids.add(value)
+            else:
+                _walk_for_entity_ids(value, entity_ids)
+    elif isinstance(obj, list):
+        for item in obj:
+            _walk_for_entity_ids(item, entity_ids)
+
+
+def _extract_entity_ids_from_yaml(yaml_text: str) -> set[str]:
+    """Extract entity_id references and notify service calls from automation YAML."""
+    if not yaml_text:
+        return set()
+    try:
+        parsed = yaml.safe_load(yaml_text)
+    except yaml.YAMLError:
+        return set()
+    if not isinstance(parsed, dict):
+        return set()
+    entity_ids: set[str] = set()
+    _walk_for_entity_ids(parsed, entity_ids)
+    return entity_ids
+
+
+def _find_hallucinated_entities(
+    yaml_text: str, known_entity_ids: set[str]
+) -> list[str]:
+    """Return entity_ids referenced in the YAML but not present in Home Assistant."""
+    referenced = _extract_entity_ids_from_yaml(yaml_text)
+    return sorted(eid for eid in referenced if eid not in known_entity_ids)
 
 
 def _parse_simple_time(value: str) -> str:
@@ -1165,6 +1228,50 @@ def _build_yaml_regeneration_messages(
     ]
 
 
+def _build_entity_repair_messages(
+    request_messages: list[dict[str, str]],
+    result: dict[str, Any],
+    hallucinated: list[str],
+    entity_summary: str,
+) -> list[dict[str, str]]:
+    """Build a retry prompt asking the model to fix hallucinated entity references."""
+    assistant_payload = {
+        "yaml": _normalize_automation_yaml_text(result.get("yaml")),
+        "summary": str(result.get("summary", "") or "").strip(),
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+    base_messages = [
+        dict(message)
+        for message in (request_messages or [])
+        if str(message.get("role", "") or "").strip() in {"system", "user"}
+    ]
+    hallucinated_list = ", ".join(hallucinated)
+
+    return [
+        {"role": "system", "content": _ENTITY_REPAIR_SYSTEM_PROMPT},
+        *base_messages,
+        {"role": "assistant", "content": json.dumps(assistant_payload)},
+        {
+            "role": "user",
+            "content": (
+                "Your previous response referenced entity_ids that do not exist "
+                "in this Home Assistant instance. "
+                f"Invalid entity_ids: {hallucinated_list}\n\n"
+                "Here are all available entities in this Home Assistant:\n"
+                f"{entity_summary}\n\n"
+                "Replace each invalid entity_id with the closest matching valid "
+                "entity_id from the list above. If no close match exists for an "
+                "entity, remove that reference entirely. "
+                "Preserve every trigger, condition, action, guard, delay, "
+                "threshold, and notification message. "
+                "Do not ask for clarification. Return the final corrected "
+                "automation JSON now."
+            ),
+        },
+    ]
+
+
 async def _regenerate_generation_result(
     client: LLMClient,
     request_messages: list[dict[str, str]],
@@ -1409,6 +1516,52 @@ async def _run_generation_job(
                 prompt_entities,
                 result,
             )
+
+            # ------- entity-id validation after structural YAML repair -------
+            if not repaired.get("needs_clarification"):
+                yaml_text = repaired.get("yaml", "")
+                known_ids = {e["entity_id"] for e in entities_list}
+                hallucinated = _find_hallucinated_entities(yaml_text, known_ids)
+                if hallucinated:
+                    job["repair_in_progress"] = True
+                    _mark_job_running(
+                        job,
+                        "Fixing incorrect entity references…",
+                        (
+                            "The model used entity IDs that don't exist in your "
+                            "Home Assistant. AutoMagic has sent the invalid "
+                            "references back to the AI for correction. "
+                            f"Unknown entities: {', '.join(hallucinated[:10])}"
+                        ),
+                    )
+                    full_entity_summary = "\n".join(
+                        f"{e['entity_id']} ({e['name']}) [{e['state']}]"
+                        for e in entities_list
+                    )
+                    for _ent_attempt in range(_ENTITY_REPAIR_ATTEMPTS):
+                        candidate = _normalize_generation_result(
+                            await client.complete(
+                                _build_entity_repair_messages(
+                                    request_messages,
+                                    repaired,
+                                    hallucinated,
+                                    full_entity_summary,
+                                )
+                            )
+                        )
+                        if candidate.get("needs_clarification"):
+                            repaired = candidate
+                            break
+                        cand_yaml = candidate.get("yaml", "")
+                        if _validate_generated_yaml(cand_yaml) is not None:
+                            continue  # broke structure, retry
+                        repaired = candidate
+                        hallucinated = _find_hallucinated_entities(
+                            cand_yaml, known_ids
+                        )
+                        if not hallucinated:
+                            break
+
             job["repair_in_progress"] = False
             return repaired
         except LLMConnectionError as err:

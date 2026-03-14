@@ -161,48 +161,10 @@ def test_entry_title_stays_generic_when_multiple_services_exist():
     assert _entry_title({CONF_MODEL: "qwen2.5:7b"}) == ENTRY_TITLE
 
 
-@pytest.mark.asyncio
-async def test_reconfigure_local_updates_primary_service_without_model_title():
-    """Primary-service reconfigure should keep a stable AutoMagic entry title."""
-    flow = AutoMagicConfigFlow()
-    flow.hass = MagicMock()
-    flow.async_update_reload_and_abort = MagicMock(return_value={"type": "abort"})
-
-    config_entry = MagicMock()
-    config_entry.data = build_service_config(
-        "http://localhost:11434",
-        "qwen2.5:7b",
-        service_id="primary",
-        request_timeout=420,
-    )
-    config_entry.subentries = {}
-    flow._get_reconfigure_entry = MagicMock(return_value=config_entry)
-
-    updated_service = build_service_config(
-        "http://localhost:11434",
-        "qwen2.5:14b",
-        service_id="primary",
-        request_timeout=900,
-    )
-
-    with patch(
-        "custom_components.automagic.config_flow._async_resolve_endpoint_service",
-        AsyncMock(return_value=(updated_service, None)),
-    ):
-        result = await flow.async_step_reconfigure_local(
-            {
-                CONF_ENDPOINT_URL: "http://localhost:11434",
-                CONF_MODEL: "qwen2.5:14b",
-                CONF_REQUEST_TIMEOUT: 900,
-            }
-        )
-
-    assert result == {"type": "abort"}
-    flow.async_update_reload_and_abort.assert_called_once()
-    _, kwargs = flow.async_update_reload_and_abort.call_args
-    assert kwargs["title"] == ENTRY_TITLE
-    assert kwargs["data"][CONF_MODEL] == "qwen2.5:14b"
-    assert kwargs["data"][CONF_SERVICE_ID] == "primary"
+def test_primary_config_entry_does_not_expose_reconfigure_flow():
+    """The parent entry should not offer a separate reconfigure action."""
+    assert "async_step_reconfigure" not in AutoMagicConfigFlow.__dict__
+    assert "async_step_reconfigure" in AutoMagicServiceSubentryFlow.__dict__
 
 
 @pytest.mark.asyncio

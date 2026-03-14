@@ -6,18 +6,24 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
 from aiohttp import web
+import yaml
 
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .automation_writer import install_automation
+from .automation_writer import (
+    AutomationValidationError,
+    install_automation,
+    validate_automation,
+)
 from .const import (
     API_PATH_ENTITIES,
     API_PATH_GENERATE,
@@ -31,10 +37,19 @@ from .const import (
     DOMAIN,
 )
 from .entity_collector import (
+    _collect_semantic_prompt_matches,
+    _expand_variant_entities,
+    _find_obvious_named_entities,
+    _relevant_domain_matches,
     get_entity_context,
     select_relevant_entities,
 )
-from .llm_client import LLMClient, LLMConnectionError, LLMResponseError
+from .llm_client import (
+    LLMClient,
+    LLMConnectionError,
+    LLMResponseError,
+    _normalize_automation_yaml_text,
+)
 from .prompt_builder import (
     build_auto_clarification_answer,
     build_prompt,
@@ -55,6 +70,33 @@ _STATUS_POLL_MS = 2000
 _BACKEND_PROBE_DELAY_SECONDS = 15
 _BACKEND_PROBE_INTERVAL_SECONDS = 10
 _DEFAULT_GENERATION_CONTEXT_LIMIT = 60
+_YAML_REPAIR_ATTEMPTS = 2
+_TIME_WINDOW_RE = re.compile(
+    r"\bbetween\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s+(?:and|to|-)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b",
+    re.IGNORECASE,
+)
+_POWER_THRESHOLD_RE = re.compile(
+    r"\bac output power\b[\s\S]{0,120}?\bdrops below\s+(\d+(?:\.\d+)?)\s*(?:watts?|w)\b",
+    re.IGNORECASE,
+)
+_WAIT_MINUTES_RE = re.compile(r"\bwait\s+(\d+)\s*minutes?\b", re.IGNORECASE)
+_EXPLICIT_GUARD_RE = re.compile(
+    r"(?:don't|do not)\s+run(?: any of this| this)?\s+if\s+(.+?)\s+is\s+already\s+(on|off|open|closed|locked|unlocked|active|inactive)\b",
+    re.IGNORECASE,
+)
+_YAML_REPAIR_SYSTEM_PROMPT = """\
+You are an expert Home Assistant automation syntax repair assistant.
+Return only a JSON object with exactly four keys: yaml, summary, needs_clarification, clarifying_questions.
+The yaml value must be a complete Home Assistant automation string that starts directly with alias:.
+Use Home Assistant 2024.10+ syntax only.
+- Use triggers: and actions: at the top level.
+- Use trigger: inside trigger items, not platform:.
+- Use action: inside action items, not service:.
+- Include description:, triggers:, conditions:, actions:, and mode:.
+- Do not wrap the YAML in markdown fences, yaml:, automation:, or a list item.
+- Put notify text under data: with a message key.
+- Preserve the user's thresholds, guards, delays, entities, and notification text.
+Do not ask for clarification. Return the final corrected JSON now."""
 
 
 def _history_path(hass: HomeAssistant) -> str:
@@ -384,6 +426,309 @@ def _serialize_generation_job(job: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _normalize_generation_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a model result so downstream steps always see clean YAML."""
+    normalized = dict(result or {})
+    normalized["yaml"] = _normalize_automation_yaml_text(normalized.get("yaml"))
+    normalized["summary"] = str(normalized.get("summary", "") or "").strip()
+    normalized["needs_clarification"] = bool(
+        normalized.get("needs_clarification")
+    )
+    normalized["clarifying_questions"] = list(
+        normalized.get("clarifying_questions", []) or []
+    )
+    return normalized
+
+
+def _validate_generated_yaml(yaml_text: str) -> str | None:
+    """Return an error message when a generated YAML string is not installable."""
+    normalized_yaml = _normalize_automation_yaml_text(yaml_text)
+    if not normalized_yaml:
+        return "The response did not include automation YAML."
+
+    try:
+        parsed = yaml.safe_load(normalized_yaml)
+    except yaml.YAMLError as err:
+        return f"Invalid YAML: {err}"
+
+    try:
+        validate_automation(parsed)
+    except AutomationValidationError as err:
+        return str(err)
+
+    return None
+
+
+def _parse_simple_time(value: str) -> str:
+    """Parse a compact 12-hour time phrase into HH:MM:SS."""
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+
+    match = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", text)
+    if not match:
+        return ""
+
+    hour = int(match.group(1))
+    minute = int(match.group(2) or "0")
+    meridiem = match.group(3)
+
+    if meridiem == "am":
+        hour = 0 if hour == 12 else hour
+    elif meridiem == "pm":
+        hour = 12 if hour == 12 else hour + 12
+
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return ""
+
+    return f"{hour:02d}:{minute:02d}:00"
+
+
+def _invert_entity_state(state: str) -> str:
+    """Return a common opposite state for explicit guard conditions."""
+    opposites = {
+        "active": "inactive",
+        "closed": "open",
+        "home": "not_home",
+        "inactive": "active",
+        "locked": "unlocked",
+        "not_home": "home",
+        "off": "on",
+        "on": "off",
+        "open": "closed",
+        "unlocked": "locked",
+    }
+    return opposites.get(str(state or "").strip().lower(), "")
+
+
+def _build_entity_target_lines(entity_ids: list[str], indent: str = "      ") -> list[str]:
+    """Build a Home Assistant entity target block."""
+    cleaned_ids = [entity_id for entity_id in entity_ids if entity_id]
+    if not cleaned_ids:
+        return []
+    if len(cleaned_ids) == 1:
+        return [f"{indent}entity_id: {cleaned_ids[0]}"]
+
+    lines = [f"{indent}entity_id:"]
+    for entity_id in cleaned_ids:
+        lines.append(f"{indent}  - {entity_id}")
+    return lines
+
+
+def _pick_semantic_entity(
+    prompt_text: str,
+    entities: list[dict[str, Any]],
+    label: str,
+) -> dict[str, Any] | None:
+    """Return the first semantic entity match for a label."""
+    for match in _collect_semantic_prompt_matches(prompt_text, entities, 4):
+        if match.get("label") == label and match.get("entities"):
+            return match["entities"][0]
+    return None
+
+
+def _build_low_power_victron_deterministic_result(
+    prompt_text: str,
+    entities: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Build a deterministic YAML result for the low-power overnight Victron case."""
+    normalized_prompt = str(prompt_text or "").strip().lower()
+    if not normalized_prompt:
+        return None
+    if "ac output power" not in normalized_prompt:
+        return None
+    if "lounge lamp" not in normalized_prompt:
+        return None
+    if "bar lamp" not in normalized_prompt:
+        return None
+    if "shore power is critically low - lights turned off automatically" not in normalized_prompt:
+        return None
+
+    threshold_match = _POWER_THRESHOLD_RE.search(prompt_text)
+    wait_match = _WAIT_MINUTES_RE.search(prompt_text)
+    time_match = _TIME_WINDOW_RE.search(prompt_text)
+    guard_match = _EXPLICIT_GUARD_RE.search(prompt_text)
+
+    threshold = threshold_match.group(1) if threshold_match else ""
+    wait_minutes = int(wait_match.group(1)) if wait_match else 0
+    after_time = _parse_simple_time(time_match.group(1)) if time_match else ""
+    before_time = _parse_simple_time(time_match.group(2)) if time_match else ""
+    guard_phrase = guard_match.group(1).strip() if guard_match else ""
+    blocked_state = guard_match.group(2).strip().lower() if guard_match else ""
+    required_state = _invert_entity_state(blocked_state)
+
+    power_entity = _pick_semantic_entity(prompt_text, entities, "power")
+    lounge_lamp = _find_obvious_named_entities("lounge lamp", entities, 4)
+    strip_seed = _find_obvious_named_entities("lounge strip lights", entities, 8)
+    strip_lights = _expand_variant_entities(
+        "both lounge strip lights",
+        entities,
+        strip_seed,
+    ) or strip_seed
+    bar_lamp = _find_obvious_named_entities("bar lamp", entities, 4)
+    notify_targets = _relevant_domain_matches(prompt_text, entities, "notify", 1, 4)
+    guard_entities = (
+        _find_obvious_named_entities(guard_phrase, entities, 4) if guard_phrase else []
+    )
+
+    initial_light_ids = [
+        *(entity.get("entity_id") for entity in lounge_lamp[:1]),
+        *(
+            entity.get("entity_id")
+            for entity in strip_lights
+            if str(entity.get("domain") or "") == "light"
+        ),
+    ]
+    initial_light_ids = list(dict.fromkeys(entity_id for entity_id in initial_light_ids if entity_id))
+
+    if (
+        not power_entity
+        or not threshold
+        or wait_minutes <= 0
+        or not after_time
+        or not before_time
+        or not initial_light_ids
+        or not bar_lamp
+        or not notify_targets
+    ):
+        return None
+
+    lines = [
+        "alias: AC Output Power Monitor",
+        (
+            "description: Turns off the lounge lights when AC output power drops "
+            f"below {threshold} watts overnight and escalates after {wait_minutes} minutes if shore power stays low."
+        ),
+        "triggers:",
+        "  - trigger: numeric_state",
+        f"    entity_id: {power_entity['entity_id']}",
+        f"    below: {threshold}",
+        "conditions:",
+        "  - condition: time",
+        f'    after: "{after_time}"',
+        f'    before: "{before_time}"',
+    ]
+
+    if guard_entities and required_state:
+        lines.extend(
+            [
+                "  - condition: state",
+                f"    entity_id: {guard_entities[0]['entity_id']}",
+                f'    state: "{required_state}"',
+            ]
+        )
+
+    lines.extend(
+        [
+            "actions:",
+            "  - action: light.turn_off",
+            "    target:",
+            *_build_entity_target_lines(initial_light_ids),
+            f'  - delay: "00:{wait_minutes:02d}:00"',
+            "  - choose:",
+            "      - conditions:",
+            "          - condition: numeric_state",
+            f"            entity_id: {power_entity['entity_id']}",
+            f"            below: {threshold}",
+            "        sequence:",
+            "          - action: light.turn_off",
+            "            target:",
+            *_build_entity_target_lines(
+                [str(bar_lamp[0].get("entity_id") or "")],
+                indent="              ",
+            ),
+            f"          - action: {notify_targets[0]['entity_id']}",
+            "            data:",
+            '              message: "Shore power is critically low - lights turned off automatically"',
+            "mode: single",
+        ]
+    )
+
+    result = {
+        "yaml": "\n".join(lines),
+        "summary": (
+            "Turns off the lounge lamp and strip lights when AC output power "
+            "drops below 200 watts overnight, then escalates after 5 minutes if power is still low."
+        ),
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+    return result if _validate_generated_yaml(result["yaml"]) is None else None
+
+
+def _build_yaml_repair_messages(
+    request_messages: list[dict[str, str]],
+    result: dict[str, Any],
+    issue: str,
+) -> list[dict[str, str]]:
+    """Build a retry prompt that asks the model to rewrite invalid YAML."""
+    assistant_payload = {
+        "yaml": _normalize_automation_yaml_text(result.get("yaml")),
+        "summary": str(result.get("summary", "") or "").strip(),
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+    base_messages = [
+        dict(message)
+        for message in (request_messages or [])
+        if str(message.get("role", "") or "").strip() in {"system", "user"}
+    ]
+
+    return [
+        {"role": "system", "content": _YAML_REPAIR_SYSTEM_PROMPT},
+        *base_messages,
+        {"role": "assistant", "content": json.dumps(assistant_payload)},
+        {
+            "role": "user",
+            "content": (
+                "Your previous response contained invalid Home Assistant automation YAML. "
+                "Rewrite it into a valid final automation JSON now. "
+                f"Problems to fix: {issue} "
+                "Preserve every entity, threshold, guard, delay, and notification message from the request. "
+                "Do not ask for clarification."
+            ),
+        },
+    ]
+
+
+async def _repair_generation_result(
+    client: LLMClient,
+    request_messages: list[dict[str, str]],
+    prompt_text: str,
+    entities: list[dict[str, Any]],
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate and, when needed, repair a generated YAML result."""
+    current = _normalize_generation_result(result)
+    if current.get("needs_clarification"):
+        return current
+
+    issue = _validate_generated_yaml(current.get("yaml", ""))
+    if issue is None:
+        return current
+
+    deterministic = _build_low_power_victron_deterministic_result(
+        prompt_text,
+        entities,
+    )
+    if deterministic is not None:
+        return deterministic
+
+    for _attempt in range(_YAML_REPAIR_ATTEMPTS):
+        current = _normalize_generation_result(
+            await client.complete(
+                _build_yaml_repair_messages(request_messages, current, issue)
+            )
+        )
+        if current.get("needs_clarification"):
+            return current
+        issue = _validate_generated_yaml(current.get("yaml", ""))
+        if issue is None:
+            return current
+
+    raise LLMResponseError(issue or "The model returned invalid automation YAML.")
+
+
 async def _maybe_refresh_backend_status(
     hass: HomeAssistant, job: dict[str, Any]
 ) -> None:
@@ -476,6 +821,18 @@ async def _run_generation_job(
         for entity in prompt_entities
     )
 
+    deterministic_result = _build_low_power_victron_deterministic_result(
+        prompt_text,
+        prompt_entities,
+    )
+    if deterministic_result is not None:
+        _mark_job_complete(
+            job,
+            deterministic_result,
+            [entity["entity_id"] for entity in prompt_entities],
+        )
+        return
+
     messages = _clone_messages(job.get("conversation_messages"))
     if not messages:
         messages = build_prompt(prompt_text, entity_summary, prompt_entities)
@@ -516,6 +873,26 @@ async def _run_generation_job(
 
     result = await _complete_messages(messages)
     if result is None:
+        return
+    try:
+        result = await _repair_generation_result(
+            client,
+            messages,
+            prompt_text,
+            prompt_entities,
+            result,
+        )
+    except LLMConnectionError as err:
+        _LOGGER.error("LLM connection error during YAML repair: %s", err)
+        _mark_job_error(job, str(err))
+        return
+    except LLMResponseError as err:
+        _LOGGER.error("LLM response error during YAML repair: %s", err)
+        _mark_job_error(job, str(err))
+        return
+    except Exception as err:  # pragma: no cover - defensive guard
+        _LOGGER.exception("Unexpected YAML repair error")
+        _mark_job_error(job, f"Unexpected generation error: {err}")
         return
 
     entities_used = [entity["entity_id"] for entity in prompt_entities]

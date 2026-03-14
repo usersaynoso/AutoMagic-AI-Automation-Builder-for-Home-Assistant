@@ -328,16 +328,6 @@ class AutoMagicConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
-    async def async_step_reconfigure(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Reconfigure the primary AI service."""
-        config_entry = self._get_reconfigure_entry()
-        provider = str(config_entry.data.get(CONF_PROVIDER, "") or "").strip().lower()
-        if provider == PROVIDER_OPENAI:
-            return await self.async_step_reconfigure_openai(user_input)
-        return await self.async_step_reconfigure_local(user_input)
-
     async def async_step_reconfigure_local(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:

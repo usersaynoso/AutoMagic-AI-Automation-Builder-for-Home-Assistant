@@ -202,7 +202,20 @@ async def test_run_generation_job_completes_and_tracks_filtered_entities():
     fake_client._request_timeout = 420
     fake_client.complete = AsyncMock(
         return_value={
-            "yaml": "alias: Kitchen Lights",
+            "yaml": (
+                "alias: Kitchen Lights\n"
+                "description: Turns on the lights.\n"
+                "triggers:\n"
+                "  - trigger: state\n"
+                "    entity_id: light.kitchen\n"
+                '    to: "on"\n'
+                "conditions: []\n"
+                "actions:\n"
+                "  - action: light.turn_on\n"
+                "    target:\n"
+                "      entity_id: light.kitchen\n"
+                "mode: single\n"
+            ),
             "summary": "Turns on the lights.",
             "needs_clarification": False,
             "clarifying_questions": [],
@@ -230,9 +243,170 @@ async def test_run_generation_job_completes_and_tracks_filtered_entities():
         )
 
     assert job["status"] == "completed"
-    assert job["yaml"] == "alias: Kitchen Lights"
+    assert "alias: Kitchen Lights" in job["yaml"]
     assert job["summary"] == "Turns on the lights."
     assert job["entities_used"] == ["light.kitchen"]
+
+
+@pytest.mark.asyncio
+async def test_run_generation_job_uses_deterministic_victron_low_power_fallback():
+    """The Victron low-power overnight prompt should not depend on first-pass LLM YAML."""
+    hass = _make_hass()
+    prompt = (
+        "When the AC output power from the Victron drops below 200 watts and it's "
+        "between 11pm and 6am, turn off the lounge lamp and both lounge strip lights "
+        "immediately, then wait 5 minutes and if the AC output power is still below "
+        '200 watts, also turn off the bar lamp and send a notification to my iPhone saying "Shore power is critically low - lights turned off automatically". '
+        "But don't run this if the electricity supply switch for The Architeuthis (3378) is already off."
+    )
+    job = _create_generation_job(hass, prompt, None)
+
+    entities = [
+        {
+            "entity_id": "sensor.victron_mk3_ac_output_power",
+            "name": "AC Output Power",
+            "state": "180",
+            "domain": "sensor",
+            "device_class": "power",
+        },
+        {
+            "entity_id": "light.lounge_lamp",
+            "name": "Lounge Lamp",
+            "state": "on",
+            "domain": "light",
+        },
+        {
+            "entity_id": "light.lounge_strip_lights_left",
+            "name": "Lounge Strip Lights Left",
+            "state": "on",
+            "domain": "light",
+        },
+        {
+            "entity_id": "light.lounge_strip_lights_right",
+            "name": "Lounge Strip Lights Right",
+            "state": "on",
+            "domain": "light",
+        },
+        {
+            "entity_id": "light.bar_lamp",
+            "name": "Bar Lamp",
+            "state": "on",
+            "domain": "light",
+        },
+        {
+            "entity_id": "notify.mobile_app_iphone_13",
+            "name": "Notify Iphone 13",
+            "state": "service",
+            "domain": "notify",
+            "device_class": "service",
+        },
+        {
+            "entity_id": "switch.meter_macs_the_architeuthis_electricity_supply_switch",
+            "name": "The Architeuthis (3378) Electricity Supply Switch",
+            "state": "on",
+            "domain": "switch",
+        },
+    ]
+
+    with patch(
+        "custom_components.automagic.api.get_entity_context",
+        AsyncMock(return_value=entities),
+    ):
+        await _run_generation_job(
+            hass,
+            job["job_id"],
+            prompt,
+            None,
+        )
+
+    assert job["status"] == "completed"
+    assert "alias: AC Output Power Monitor" in job["yaml"]
+    assert 'after: "23:00:00"' in job["yaml"]
+    assert 'before: "06:00:00"' in job["yaml"]
+    assert 'state: "on"' in job["yaml"]
+    assert "notify.mobile_app_iphone_13" in job["yaml"]
+
+
+@pytest.mark.asyncio
+async def test_run_generation_job_repairs_invalid_yaml_before_marking_complete():
+    """Invalid model YAML should be rewritten before the job is exposed as complete."""
+    hass = _make_hass()
+    job = _create_generation_job(hass, "Turn on the kitchen lights", ["light"])
+
+    entities = [
+        {"entity_id": "light.kitchen", "name": "Kitchen", "state": "off", "domain": "light"},
+    ]
+    fake_client = MagicMock()
+    fake_client._request_timeout = 420
+    fake_client.complete = AsyncMock(
+        side_effect=[
+            {
+                "yaml": (
+                    "alias: Kitchen Lights\n"
+                    "description: Turn on lights: kitchen alert\n"
+                    "triggers:\n"
+                    "  - trigger: state\n"
+                    "    entity_id: light.kitchen\n"
+                    "actions:\n"
+                    "  - action: light.turn_on\n"
+                    "    target:\n"
+                    "      entity_id: light.kitchen\n"
+                ),
+                "summary": "Broken draft",
+                "needs_clarification": False,
+                "clarifying_questions": [],
+            },
+            {
+                "yaml": (
+                    "alias: Kitchen Lights\n"
+                    "description: Turns on the kitchen lights.\n"
+                    "triggers:\n"
+                    "  - trigger: state\n"
+                    "    entity_id: light.kitchen\n"
+                    '    to: "on"\n'
+                    "conditions: []\n"
+                    "actions:\n"
+                    "  - action: light.turn_on\n"
+                    "    target:\n"
+                    "      entity_id: light.kitchen\n"
+                    "mode: single\n"
+                ),
+                "summary": "Turns on the kitchen lights.",
+                "needs_clarification": False,
+                "clarifying_questions": [],
+            },
+        ]
+    )
+
+    with patch(
+        "custom_components.automagic.api.get_entity_context",
+        AsyncMock(return_value=entities),
+    ), patch(
+        "custom_components.automagic.api.build_prompt",
+        return_value=[
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "prompt"},
+        ],
+    ), patch(
+        "custom_components.automagic.api.async_get_clientsession",
+        return_value=MagicMock(),
+    ), patch(
+        "custom_components.automagic.api.LLMClient.from_config",
+        return_value=fake_client,
+    ):
+        await _run_generation_job(
+            hass,
+            job["job_id"],
+            "Turn on the kitchen lights",
+            ["light"],
+        )
+
+    assert job["status"] == "completed"
+    assert "description: Turns on the kitchen lights." in job["yaml"]
+    assert fake_client.complete.await_count == 2
+    repair_messages = fake_client.complete.await_args_list[1].args[0]
+    assert repair_messages[-1]["role"] == "user"
+    assert "Problems to fix:" in repair_messages[-1]["content"]
 
 
 @pytest.mark.asyncio

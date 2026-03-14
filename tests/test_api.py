@@ -751,7 +751,8 @@ async def test_run_generation_job_repairs_invalid_yaml_before_marking_complete()
     assert fake_client.complete.await_count == 2
     repair_messages = fake_client.complete.await_args_list[1].args[0]
     assert repair_messages[-1]["role"] == "user"
-    assert "Problems to fix:" in repair_messages[-1]["content"]
+    assert "Current problems to fix:" in repair_messages[-1]["content"]
+    assert "Repair rules:" in repair_messages[-1]["content"]
 
 
 @pytest.mark.asyncio
@@ -847,6 +848,90 @@ async def test_run_generation_job_regenerates_after_repair_attempts_stay_invalid
 
 
 @pytest.mark.asyncio
+async def test_run_generation_job_keeps_retrying_beyond_previous_yaml_retry_cap():
+    """Generation should keep cycling repairs and regenerations until a later valid draft arrives."""
+    hass = _make_hass()
+    job = _create_generation_job(
+        hass,
+        "Start the robot vacuum at 8am on weekdays if it has not cleaned in the last 24 hours.",
+        None,
+    )
+
+    entities = [
+        {"entity_id": "vacuum.robot_vacuum", "name": "Robot Vacuum", "state": "docked", "domain": "vacuum"},
+        {"entity_id": "notify.mobile_app_phone", "name": "Phone", "state": "service", "domain": "notify"},
+    ]
+    invalid_yaml = {
+        "yaml": (
+            "alias: Robot Vacuum Check\n"
+            "description: Broken draft.\n"
+            "triggers:\n"
+            "  - trigger: time\n"
+            '    at: "08:00:00"\n'
+            "conditions: []\n"
+            "actions:\n"
+            "  - action: vacuum.robot_vacuum.start\n"
+            "mode: single\n"
+        ),
+        "summary": "Broken draft",
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+    valid_yaml = {
+        "yaml": (
+            "alias: Robot Vacuum Check\n"
+            "description: Starts the robot vacuum at 8am on weekdays when it has not cleaned recently.\n"
+            "triggers:\n"
+            "  - trigger: time\n"
+            '    at: "08:00:00"\n'
+            "conditions: []\n"
+            "actions:\n"
+            "  - action: vacuum.start\n"
+            "    target:\n"
+            "      entity_id: vacuum.robot_vacuum\n"
+            "mode: single\n"
+        ),
+        "summary": "Starts the robot vacuum at 8am on weekdays when it has not cleaned recently.",
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+    fake_client = MagicMock()
+    fake_client._request_timeout = 420
+    fake_client.complete = AsyncMock(
+        side_effect=[*([invalid_yaml] * 12), valid_yaml]
+    )
+
+    with patch(
+        "custom_components.automagic.api.get_entity_context",
+        AsyncMock(return_value=entities),
+    ), patch(
+        "custom_components.automagic.api.build_prompt",
+        return_value=[
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "prompt"},
+        ],
+    ), patch(
+        "custom_components.automagic.api.async_get_clientsession",
+        return_value=MagicMock(),
+    ), patch(
+        "custom_components.automagic.api.LLMClient.from_config",
+        return_value=fake_client,
+    ):
+        await _run_generation_job(
+            hass,
+            job["job_id"],
+            "Start the robot vacuum at 8am on weekdays if it has not cleaned in the last 24 hours.",
+            None,
+        )
+
+    assert job["status"] == "completed"
+    assert _validate_generated_yaml(job["yaml"]) is None
+    assert fake_client.complete.await_count == 13
+    final_retry_messages = fake_client.complete.await_args_list[12].args[0]
+    assert "Regeneration attempt 4." in final_retry_messages[-1]["content"]
+
+
+@pytest.mark.asyncio
 async def test_run_generation_job_sets_repair_in_progress_on_invalid_yaml():
     """When the first LLM response has invalid YAML, repair_in_progress is exposed via detail."""
     hass = _make_hass()
@@ -929,7 +1014,7 @@ async def test_run_generation_job_sets_repair_in_progress_on_invalid_yaml():
 
 @pytest.mark.asyncio
 async def test_run_generation_job_repair_failure_includes_helpful_detail():
-    """When all YAML repairs are exhausted, the job detail explains that auto-repair was attempted."""
+    """If repair later fails at the transport layer, the job keeps the latest repair detail visible."""
     hass = _make_hass()
     job = _create_generation_job(hass, "Turn on the kitchen lights", ["light"])
 
@@ -953,8 +1038,13 @@ async def test_run_generation_job_repair_failure_includes_helpful_detail():
     }
     fake_client = MagicMock()
     fake_client._request_timeout = 420
-    # Return invalid YAML for every attempt so all repair+regen passes exhaust
-    fake_client.complete = AsyncMock(return_value=invalid_yaml_response)
+    fake_client.complete = AsyncMock(
+        side_effect=[
+            invalid_yaml_response,
+            invalid_yaml_response,
+            LLMConnectionError("Timed out while contacting the AI service"),
+        ]
+    )
 
     with patch(
         "custom_components.automagic.api.get_entity_context",
@@ -974,7 +1064,9 @@ async def test_run_generation_job_repair_failure_includes_helpful_detail():
     assert job["status"] == "error"
     assert not job.get("repair_in_progress"), "repair_in_progress must be False after failure"
     assert job.get("detail"), "detail should be set when repair fails"
-    assert "correction" in job["detail"].lower() or "repair" in job["detail"].lower() or "formatting" in job["detail"].lower()
+    assert "requesting another correction" in job["detail"].lower()
+    assert "triggers:" in job["detail"] or "trigger:" in job["detail"]
+    assert "Timed out while contacting the AI service" in job["error"]
 
 
 @pytest.mark.asyncio
@@ -1073,7 +1165,8 @@ async def test_run_generation_job_retries_with_specific_error_after_invalid_rege
 
     follow_up_repair_messages = fake_client.complete.await_args_list[7].args[0]
     assert follow_up_repair_messages[-1]["role"] == "user"
-    assert "Problems to fix: Action 0: 'delay'" in follow_up_repair_messages[-1]["content"]
+    assert "Current problems to fix:" in follow_up_repair_messages[-1]["content"]
+    assert "Action 0: 'delay'" in follow_up_repair_messages[-1]["content"]
     assert "regenerate the full automation JSON" not in follow_up_repair_messages[-1]["content"]
 
 
@@ -1979,7 +2072,7 @@ async def test_run_generation_job_keeps_repairing_latest_yaml_before_regeneratio
         if "Ignore every prior draft and regenerate the full automation JSON" in last_content:
             regeneration_calls += 1
             return still_incomplete_yaml
-        if "Rewrite it into a valid final automation JSON now." in last_content:
+        if "Rewrite the latest draft into a valid final automation JSON now." in last_content:
             repair_calls += 1
             if regeneration_calls:
                 return still_incomplete_yaml
@@ -2019,6 +2112,7 @@ async def test_run_generation_job_keeps_repairing_latest_yaml_before_regeneratio
     assert repair_calls == 3
     assert regeneration_calls == 0
     final_repair_messages = fake_client.complete.await_args_list[3].args[0]
+    assert "Problems from earlier failed drafts that must stay fixed too:" in final_repair_messages[-1]["content"]
     assert "switch.router_led_right" in final_repair_messages[-1]["content"]
     assert 'must not be "Speaker"' in final_repair_messages[-1]["content"]
     assert any("does not match the required <domain>.<service_name> format" in detail for detail in details_seen)
@@ -2374,7 +2468,7 @@ async def test_run_generation_job_repairs_invalid_yaml_after_auto_clarification(
     assert fake_client.complete.await_count == 3
     repair_messages = fake_client.complete.await_args_list[2].args[0]
     assert repair_messages[-1]["role"] == "user"
-    assert "Problems to fix:" in repair_messages[-1]["content"]
+    assert "Current problems to fix:" in repair_messages[-1]["content"]
 
 
 @pytest.mark.asyncio
@@ -2999,7 +3093,98 @@ async def test_install_repair_retries_with_latest_validation_issue():
     assert "light.turn_on" in payload["yaml"]
     assert fake_client.complete.await_count == 2
     second_attempt_messages = fake_client.complete.await_args_list[1].args[0]
+    assert "Current problems to fix:" in second_attempt_messages[-1]["content"]
     assert "use 'action:' instead of 'service:'" in second_attempt_messages[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_install_repair_keeps_retrying_beyond_previous_attempt_cap():
+    """Install repair should continue past the old fixed attempt cap until a valid YAML fix arrives."""
+    hass = _make_hass()
+
+    legacy_service_yaml = (
+        "alias: Test\n"
+        "description: Legacy service draft.\n"
+        "triggers:\n"
+        "  - trigger: state\n"
+        "    entity_id: light.test\n"
+        '    to: "on"\n'
+        "conditions: []\n"
+        "actions:\n"
+        "  - service: light.turn_on\n"
+        "    target:\n"
+        "      entity_id: light.test\n"
+        "mode: single\n"
+    )
+    fixed_yaml = (
+        "alias: Test\n"
+        "description: Fixed automation.\n"
+        "triggers:\n"
+        "  - trigger: state\n"
+        "    entity_id: light.test\n"
+        '    to: "on"\n'
+        "conditions: []\n"
+        "actions:\n"
+        "  - action: light.turn_on\n"
+        "    target:\n"
+        "      entity_id: light.test\n"
+        "mode: single\n"
+    )
+
+    fake_client = AsyncMock()
+    attempt_count = 0
+
+    async def _repair_complete(_messages):
+        nonlocal attempt_count
+        attempt_count += 1
+        if attempt_count < 7:
+            return {
+                "yaml": legacy_service_yaml,
+                "summary": "Legacy service draft",
+                "needs_clarification": False,
+                "clarifying_questions": [],
+            }
+        return {
+            "yaml": fixed_yaml,
+            "summary": "Fixed automation",
+            "needs_clarification": False,
+            "clarifying_questions": [],
+        }
+
+    fake_client.complete = AsyncMock(side_effect=_repair_complete)
+
+    body = {
+        "yaml": (
+            "alias: Test\n"
+            "triggers:\n"
+            "  - trigger: state\n"
+            "    entity_id: light.test\n"
+            '    to: "on"\n'
+            "conditions: []\n"
+            "actions:\n"
+            "  - action: light.test.turn_on\n"
+            "mode: single\n"
+        ),
+        "error": "Action 0: 'light.test.turn_on' does not match the required <domain>.<service_name> format",
+        "summary": "Turn on light",
+    }
+
+    with patch(
+        "custom_components.automagic.api.async_get_clientsession",
+        return_value=MagicMock(),
+    ), patch(
+        "custom_components.automagic.api.LLMClient.from_config",
+        return_value=fake_client,
+    ):
+        payload, status = await async_install_repair_request(hass, body)
+
+    assert status == 200
+    assert payload["success"] is True
+    assert "light.turn_on" in payload["yaml"]
+    assert _validate_generated_yaml(payload["yaml"]) is None
+    assert fake_client.complete.await_count == 7
+    late_retry_messages = fake_client.complete.await_args_list[4].args[0]
+    assert "Install repair attempt 5." in late_retry_messages[-1]["content"]
 
 
 @pytest.mark.asyncio

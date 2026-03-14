@@ -75,7 +75,6 @@ _BACKEND_PROBE_INTERVAL_SECONDS = 10
 _DEFAULT_GENERATION_CONTEXT_LIMIT = 60
 _YAML_REPAIR_ATTEMPTS = 4
 _YAML_REGENERATION_ATTEMPTS = 2
-_ENTITY_REPAIR_ATTEMPTS = 3
 _TIME_WINDOW_RE = re.compile(
     r"\bbetween\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s+(?:and|to|-)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b",
     re.IGNORECASE,
@@ -184,7 +183,6 @@ For example use - delay: "00:05:00", not - action: delay.
 - Put notify text under data: with a message key.
 Preserve the user's thresholds, guards, delays, entities, and notification text.
 Do not ask for clarification. Return the final corrected JSON now."""
-_INSTALL_REPAIR_ATTEMPTS = 4
 
 
 def _history_path(hass: HomeAssistant) -> str:
@@ -475,6 +473,111 @@ def _build_automation_context_message(summary: str, yaml_text: str) -> str:
         parts.append(f"Current automation YAML:\n{normalized_yaml}")
 
     return "\n\n".join(part for part in parts if part).strip()
+
+
+def _normalize_issue_list(
+    issues: str | list[str] | tuple[str, ...] | set[str] | None,
+    *,
+    limit: int = 8,
+) -> list[str]:
+    """Normalize repair issues into a deduplicated ordered list."""
+    if isinstance(issues, str):
+        candidates = [issues]
+    elif isinstance(issues, (list, tuple, set)):
+        candidates = [str(item or "") for item in issues]
+    elif issues is None:
+        candidates = []
+    else:
+        candidates = [str(issues or "")]
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        cleaned = str(candidate or "").strip()
+        if not cleaned or cleaned in seen:
+            continue
+        normalized.append(cleaned)
+        seen.add(cleaned)
+        if len(normalized) >= limit:
+            break
+    return normalized
+
+
+def _summarize_issue_list(
+    issues: str | list[str] | tuple[str, ...] | set[str] | None,
+    *,
+    limit: int = 6,
+) -> str:
+    """Join the most important issues into one concise status string."""
+    normalized = _normalize_issue_list(issues, limit=limit)
+    return " ".join(normalized) or "The model returned invalid automation YAML."
+
+
+def _build_yaml_repair_hints(issues: list[str]) -> list[str]:
+    """Return generic repair guidance derived from the current issue set."""
+    combined = " ".join(_normalize_issue_list(issues, limit=12)).lower()
+    hints = [
+        "Fix every listed problem in the YAML itself in one pass.",
+        "Do not remove a requested guard, weekday restriction, notification, delay, or action just to silence an error.",
+        "Keep valid parts of the latest draft unless a listed issue requires changing them.",
+    ]
+
+    if (
+        "does not match the required <domain>.<service_name> format" in combined
+        or "use action:" in combined
+        or "use action: <domain>.<service>" in combined
+    ):
+        hints.append(
+            "For service calls use action: <domain>.<service> and move entity_id under target:, never inside the action value."
+        )
+    if any(keyword in combined for keyword in ("wait_for_trigger", "wait_template", "delay")):
+        hints.append(
+            "Script steps such as delay, wait_template, and wait_for_trigger must use their own YAML keys like - delay:, - wait_template:, or - wait_for_trigger:, not action: delay or action: wait_template."
+        )
+    if "invalid yaml:" in combined:
+        hints.append(
+            "Return syntactically valid YAML with correct indentation, list markers, and quoting."
+        )
+    if "weekday schedule" in combined:
+        hints.append(
+            "Preserve requested weekday restrictions explicitly in weekday: or an equivalent weekday condition."
+        )
+    if "must not be" in combined or "explicit guard" in combined:
+        hints.append(
+            "Encode blocked-state guards as executable YAML conditions such as condition: not with a nested state condition, or a valid template condition that requires entity != state."
+        )
+    if "notification target" in combined:
+        hints.append("Use the resolved notify service exactly as provided.")
+    if "color_name values should not use underscore" in combined:
+        hints.append(
+            "Use valid light color fields such as kelvin, color_temp, rgb_color, or a supported CSS color_name."
+        )
+    return list(dict.fromkeys(hints))
+
+
+def _build_yaml_repair_issue_block(
+    issues: str | list[str] | tuple[str, ...] | set[str] | None,
+    issue_history: list[str] | None = None,
+) -> str:
+    """Build a structured repair brief for the next YAML correction attempt."""
+    current_issues = _normalize_issue_list(issues, limit=8)
+    history = _normalize_issue_list(issue_history or [], limit=12)
+    prior_issues = [item for item in history if item not in current_issues][:6]
+    sections: list[str] = []
+
+    if current_issues:
+        sections.append("Current problems to fix:\n- " + "\n- ".join(current_issues))
+    if prior_issues:
+        sections.append(
+            "Problems from earlier failed drafts that must stay fixed too:\n- "
+            + "\n- ".join(prior_issues)
+        )
+
+    hints = _build_yaml_repair_hints([*current_issues, *prior_issues[:3]])
+    if hints:
+        sections.append("Repair rules:\n- " + "\n- ".join(hints))
+
+    return "\n\n".join(section for section in sections if section)
 
 
 def _append_assistant_turn(
@@ -1598,7 +1701,9 @@ def _build_deterministic_generation_result(
 def _build_yaml_repair_messages(
     request_messages: list[dict[str, str]],
     result: dict[str, Any],
-    issue: str,
+    issues: str | list[str],
+    issue_history: list[str] | None = None,
+    attempt_number: int = 1,
 ) -> list[dict[str, str]]:
     """Build a retry prompt that asks the model to rewrite invalid YAML."""
     assistant_payload = {
@@ -1612,6 +1717,7 @@ def _build_yaml_repair_messages(
         for message in (request_messages or [])
         if str(message.get("role", "") or "").strip() in {"system", "user"}
     ]
+    issue_block = _build_yaml_repair_issue_block(issues, issue_history)
 
     return [
         {"role": "system", "content": _YAML_REPAIR_SYSTEM_PROMPT},
@@ -1620,11 +1726,12 @@ def _build_yaml_repair_messages(
         {
             "role": "user",
             "content": (
+                f"Correction attempt {attempt_number}. "
                 "Your previous response contained invalid Home Assistant automation YAML. "
-                "Rewrite it into a valid final automation JSON now. "
-                f"Problems to fix: {issue} "
-                "Preserve every entity, threshold, guard, delay, and notification message from the request. "
-                "Do not ask for clarification."
+                "Rewrite the latest draft into a valid final automation JSON now.\n\n"
+                f"{issue_block}\n\n"
+                "Preserve every entity, threshold, weekday restriction, guard, branch, delay, and notification message from the original request. "
+                "Do not ask for clarification. Return only the final corrected JSON object."
             ),
         },
     ]
@@ -1632,7 +1739,9 @@ def _build_yaml_repair_messages(
 
 def _build_yaml_regeneration_messages(
     request_messages: list[dict[str, str]],
-    issue: str,
+    issues: str | list[str],
+    issue_history: list[str] | None = None,
+    attempt_number: int = 1,
 ) -> list[dict[str, str]]:
     """Build a retry prompt that regenerates YAML from the original request."""
     base_messages = [
@@ -1640,17 +1749,20 @@ def _build_yaml_regeneration_messages(
         for message in (request_messages or [])
         if str(message.get("role", "") or "").strip() in {"system", "user"}
     ]
+    issue_block = _build_yaml_repair_issue_block(issues, issue_history)
     return [
         {"role": "system", "content": _YAML_REGENERATION_SYSTEM_PROMPT},
         *base_messages,
         {
             "role": "user",
             "content": (
+                f"Regeneration attempt {attempt_number}. "
                 "The previous response still did not produce valid Home Assistant automation YAML. "
-                "Ignore every prior draft and regenerate the full automation JSON from the original request now. "
-                f"Problems to avoid: {issue} "
-                "Preserve every entity, threshold, guard, delay, and notification message from the request. "
-                "Do not ask for clarification unless the original request truly leaves a required detail unspecified."
+                "Ignore every prior draft and regenerate the full automation JSON from the original request now.\n\n"
+                f"{issue_block}\n\n"
+                "Preserve every entity, threshold, weekday restriction, guard, branch, delay, and notification message from the original request. "
+                "Do not ask for clarification unless the original request truly leaves a required detail unspecified. "
+                "Return only the final corrected JSON object."
             ),
         },
     ]
@@ -1669,7 +1781,9 @@ def _build_model_response_issue(err: Exception | str) -> str:
 def _build_install_repair_messages(
     yaml_string: str,
     summary: str,
-    issue: str,
+    issues: str | list[str],
+    issue_history: list[str] | None = None,
+    attempt_number: int = 1,
 ) -> list[dict[str, str]]:
     """Build a retry prompt for install-time repair using the latest invalid draft."""
     assistant_payload = {
@@ -1678,6 +1792,7 @@ def _build_install_repair_messages(
         "needs_clarification": False,
         "clarifying_questions": [],
     }
+    issue_block = _build_yaml_repair_issue_block(issues, issue_history)
 
     return [
         {"role": "system", "content": _INSTALL_REPAIR_SYSTEM_PROMPT},
@@ -1688,12 +1803,13 @@ def _build_install_repair_messages(
         {
             "role": "user",
             "content": (
-                "Home Assistant rejected this automation when I tried to install it. "
-                f"Error: {issue}\n\n"
-                "Fix the YAML to resolve this specific error. "
+                f"Install repair attempt {attempt_number}. "
+                "Home Assistant rejected this automation when I tried to install it.\n\n"
+                f"{issue_block}\n\n"
+                "Fix the YAML to resolve every listed problem. "
                 "Do not change anything else — preserve every trigger, condition, "
                 "action intent, entity, threshold, guard, delay, and notification message. "
-                "Return the corrected automation JSON now."
+                "Return only the corrected automation JSON now."
             ),
         },
     ]
@@ -1719,7 +1835,12 @@ def _build_entity_repair_messages(
         if str(message.get("role", "") or "").strip() in {"system", "user"}
     ]
     hallucinated_list = ", ".join(hallucinated)
-    extra_issue = f"\n\nAlso fix this problem from your previous correction attempt: {issue}" if issue else ""
+    extra_issue = (
+        "\n\nAlso keep the YAML structurally valid while fixing entities.\n\n"
+        f"{_build_yaml_repair_issue_block([issue])}"
+        if issue
+        else ""
+    )
 
     return [
         {"role": "system", "content": _ENTITY_REPAIR_SYSTEM_PROMPT},
@@ -1750,49 +1871,82 @@ async def _regenerate_generation_result(
     request_messages: list[dict[str, str]],
     prompt_text: str,
     entities: list[dict[str, Any]],
-    issue: str,
+    issue: str | list[str],
     job: dict[str, Any] | None = None,
+    issue_history: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Regenerate a clean automation from the original request when repair is exhausted."""
-    last_issue = str(issue or "").strip() or "The model returned invalid automation YAML."
+    """Regenerate a clean automation from the original request until it validates."""
+    last_issue = _summarize_issue_list(issue)
+    combined_history = _normalize_issue_list(
+        [*(issue_history or []), *_normalize_issue_list(issue, limit=12)],
+        limit=12,
+    )
     last_result: dict[str, Any] | None = None
-    for _attempt in range(_YAML_REGENERATION_ATTEMPTS):
-        if job is not None:
-            _mark_job_yaml_repair(job, last_issue)
-        try:
-            regenerated = _normalize_generation_result(
-                await client.complete(
-                    _build_yaml_regeneration_messages(request_messages, last_issue)
-                )
-            )
-        except LLMResponseError as err:
-            last_issue = _build_model_response_issue(err)
-            continue
-        if regenerated.get("needs_clarification"):
-            return regenerated
-        last_result = regenerated
-        regenerated_issues = _collect_generated_yaml_issues(
-            prompt_text,
-            entities,
-            regenerated.get("yaml", ""),
-        )
-        last_issue = " ".join(regenerated_issues[:6])
-        if not regenerated_issues:
-            return regenerated
+    regeneration_attempt = 0
+    repair_attempt = 0
 
-    current = last_result
-    if current is not None and last_issue:
+    while True:
+        for _attempt in range(_YAML_REGENERATION_ATTEMPTS):
+            regeneration_attempt += 1
+            if job is not None:
+                _mark_job_yaml_repair(job, last_issue)
+            try:
+                regenerated = _normalize_generation_result(
+                    await client.complete(
+                        _build_yaml_regeneration_messages(
+                            request_messages,
+                            last_issue,
+                            combined_history,
+                            regeneration_attempt,
+                        )
+                    )
+                )
+            except LLMResponseError as err:
+                last_issue = _build_model_response_issue(err)
+                combined_history = _normalize_issue_list(
+                    [*combined_history, last_issue], limit=12
+                )
+                continue
+            if regenerated.get("needs_clarification"):
+                return regenerated
+            last_result = regenerated
+            regenerated_issues = _collect_generated_yaml_issues(
+                prompt_text,
+                entities,
+                regenerated.get("yaml", ""),
+            )
+            if not regenerated_issues:
+                return regenerated
+            last_issue = _summarize_issue_list(regenerated_issues)
+            combined_history = _normalize_issue_list(
+                [*combined_history, *regenerated_issues], limit=12
+            )
+
+        current = last_result
+        if current is None:
+            continue
+
         for _attempt in range(_YAML_REPAIR_ATTEMPTS):
+            repair_attempt += 1
             if job is not None:
                 _mark_job_yaml_repair(job, last_issue)
             try:
                 current = _normalize_generation_result(
                     await client.complete(
-                        _build_yaml_repair_messages(request_messages, current, last_issue)
+                        _build_yaml_repair_messages(
+                            request_messages,
+                            current,
+                            last_issue,
+                            combined_history,
+                            repair_attempt,
+                        )
                     )
                 )
             except LLMResponseError as err:
                 last_issue = _build_model_response_issue(err)
+                combined_history = _normalize_issue_list(
+                    [*combined_history, last_issue], limit=12
+                )
                 continue
             if current.get("needs_clarification"):
                 return current
@@ -1801,13 +1955,12 @@ async def _regenerate_generation_result(
                 entities,
                 current.get("yaml", ""),
             )
-            last_issue = " ".join(repaired_issues[:6])
             if not repaired_issues:
                 return current
-
-    raise LLMResponseError(
-        last_issue or "The model returned invalid automation YAML."
-    )
+            last_issue = _summarize_issue_list(repaired_issues)
+            combined_history = _normalize_issue_list(
+                [*combined_history, *repaired_issues], limit=12
+            )
 
 
 async def _repair_generation_result(
@@ -1839,18 +1992,26 @@ async def _repair_generation_result(
     ):
         return deterministic
 
+    issue_history = _normalize_issue_list(issues, limit=12)
     for _attempt in range(_YAML_REPAIR_ATTEMPTS):
-        issue = " ".join(issues[:6])
+        issue = _summarize_issue_list(issues)
         if job is not None:
             _mark_job_yaml_repair(job, issue)
         try:
             current = _normalize_generation_result(
                 await client.complete(
-                    _build_yaml_repair_messages(request_messages, current, issue)
+                    _build_yaml_repair_messages(
+                        request_messages,
+                        current,
+                        issues,
+                        issue_history,
+                        _attempt + 1,
+                    )
                 )
             )
         except LLMResponseError as err:
             issues = [_build_model_response_issue(err)]
+            issue_history = _normalize_issue_list([*issue_history, *issues], limit=12)
             continue
         if current.get("needs_clarification"):
             return current
@@ -1861,14 +2022,16 @@ async def _repair_generation_result(
         )
         if not issues:
             return current
+        issue_history = _normalize_issue_list([*issue_history, *issues], limit=12)
 
     return await _regenerate_generation_result(
         client,
         request_messages,
         prompt_text,
         entities,
-        " ".join(issues[:6]),
+        issues,
         job,
+        issue_history,
     )
 
 
@@ -2079,7 +2242,7 @@ async def _run_generation_job(
                         for e in entities_list
                     )
                     entity_repair_issue = ""
-                    for _ent_attempt in range(_ENTITY_REPAIR_ATTEMPTS):
+                    while hallucinated:
                         _mark_job_entity_repair(
                             job,
                             entity_repair_issue
@@ -2110,7 +2273,7 @@ async def _run_generation_job(
                             cand_yaml,
                         )
                         if candidate_issues:
-                            entity_repair_issue = " ".join(candidate_issues[:6])
+                            entity_repair_issue = _summarize_issue_list(candidate_issues)
                             continue  # broke structure, retry
                         repaired = candidate
                         hallucinated = _find_hallucinated_entities(
@@ -2124,7 +2287,12 @@ async def _run_generation_job(
         except LLMConnectionError as err:
             job["repair_in_progress"] = False
             _LOGGER.error("LLM connection error during YAML repair: %s", err)
-            _mark_job_error(job, str(err))
+            _mark_job_error(
+                job,
+                str(err),
+                str(job.get("detail") or "").strip()
+                or "The request stopped before a valid automation was returned.",
+            )
             return None
         except LLMResponseError as err:
             job["repair_in_progress"] = False
@@ -2438,11 +2606,16 @@ async def async_install_repair_request(
     current_yaml = yaml_string
     current_summary = str(body.get("summary", "") or "").strip()
     last_error = install_error
-    for _attempt in range(_INSTALL_REPAIR_ATTEMPTS):
+    issue_history = _normalize_issue_list([install_error], limit=12)
+    attempt_number = 0
+    while True:
+        attempt_number += 1
         repair_messages = _build_install_repair_messages(
             current_yaml,
             current_summary,
             last_error,
+            issue_history,
+            attempt_number,
         )
         try:
             result = await client.complete(repair_messages)
@@ -2450,6 +2623,9 @@ async def async_install_repair_request(
             return {"error": f"AI repair failed: {err}"}, 502
         except LLMResponseError as err:
             last_error = _build_model_response_issue(err)
+            issue_history = _normalize_issue_list(
+                [*issue_history, last_error], limit=12
+            )
             continue
 
         normalized = _normalize_generation_result(result)
@@ -2460,6 +2636,9 @@ async def async_install_repair_request(
             last_error = issue
             current_yaml = fixed_yaml or current_yaml
             current_summary = fixed_summary
+            issue_history = _normalize_issue_list(
+                [*issue_history, issue], limit=12
+            )
             continue
 
         return {
@@ -2467,14 +2646,6 @@ async def async_install_repair_request(
             "yaml": fixed_yaml,
             "summary": fixed_summary,
         }, 200
-
-    return {
-        "error": (
-            "AutoMagic sent the install error back to the AI but could not "
-            f"produce a valid fix after {_INSTALL_REPAIR_ATTEMPTS} attempts. "
-            f"Last issue: {last_error}"
-        )
-    }, 502
 
 
 async def async_get_entities_payload(

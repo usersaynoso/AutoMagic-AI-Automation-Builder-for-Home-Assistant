@@ -1642,6 +1642,96 @@ class AutoMagicCard extends LitElement {
     );
   }
 
+  _normalizeRepairIssues(issues, limit = 8) {
+    const values = Array.isArray(issues) ? issues : issues ? [issues] : [];
+    const normalized = [];
+    values.forEach((issue) => {
+      const text = this._normalizeText(issue);
+      if (!text || normalized.includes(text)) return;
+      normalized.push(text);
+    });
+    return normalized.slice(0, Math.max(1, limit || 8));
+  }
+
+  _buildRepairHints(issues = []) {
+    const combined = this._normalizeRepairIssues(issues, 12).join(" ").toLowerCase();
+    const hints = [
+      "Fix every listed problem in the YAML itself in one pass.",
+      "Do not remove a requested guard, weekday restriction, notification, delay, or action just to silence an error.",
+      "Keep valid parts of the latest draft unless a listed issue requires changing them.",
+    ];
+
+    if (
+      combined.includes("does not match the required <domain>.<service_name> format") ||
+      combined.includes("use action:") ||
+      combined.includes("use action: <domain>.<service>")
+    ) {
+      hints.push(
+        "For service calls use action: <domain>.<service> and move entity_id under target:, never inside the action value."
+      );
+    }
+    if (
+      combined.includes("wait_for_trigger") ||
+      combined.includes("wait_template") ||
+      combined.includes("delay")
+    ) {
+      hints.push(
+        "Script steps such as delay, wait_template, and wait_for_trigger must use their own YAML keys like - delay:, - wait_template:, or - wait_for_trigger:, not action: delay or action: wait_template."
+      );
+    }
+    if (combined.includes("invalid yaml:")) {
+      hints.push(
+        "Return syntactically valid YAML with correct indentation, list markers, and quoting."
+      );
+    }
+    if (combined.includes("weekday schedule")) {
+      hints.push(
+        "Preserve requested weekday restrictions explicitly in weekday: or an equivalent weekday condition."
+      );
+    }
+    if (combined.includes("must not be") || combined.includes("explicit guard")) {
+      hints.push(
+        "Encode blocked-state guards as executable YAML conditions such as condition: not with a nested state condition, or a valid template condition that requires entity != state."
+      );
+    }
+    if (combined.includes("notification target")) {
+      hints.push("Use the resolved notify service exactly as provided.");
+    }
+    if (combined.includes("color_name values should not use underscore")) {
+      hints.push(
+        "Use valid light color fields such as kelvin, color_temp, rgb_color, or a supported CSS color_name."
+      );
+    }
+    return hints.filter((hint, index, items) => hint && items.indexOf(hint) === index);
+  }
+
+  _buildRepairIssueText(issues = [], issueHistory = []) {
+    const currentIssues = this._normalizeRepairIssues(issues, 8);
+    const priorIssues = this._normalizeRepairIssues(issueHistory, 12)
+      .filter((issue) => !currentIssues.includes(issue))
+      .slice(0, 6);
+    const sections = [];
+
+    if (currentIssues.length > 0) {
+      sections.push(`Current problems to fix:\n- ${currentIssues.join("\n- ")}`);
+    }
+    if (priorIssues.length > 0) {
+      sections.push(
+        `Problems from earlier failed drafts that must stay fixed too:\n- ${priorIssues.join("\n- ")}`
+      );
+    }
+
+    const hints = this._buildRepairHints([
+      ...currentIssues,
+      ...priorIssues.slice(0, 3),
+    ]);
+    if (hints.length > 0) {
+      sections.push(`Repair rules:\n- ${hints.join("\n- ")}`);
+    }
+
+    return sections.join("\n\n");
+  }
+
   async _repairGeneratedYamlIfNeeded(prompt, messages, result, repairContext = null) {
     let currentResult = result;
     const preferYamlOnlyRepair = this._isComplexAutomationPrompt(prompt);
@@ -1651,6 +1741,7 @@ class AutoMagicCard extends LitElement {
       resolvedPrompt: repairContext?.resolvedPrompt || "",
       plan: repairContext?.plan || null,
     };
+    let issueHistory = [];
     if (currentResult?.planner_only) {
       const compileContext = {
         ...fallbackContext,
@@ -1695,7 +1786,9 @@ class AutoMagicCard extends LitElement {
           return currentResult;
         }
       } else {
-        for (let attempt = 0; attempt < DIRECT_REPAIR_ATTEMPTS; attempt += 1) {
+        let missingYamlAttempt = 0;
+        while (currentResult?.missing_yaml || !currentResult?.yaml) {
+          missingYamlAttempt += 1;
           this._pushRepairStatus(
             "The previous response did not include the required complete automation YAML."
           );
@@ -1713,6 +1806,7 @@ class AutoMagicCard extends LitElement {
             {
               role: "user",
               content:
+                `Correction attempt ${missingYamlAttempt}. ` +
                 "Your previous response did not include the required automation YAML. " +
                 "Return the complete automation JSON now. " +
                 "The yaml key must be a non-empty string containing the full Home Assistant automation. " +
@@ -1725,9 +1819,7 @@ class AutoMagicCard extends LitElement {
           if (currentResult?.needs_clarification) {
             return currentResult;
           }
-          if (!currentResult?.missing_yaml && currentResult?.yaml) {
-            break;
-          }
+          if (!currentResult?.missing_yaml && currentResult?.yaml) break;
         }
       }
     }
@@ -1754,6 +1846,7 @@ class AutoMagicCard extends LitElement {
       currentResult?.yaml || "",
       fallbackContext
     );
+    issueHistory = this._normalizeRepairIssues(remainingIssues, 12);
     if (preferYamlOnlyRepair && remainingIssues.length > 0) {
       this._pushRepairStatus(remainingIssues.join(" "));
       currentResult = await this._regenerateAutomationYamlFromScratch(
@@ -1773,6 +1866,10 @@ class AutoMagicCard extends LitElement {
         currentResult?.yaml || "",
         fallbackContext
       );
+      issueHistory = this._normalizeRepairIssues(
+        [...issueHistory, ...remainingIssues],
+        12
+      );
     }
     if (preferYamlOnlyRepair && remainingIssues.length > 0 && !currentResult?.needs_clarification) {
       this._pushRepairStatus(remainingIssues.join(" "));
@@ -1790,12 +1887,17 @@ class AutoMagicCard extends LitElement {
         currentResult?.yaml || "",
         fallbackContext
       );
+      issueHistory = this._normalizeRepairIssues(
+        [...issueHistory, ...remainingIssues],
+        12
+      );
     }
     for (let attempt = 0; attempt < DIRECT_REPAIR_ATTEMPTS; attempt += 1) {
       if (remainingIssues.length === 0) {
         return currentResult;
       }
       const issues = remainingIssues;
+      issueHistory = this._normalizeRepairIssues([...issueHistory, ...issues], 12);
       this._pushRepairStatus(issues.join(" "));
 
       const repairMessages = [
@@ -1810,9 +1912,11 @@ class AutoMagicCard extends LitElement {
         {
           role: "user",
           content:
+            `Correction attempt ${attempt + 1}. ` +
             "The automation YAML above is invalid or does not follow the required Home Assistant 2024.10+ syntax. " +
-            "Fix it and return the complete corrected automation JSON only. " +
-            `Issues to fix: ${issues.join(" ")} ` +
+            "Fix it and return the complete corrected automation JSON only.\n\n" +
+            `${this._buildRepairIssueText(issues, issueHistory)}\n\n` +
+            "Preserve every entity, threshold, weekday restriction, guard, branch, delay, and notification message from the original request. " +
             "Do not ask new clarification questions unless the original prompt truly leaves a required detail unspecified.",
         },
       ];
@@ -1826,9 +1930,17 @@ class AutoMagicCard extends LitElement {
         currentResult?.yaml || "",
         fallbackContext
       );
+      issueHistory = this._normalizeRepairIssues(
+        [...issueHistory, ...remainingIssues],
+        12
+      );
     }
 
-    if (remainingIssues.length > 0 && !currentResult?.needs_clarification) {
+    while (remainingIssues.length > 0 && !currentResult?.needs_clarification) {
+      issueHistory = this._normalizeRepairIssues(
+        [...issueHistory, ...remainingIssues],
+        12
+      );
       this._pushRepairStatus(remainingIssues.join(" "));
       try {
         currentResult = await this._rewriteInvalidAutomationYaml(
@@ -1856,9 +1968,6 @@ class AutoMagicCard extends LitElement {
         currentResult?.yaml || "",
         fallbackContext
       );
-    }
-
-    if (remainingIssues.length > 0 && !currentResult?.needs_clarification) {
       for (let attempt = 0; attempt < DIRECT_REGENERATION_ATTEMPTS; attempt += 1) {
         this._pushRepairStatus(remainingIssues.join(" "));
         currentResult = await this._regenerateAutomationYamlFromScratch(
@@ -1875,17 +1984,14 @@ class AutoMagicCard extends LitElement {
           currentResult?.yaml || "",
           fallbackContext
         );
+        issueHistory = this._normalizeRepairIssues(
+          [...issueHistory, ...remainingIssues],
+          12
+        );
         if (remainingIssues.length === 0) {
           return currentResult;
         }
       }
-    }
-
-    if (remainingIssues.length > 0 && !currentResult?.needs_clarification) {
-      throw new Error(
-        "AutoMagic sent each returned YAML error back to the AI, but the model still " +
-          `did not produce valid automation YAML. Last issue: ${remainingIssues.join(" ")}`
-      );
     }
 
     return currentResult;
@@ -4942,8 +5048,9 @@ class AutoMagicCard extends LitElement {
       sections.push(`Incomplete draft to replace:\n${draftText}`);
     }
 
-    if (Array.isArray(issues) && issues.length > 0) {
-      sections.push(`Problems to fix:\n- ${issues.join("\n- ")}`);
+    const repairIssueText = this._buildRepairIssueText(issues);
+    if (repairIssueText) {
+      sections.push(repairIssueText);
     }
 
     sections.push(
@@ -4994,6 +5101,7 @@ class AutoMagicCard extends LitElement {
     const nonSystemMessages = (Array.isArray(messages) ? messages : []).filter(
       (message) => message?.role !== "system"
     );
+    const repairIssueText = this._buildRepairIssueText(issues);
     const rewriteMessages = [
       { role: "system", content: DIRECT_SYNTAX_REWRITE_SYSTEM_PROMPT },
       ...nonSystemMessages,
@@ -5011,9 +5119,7 @@ class AutoMagicCard extends LitElement {
           "Rewrite the draft above into one valid Home Assistant automation. " +
           "The yaml key must be a non-empty string and must preserve the original intent. " +
           "Do not ask any more clarification questions. " +
-          `Syntax problems to fix: ${(Array.isArray(issues) ? issues : [])
-            .filter(Boolean)
-            .join(" ")}`,
+          `Syntax problems to fix:\n${repairIssueText || "- Return valid Home Assistant YAML."}`,
       },
     ];
 
@@ -6533,7 +6639,14 @@ class AutoMagicCard extends LitElement {
   }
 
   _formatChatThread() {
-    return this._chatMessages
+    const modelName =
+      this._normalizeText(this._selectedService()?.model) ||
+      this._normalizeText(this._directModel);
+    const sections = [];
+    if (modelName) {
+      sections.push(`AI model: ${modelName}`);
+    }
+    const threadBody = this._chatMessages
       .map((message) => {
         const body = this._threadMessageBody(message);
         if (!body) return "";
@@ -6545,6 +6658,10 @@ class AutoMagicCard extends LitElement {
       })
       .filter(Boolean)
       .join("\n\n");
+    if (threadBody) {
+      sections.push(threadBody);
+    }
+    return sections.join("\n\n");
   }
 
   async _copyChatThread() {

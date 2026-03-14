@@ -261,6 +261,9 @@ function buildHarness() {
     "_yamlIncludesAllEntityIds",
     "_collectYamlCoverageIssues",
     "_collectRepairIssues",
+    "_normalizeRepairIssues",
+    "_buildRepairHints",
+    "_buildRepairIssueText",
     "_entitySummary",
     "_humanizeIdentifier",
     "_formatError",
@@ -405,6 +408,7 @@ test("Formatted chat threads label user, AI, and AutoMagic messages distinctly",
 
   const formatted = harness._formatChatThread.call(harness);
 
+  assert.match(formatted, /^AI model: gpt-4o-mini\n\nUser said:/m);
   assert.match(formatted, /^User said:/m);
   assert.match(formatted, /^AutoMagic said:/m);
   assert.match(formatted, /^gpt-4o-mini said:/m);
@@ -3203,6 +3207,64 @@ test("Complex missing-yaml repairs skip chat JSON retries and go straight to YAM
 
   assert.match(result.yaml, /^alias: Complex Example/m);
   assert.match(result.summary, /required complete automation YAML/i);
+});
+
+test("Direct repair keeps retrying beyond the old cap until a later regeneration succeeds", async () => {
+  const harness = buildHarness();
+  let directCalls = 0;
+  let rewriteCalls = 0;
+  let regenerationCalls = 0;
+
+  const invalidResult = {
+    yaml: "alias: Broken\ndescription: Broken\ntriggers: []\nconditions: []\nactions: []",
+    summary: "Broken draft",
+    needs_clarification: false,
+    clarifying_questions: [],
+  };
+  const validResult = {
+    yaml: "alias: Fixed\ndescription: Fixed\ntriggers: []\nconditions: []\nactions: []\nmode: single",
+    summary: "Fixed automation",
+    needs_clarification: false,
+    clarifying_questions: [],
+  };
+
+  harness._collectRepairIssues = (_prompt, yaml) =>
+    String(yaml || "").includes("mode: single")
+      ? []
+      : ['Preserve the requested guard that sensor.phone_audio_output must not be "Speaker".'];
+  harness._directChatCompletion = async () => {
+    directCalls += 1;
+    return invalidResult;
+  };
+  harness._rewriteInvalidAutomationYaml = async () => {
+    rewriteCalls += 1;
+    return invalidResult;
+  };
+  harness._regenerateAutomationYamlFromScratch = async () => {
+    regenerationCalls += 1;
+    return regenerationCalls >= 4 ? validResult : invalidResult;
+  };
+
+  const result = await harness._repairGeneratedYamlIfNeeded.call(
+    harness,
+    "Turn on the kitchen lights",
+    [{ role: "user", content: "Turn on the kitchen lights" }],
+    invalidResult,
+    {
+      entities: [
+        {
+          entity_id: "light.kitchen",
+          name: "Kitchen",
+          domain: "light",
+        },
+      ],
+    }
+  );
+
+  assert.equal(directCalls, 4);
+  assert.equal(rewriteCalls, 2);
+  assert.equal(regenerationCalls, 4);
+  assert.match(result.yaml, /^alias: Fixed/m);
 });
 
 test("Source includes a dedicated syntax rewrite fallback for invalid YAML", () => {

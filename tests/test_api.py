@@ -23,6 +23,7 @@ from custom_components.automagic.api import (
     async_delete_history_entry_request,
     async_get_history_payload,
     async_get_services_payload,
+    async_install_repair_request,
     async_start_generation_request,
 )
 from custom_components.automagic.const import (
@@ -1946,3 +1947,85 @@ async def test_run_generation_job_repairs_hallucinated_entities():
     # The final YAML should reference the real entity
     assert "light.kitchen" in job["yaml"]
     assert "light.nonexistent_light" not in job["yaml"]
+
+
+# ---- Install-repair endpoint tests ----
+
+
+@pytest.mark.asyncio
+async def test_install_repair_returns_fixed_yaml():
+    """install_repair should send the error to the AI and return the corrected YAML."""
+    hass = _make_hass()
+
+    fixed_yaml = (
+        "alias: Test\ntriggers:\n  - trigger: state\n    entity_id: light.test\n"
+        "actions:\n  - action: light.turn_on\n    target:\n      entity_id: light.test\n"
+    )
+    fake_client = AsyncMock()
+    fake_client.complete = AsyncMock(
+        return_value={
+            "yaml": fixed_yaml,
+            "summary": "Fixed automation",
+            "needs_clarification": False,
+            "clarifying_questions": [],
+        }
+    )
+
+    body = {
+        "yaml": "alias: Test\ntriggers:\n  - trigger: state\nactions:\n  - action: light.test.turn_on\n",
+        "error": "does not match format <domain>.<name>",
+        "summary": "Turn on light",
+    }
+
+    with patch(
+        "custom_components.automagic.api.async_get_clientsession",
+        return_value=MagicMock(),
+    ), patch(
+        "custom_components.automagic.api.LLMClient.from_config",
+        return_value=fake_client,
+    ):
+        payload, status = await async_install_repair_request(hass, body)
+
+    assert status == 200
+    assert payload["success"] is True
+    assert "light.turn_on" in payload["yaml"]
+
+
+@pytest.mark.asyncio
+async def test_install_repair_missing_fields():
+    """install_repair should return 400 when yaml or error is missing."""
+    hass = _make_hass()
+
+    payload, status = await async_install_repair_request(hass, {"yaml": "test"})
+    assert status == 400
+    assert "Missing" in payload["error"]
+
+    payload, status = await async_install_repair_request(hass, {"error": "bad"})
+    assert status == 400
+    assert "Missing" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_install_repair_returns_502_on_llm_error():
+    """install_repair should return 502 when the LLM connection fails."""
+    hass = _make_hass()
+
+    fake_client = AsyncMock()
+    fake_client.complete = AsyncMock(side_effect=LLMConnectionError("timeout"))
+
+    body = {
+        "yaml": "alias: Test\ntriggers:\n  - trigger: state\nactions:\n  - action: bad\n",
+        "error": "some error",
+    }
+
+    with patch(
+        "custom_components.automagic.api.async_get_clientsession",
+        return_value=MagicMock(),
+    ), patch(
+        "custom_components.automagic.api.LLMClient.from_config",
+        return_value=fake_client,
+    ):
+        payload, status = await async_install_repair_request(hass, body)
+
+    assert status == 502
+    assert "AI repair failed" in payload["error"]

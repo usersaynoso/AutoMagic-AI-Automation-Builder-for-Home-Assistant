@@ -32,6 +32,7 @@ from .const import (
     API_PATH_HISTORY,
     API_PATH_HISTORY_ENTRY,
     API_PATH_INSTALL,
+    API_PATH_INSTALL_REPAIR,
     API_PATH_SERVICES,
     CONF_ENDPOINT_URL,
     CONF_MODEL,
@@ -108,6 +109,8 @@ Use Home Assistant 2024.10+ syntax only.
 - Use triggers: and actions: at the top level.
 - Use trigger: inside trigger items, not platform:.
 - Use action: inside action items, not service:.
+- action values must be exactly <domain>.<service_name> (e.g. light.turn_on, notify.mobile_app_iphone). \
+Never include an entity_id in the action value. Use a separate target: entity_id: field instead.
 - Include description:, triggers:, conditions:, actions:, and mode:.
 - Do not wrap the YAML in markdown fences, yaml:, automation:, or a list item.
 - Put notify text under data: with a message key.
@@ -122,6 +125,8 @@ Use Home Assistant 2024.10+ syntax only.
 - Use triggers: and actions: at the top level.
 - Use trigger: inside trigger items, not platform:.
 - Use action: inside action items, not service:.
+- action values must be exactly <domain>.<service_name> (e.g. light.turn_on, notify.mobile_app_iphone). \
+Never include an entity_id in the action value. Use a separate target: entity_id: field instead.
 - Do not wrap the YAML in markdown fences, yaml:, automation:, or a list item.
 - Put notify text under data: with a message key.
 - Preserve the user's thresholds, guards, delays, entities, and notification text.
@@ -135,6 +140,8 @@ Use Home Assistant 2024.10+ syntax only.
 - Use triggers: and actions: at the top level.
 - Use trigger: inside trigger items, not platform:.
 - Use action: inside action items, not service:.
+- action values must be exactly <domain>.<service_name> (e.g. light.turn_on, notify.mobile_app_iphone). \
+Never include an entity_id in the action value. Use a separate target: entity_id: field instead.
 - Include description:, triggers:, conditions:, actions:, and mode:.
 - Do not wrap the YAML in markdown fences, yaml:, automation:, or a list item.
 - Put notify text under data: with a message key.
@@ -142,6 +149,24 @@ The previous automation YAML referenced entity_ids that do not exist in this Hom
 Replace every invalid entity_id with the closest correct entity_id from the provided entity list.
 Preserve all thresholds, guards, delays, and notification messages.
 Do not ask for clarification. Return the corrected automation JSON now."""
+_INSTALL_REPAIR_SYSTEM_PROMPT = """\
+You are an expert Home Assistant automation repair assistant.
+The user tried to install an automation but Home Assistant rejected it with a specific error.
+Rewrite the automation to fix the exact error described while preserving the original intent.
+Return only a JSON object with exactly four keys: yaml, summary, needs_clarification, clarifying_questions.
+The yaml value must be a complete Home Assistant automation string that starts directly with alias:.
+Use Home Assistant 2024.10+ syntax only.
+- Use triggers: and actions: at the top level.
+- Use trigger: inside trigger items, not platform:.
+- Use action: inside action items, not service:.
+- action values must be exactly <domain>.<service_name> (e.g. light.turn_on, notify.mobile_app_iphone). \
+Never include an entity_id in the action value. Use a separate target: entity_id: field instead.
+- Include description:, triggers:, conditions:, actions:, and mode:.
+- Do not wrap the YAML in markdown fences, yaml:, automation:, or a list item.
+- Put notify text under data: with a message key.
+Preserve the user's thresholds, guards, delays, entities, and notification text.
+Do not ask for clarification. Return the final corrected JSON now."""
+_INSTALL_REPAIR_ATTEMPTS = 2
 
 
 def _history_path(hass: HomeAssistant) -> str:
@@ -1832,6 +1857,82 @@ async def async_install_automation_request(
     return result, status
 
 
+async def async_install_repair_request(
+    hass: HomeAssistant, body: dict[str, Any]
+) -> tuple[dict[str, Any], int]:
+    """Send install-time HA error back to the AI for repair and return the fixed YAML."""
+    yaml_string = str(body.get("yaml", "")).strip()
+    install_error = str(body.get("error", "")).strip()
+    if not yaml_string or not install_error:
+        return {"error": "Missing 'yaml' or 'error' field"}, 400
+
+    config_data = _get_config_data(hass)
+    if config_data is None:
+        return {"error": "AutoMagic is not configured"}, 500
+
+    selected_service_id = str(body.get(CONF_SERVICE_ID, "")).strip()
+    service_config = _get_service_config(hass, selected_service_id)
+    if service_config is None:
+        return {"error": "The selected AI service is no longer available."}, 500
+
+    session = async_get_clientsession(hass)
+    client = LLMClient.from_config(service_config, session=session)
+
+    assistant_payload = {
+        "yaml": _normalize_automation_yaml_text(yaml_string),
+        "summary": str(body.get("summary", "") or "").strip(),
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+
+    repair_messages: list[dict[str, str]] = [
+        {"role": "system", "content": _INSTALL_REPAIR_SYSTEM_PROMPT},
+        {
+            "role": "assistant",
+            "content": json.dumps(assistant_payload),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Home Assistant rejected this automation when I tried to install it. "
+                f"Error: {install_error}\n\n"
+                "Fix the YAML to resolve this specific error. "
+                "Do not change anything else — preserve every trigger, condition, "
+                "action intent, entity, threshold, guard, delay, and notification message. "
+                "Return the corrected automation JSON now."
+            ),
+        },
+    ]
+
+    last_error = install_error
+    for _attempt in range(_INSTALL_REPAIR_ATTEMPTS):
+        try:
+            result = await client.complete(repair_messages)
+        except (LLMConnectionError, LLMResponseError) as err:
+            return {"error": f"AI repair failed: {err}"}, 502
+
+        normalized = _normalize_generation_result(result)
+        fixed_yaml = normalized.get("yaml", "")
+        issue = _validate_generated_yaml(fixed_yaml)
+        if issue is not None:
+            last_error = issue
+            continue
+
+        return {
+            "success": True,
+            "yaml": fixed_yaml,
+            "summary": normalized.get("summary", ""),
+        }, 200
+
+    return {
+        "error": (
+            "AutoMagic sent the install error back to the AI but could not "
+            f"produce a valid fix after {_INSTALL_REPAIR_ATTEMPTS} attempts. "
+            f"Last issue: {last_error}"
+        )
+    }, 502
+
+
 async def async_get_entities_payload(
     hass: HomeAssistant,
 ) -> tuple[dict[str, Any], int]:
@@ -1960,6 +2061,25 @@ class AutoMagicInstallView(HomeAssistantView):
         except ValueError:
             return self.json({"error": "Invalid JSON body"}, status_code=400)
         payload, status_code = await async_install_automation_request(hass, body)
+        return self.json(payload, status_code=status_code)
+
+
+class AutoMagicInstallRepairView(HomeAssistantView):
+    """Handle POST /api/automagic/install_repair."""
+
+    url = API_PATH_INSTALL_REPAIR
+    name = "api:automagic:install_repair"
+    requires_auth = True
+
+    async def post(self, request: web.Request) -> web.Response:
+        """Send an install error to the AI for repair."""
+        hass: HomeAssistant = request.app["hass"]
+
+        try:
+            body = await request.json()
+        except ValueError:
+            return self.json({"error": "Invalid JSON body"}, status_code=400)
+        payload, status_code = await async_install_repair_request(hass, body)
         return self.json(payload, status_code=status_code)
 
 

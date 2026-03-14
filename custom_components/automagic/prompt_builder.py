@@ -49,6 +49,9 @@ SYNTAX RULES - this is critical:
 - Use 'conditions:' (plural) for conditions
 - Use 'actions:' (plural) for the action list
 - Use 'action:' for service calls - NEVER use 'service:'
+- action values must be exactly <domain>.<service_name> (e.g. light.turn_on, \
+notify.mobile_app_iphone). NEVER put an entity_id in the action value. \
+Use a separate target: entity_id: field for the entity.
 
 Example of correct syntax:
   triggers:

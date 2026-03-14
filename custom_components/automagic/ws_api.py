@@ -16,6 +16,7 @@ from .api import (
     async_get_history_payload,
     async_get_services_payload,
     async_install_automation_request,
+    async_install_repair_request,
     async_start_generation_request,
 )
 
@@ -126,6 +127,24 @@ async def websocket_history_delete(
 @websocket_api.async_response
 @websocket_api.websocket_command(
     {
+        vol.Required("type"): "automagic/install_repair",
+        vol.Required("yaml"): str,
+        vol.Required("error"): str,
+        vol.Optional("summary"): str,
+        vol.Optional("service_id"): str,
+    }
+)
+async def websocket_install_repair(
+    hass: HomeAssistant, connection: Any, msg: dict[str, Any]
+) -> None:
+    """Send an install error back to the AI for repair over websocket."""
+    payload, _status = await async_install_repair_request(hass, msg)
+    connection.send_result(msg["id"], payload)
+
+
+@websocket_api.async_response
+@websocket_api.websocket_command(
+    {
         vol.Required("type"): "automagic/services",
     }
 )
@@ -145,4 +164,5 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_entities)
     websocket_api.async_register_command(hass, websocket_history)
     websocket_api.async_register_command(hass, websocket_history_delete)
+    websocket_api.async_register_command(hass, websocket_install_repair)
     websocket_api.async_register_command(hass, websocket_services)

@@ -124,6 +124,35 @@ class TestValidateAutomation:
         }
         validate_automation(parsed)  # Should not raise
 
+    def test_action_format_three_segments_rejected(self):
+        """Action with embedded entity_id like 'light.kitchen.turn_on' should be rejected."""
+        parsed = {
+            "alias": "Test",
+            "triggers": [{"trigger": "state", "entity_id": "binary_sensor.door"}],
+            "actions": [{"action": "light.kitchen.turn_on"}],
+        }
+        with pytest.raises(AutomationValidationError, match="<domain>.<service_name> format"):
+            validate_automation(parsed)
+
+    def test_action_format_valid_domain_service(self):
+        """Actions like 'light.turn_on' must pass the format check."""
+        parsed = {
+            "alias": "Test",
+            "triggers": [{"trigger": "state", "entity_id": "binary_sensor.door"}],
+            "actions": [{"action": "light.turn_on", "target": {"entity_id": "light.hallway"}}],
+        }
+        validate_automation(parsed)  # Should not raise
+
+    def test_action_format_no_dots_rejected(self):
+        """An action value with no dot, like 'turn_on', should be rejected."""
+        parsed = {
+            "alias": "Test",
+            "triggers": [{"trigger": "state", "entity_id": "binary_sensor.door"}],
+            "actions": [{"action": "turn_on"}],
+        }
+        with pytest.raises(AutomationValidationError, match="<domain>.<service_name> format"):
+            validate_automation(parsed)
+
 
 # ---- Install tests ----
 

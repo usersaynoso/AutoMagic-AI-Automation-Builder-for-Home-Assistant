@@ -775,6 +775,14 @@ class AutoMagicCard extends LitElement {
     }
   }
 
+  async _requestInstallRepair(payload) {
+    try {
+      return await this._wsCommand("automagic/install_repair", payload);
+    } catch (err) {
+      return this._apiPost("/api/automagic/install_repair", payload);
+    }
+  }
+
   async _requestEntities() {
     try {
       return await this._wsCommand("automagic/entities");
@@ -6016,7 +6024,7 @@ class AutoMagicCard extends LitElement {
   async _handleInstall(messageIndex = -1) {
     const targetMessage =
       messageIndex >= 0 ? this._chatMessages[messageIndex] : null;
-    const yaml = this._normalizeAutomationYamlText(
+    let yaml = this._normalizeAutomationYamlText(
       targetMessage?.yaml || this._yaml
     );
     if (!yaml) return;
@@ -6032,11 +6040,95 @@ class AutoMagicCard extends LitElement {
     this._error = "";
 
     try {
-      const result = await this._requestInstall({
+      let result = await this._requestInstall({
         yaml,
         prompt: targetMessage?.requestText || this._lastUserChatText(),
         summary: targetMessage?.summary || this._summary,
       });
+
+      // --- Install-error repair: send HA error back to AI to fix ---
+      if (!result.success && result.error) {
+        this._appendChatMessage({
+          role: "assistant",
+          type: "status",
+          tone: "warning",
+          text:
+            "Home Assistant rejected the automation with an error. " +
+            "AutoMagic is sending the error back to the AI for correction.\n\n" +
+            `Error: ${result.error}`,
+        });
+        this._state = STATES.LOADING;
+        this._loadingMessage = "Fixing install error…";
+        this._loadingDetail =
+          "The AI is correcting the automation based on the Home Assistant error.";
+
+        try {
+          const selectedService = this._selectedService();
+          const repairPayload = {
+            yaml,
+            error: result.error,
+            summary: targetMessage?.summary || this._summary,
+          };
+          if (selectedService?.service_id) {
+            repairPayload.service_id = selectedService.service_id;
+          }
+          const repairResult = await this._requestInstallRepair(repairPayload);
+
+          if (repairResult.success && repairResult.yaml) {
+            yaml = this._normalizeAutomationYamlText(repairResult.yaml);
+            this._yaml = yaml;
+            this._parsedAutomation = this._parseYaml(yaml);
+            this._summary = repairResult.summary || this._summary;
+
+            this._appendChatMessage({
+              role: "assistant",
+              type: "status",
+              tone: "info",
+              text: "The AI corrected the automation. Retrying install…",
+            });
+
+            this._state = STATES.INSTALLING;
+            result = await this._requestInstall({
+              yaml,
+              prompt: targetMessage?.requestText || this._lastUserChatText(),
+              summary: repairResult.summary || this._summary,
+            });
+          } else {
+            // Repair endpoint itself failed
+            const repairError =
+              repairResult.error || "AI could not fix the automation.";
+            this._error = repairError;
+            if (messageIndex >= 0) {
+              this._updateChatMessage(messageIndex, {
+                installStatus: "error",
+                installError: repairError,
+              });
+            }
+            this._appendChatMessage({
+              role: "assistant",
+              type: "error",
+              text: `Install repair failed: ${repairError}`,
+            });
+            this._state = STATES.ERROR;
+            return;
+          }
+        } catch (repairErr) {
+          this._error = `Install repair failed: ${this._formatError(repairErr)}`;
+          if (messageIndex >= 0) {
+            this._updateChatMessage(messageIndex, {
+              installStatus: "error",
+              installError: this._error,
+            });
+          }
+          this._appendChatMessage({
+            role: "assistant",
+            type: "error",
+            text: this._error,
+          });
+          this._state = STATES.ERROR;
+          return;
+        }
+      }
 
       if (result.success) {
         this._installedAlias = result.alias || "Automation";

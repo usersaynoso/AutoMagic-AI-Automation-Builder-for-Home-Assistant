@@ -19,6 +19,7 @@ from .api import (
     AutoMagicGenerateStatusView,
     AutoMagicHistoryEntryView,
     AutoMagicHistoryView,
+    AutoMagicInstallRepairView,
     AutoMagicInstallView,
     AutoMagicServicesView,
 )
@@ -196,6 +197,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.http.register_view(AutoMagicGenerateView())
         hass.http.register_view(AutoMagicGenerateStatusView())
         hass.http.register_view(AutoMagicInstallView())
+        hass.http.register_view(AutoMagicInstallRepairView())
         hass.http.register_view(AutoMagicEntitiesView())
         hass.http.register_view(AutoMagicHistoryView())
         hass.http.register_view(AutoMagicHistoryEntryView())

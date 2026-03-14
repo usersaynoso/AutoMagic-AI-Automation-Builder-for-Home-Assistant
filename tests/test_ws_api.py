@@ -11,6 +11,7 @@ from custom_components.automagic.ws_api import (
     websocket_generate,
     websocket_generate_status,
     websocket_history_delete,
+    websocket_install_repair,
     websocket_services,
 )
 
@@ -24,7 +25,7 @@ def test_register_websocket_commands_registers_all_handlers():
     ) as register_command:
         async_register_websocket_commands(hass)
 
-    assert register_command.call_count == 7
+    assert register_command.call_count == 8
 
 
 @pytest.mark.asyncio
@@ -134,4 +135,38 @@ async def test_websocket_history_delete_sends_errors_for_blocked_rows():
         15,
         "history_delete_failed",
         "Only failed or deleted history entries can be removed",
+    )
+
+
+@pytest.mark.asyncio
+async def test_websocket_install_repair_sends_repaired_yaml():
+    """Install-repair websocket handler should relay the AI-fixed YAML."""
+    hass = MagicMock()
+    connection = MagicMock()
+    msg = {
+        "id": 17,
+        "type": "automagic/install_repair",
+        "yaml": "alias: Broken\ntriggers:\n  - trigger: state\nactions:\n  - action: light.bad.turn_on\n",
+        "error": "does not match format <domain>.<name>",
+        "summary": "Turn on light",
+    }
+
+    with patch(
+        "custom_components.automagic.ws_api.async_install_repair_request",
+        AsyncMock(
+            return_value=(
+                {"success": True, "yaml": "alias: Fixed\ntriggers:\n  - trigger: state\nactions:\n  - action: light.turn_on\n", "summary": "Turn on light"},
+                200,
+            )
+        ),
+    ):
+        await websocket_install_repair(hass, connection, msg)
+
+    connection.send_result.assert_called_once_with(
+        17,
+        {
+            "success": True,
+            "yaml": "alias: Fixed\ntriggers:\n  - trigger: state\nactions:\n  - action: light.turn_on\n",
+            "summary": "Turn on light",
+        },
     )

@@ -26,6 +26,7 @@ DEFAULT_CONTEXT_LIMIT = 0
 API_PATH_GENERATE = "/api/automagic/generate"
 API_PATH_GENERATE_STATUS = "/api/automagic/generate/{job_id}"
 API_PATH_INSTALL = "/api/automagic/install"
+API_PATH_INSTALL_REPAIR = "/api/automagic/install_repair"
 API_PATH_ENTITIES = "/api/automagic/entities"
 API_PATH_HISTORY = "/api/automagic/history"
 API_PATH_HISTORY_ENTRY = "/api/automagic/history/{entry_id}"

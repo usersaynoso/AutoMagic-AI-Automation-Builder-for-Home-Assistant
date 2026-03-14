@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import uuid
 from typing import Any
 
@@ -19,6 +20,7 @@ _LOGGER = logging.getLogger(__name__)
 # Legacy keys that must NOT appear in new-syntax automations
 _LEGACY_TRIGGER_KEY = "platform"
 _LEGACY_ACTION_KEY = "service"
+_ACTION_FORMAT_RE = re.compile(r"^[a-z_]+\.[a-z_0-9]+$")
 
 
 class AutomationValidationError(Exception):
@@ -79,6 +81,14 @@ def validate_automation(parsed: dict[str, Any]) -> None:
         if _LEGACY_ACTION_KEY in act and "action" not in act:
             raise AutomationValidationError(
                 f"Action {i}: use 'action:' instead of 'service:' (legacy syntax rejected)"
+            )
+        action_value = act.get("action")
+        if isinstance(action_value, str) and action_value and not _ACTION_FORMAT_RE.match(action_value):
+            raise AutomationValidationError(
+                f"Action {i}: '{action_value}' does not match the required "
+                f"<domain>.<service_name> format (e.g. 'light.turn_on', not "
+                f"'light.kitchen.turn_on'). Use action: <domain>.<service> with "
+                f"a separate target: entity_id: field."
             )
 
 

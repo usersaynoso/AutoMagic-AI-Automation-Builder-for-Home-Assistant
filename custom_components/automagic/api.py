@@ -73,7 +73,7 @@ _STATUS_POLL_MS = 2000
 _BACKEND_PROBE_DELAY_SECONDS = 15
 _BACKEND_PROBE_INTERVAL_SECONDS = 10
 _DEFAULT_GENERATION_CONTEXT_LIMIT = 60
-_YAML_REPAIR_ATTEMPTS = 2
+_YAML_REPAIR_ATTEMPTS = 3
 _YAML_REGENERATION_ATTEMPTS = 1
 _ENTITY_REPAIR_ATTEMPTS = 2
 _TIME_WINDOW_RE = re.compile(
@@ -184,7 +184,7 @@ For example use - delay: "00:05:00", not - action: delay.
 - Put notify text under data: with a message key.
 Preserve the user's thresholds, guards, delays, entities, and notification text.
 Do not ask for clarification. Return the final corrected JSON now."""
-_INSTALL_REPAIR_ATTEMPTS = 2
+_INSTALL_REPAIR_ATTEMPTS = 3
 
 
 def _history_path(hass: HomeAssistant) -> str:
@@ -1611,11 +1611,55 @@ def _build_yaml_regeneration_messages(
     ]
 
 
+def _build_model_response_issue(err: Exception | str) -> str:
+    """Build a repair instruction for model responses that still cannot be used."""
+    detail = str(err or "").strip() or "The previous response could not be used."
+    return (
+        "Your previous response still could not be used by AutoMagic. "
+        "Return valid automation JSON with exactly the required keys and valid Home Assistant YAML only. "
+        f"Problem to fix: {detail}"
+    )
+
+
+def _build_install_repair_messages(
+    yaml_string: str,
+    summary: str,
+    issue: str,
+) -> list[dict[str, str]]:
+    """Build a retry prompt for install-time repair using the latest invalid draft."""
+    assistant_payload = {
+        "yaml": _normalize_automation_yaml_text(yaml_string),
+        "summary": str(summary or "").strip(),
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+
+    return [
+        {"role": "system", "content": _INSTALL_REPAIR_SYSTEM_PROMPT},
+        {
+            "role": "assistant",
+            "content": json.dumps(assistant_payload),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Home Assistant rejected this automation when I tried to install it. "
+                f"Error: {issue}\n\n"
+                "Fix the YAML to resolve this specific error. "
+                "Do not change anything else — preserve every trigger, condition, "
+                "action intent, entity, threshold, guard, delay, and notification message. "
+                "Return the corrected automation JSON now."
+            ),
+        },
+    ]
+
+
 def _build_entity_repair_messages(
     request_messages: list[dict[str, str]],
     result: dict[str, Any],
     hallucinated: list[str],
     entity_summary: str,
+    issue: str = "",
 ) -> list[dict[str, str]]:
     """Build a retry prompt asking the model to fix hallucinated entity references."""
     assistant_payload = {
@@ -1630,6 +1674,7 @@ def _build_entity_repair_messages(
         if str(message.get("role", "") or "").strip() in {"system", "user"}
     ]
     hallucinated_list = ", ".join(hallucinated)
+    extra_issue = f"\n\nAlso fix this problem from your previous correction attempt: {issue}" if issue else ""
 
     return [
         {"role": "system", "content": _ENTITY_REPAIR_SYSTEM_PROMPT},
@@ -1649,7 +1694,7 @@ def _build_entity_repair_messages(
                 "Preserve every trigger, condition, action, guard, delay, "
                 "threshold, and notification message. "
                 "Do not ask for clarification. Return the final corrected "
-                "automation JSON now."
+                f"automation JSON now.{extra_issue}"
             ),
         },
     ]
@@ -1666,11 +1711,15 @@ async def _regenerate_generation_result(
     last_issue = str(issue or "").strip() or "The model returned invalid automation YAML."
     last_result: dict[str, Any] | None = None
     for _attempt in range(_YAML_REGENERATION_ATTEMPTS):
-        regenerated = _normalize_generation_result(
-            await client.complete(
-                _build_yaml_regeneration_messages(request_messages, last_issue)
+        try:
+            regenerated = _normalize_generation_result(
+                await client.complete(
+                    _build_yaml_regeneration_messages(request_messages, last_issue)
+                )
             )
-        )
+        except LLMResponseError as err:
+            last_issue = _build_model_response_issue(err)
+            continue
         if regenerated.get("needs_clarification"):
             return regenerated
         last_result = regenerated
@@ -1686,11 +1735,15 @@ async def _regenerate_generation_result(
     current = last_result
     if current is not None and last_issue:
         for _attempt in range(_YAML_REPAIR_ATTEMPTS):
-            current = _normalize_generation_result(
-                await client.complete(
-                    _build_yaml_repair_messages(request_messages, current, last_issue)
+            try:
+                current = _normalize_generation_result(
+                    await client.complete(
+                        _build_yaml_repair_messages(request_messages, current, last_issue)
+                    )
                 )
-            )
+            except LLMResponseError as err:
+                last_issue = _build_model_response_issue(err)
+                continue
             if current.get("needs_clarification"):
                 return current
             repaired_issues = _collect_generated_yaml_issues(
@@ -1737,11 +1790,15 @@ async def _repair_generation_result(
 
     for _attempt in range(_YAML_REPAIR_ATTEMPTS):
         issue = " ".join(issues[:6])
-        current = _normalize_generation_result(
-            await client.complete(
-                _build_yaml_repair_messages(request_messages, current, issue)
+        try:
+            current = _normalize_generation_result(
+                await client.complete(
+                    _build_yaml_repair_messages(request_messages, current, issue)
+                )
             )
-        )
+        except LLMResponseError as err:
+            issues = [_build_model_response_issue(err)]
+            continue
         if current.get("needs_clarification"):
             return current
         issues = _collect_generated_yaml_issues(
@@ -1974,17 +2031,23 @@ async def _run_generation_job(
                         f"{e['entity_id']} ({e['name']}) [{e['state']}]"
                         for e in entities_list
                     )
+                    entity_repair_issue = ""
                     for _ent_attempt in range(_ENTITY_REPAIR_ATTEMPTS):
-                        candidate = _normalize_generation_result(
-                            await client.complete(
-                                _build_entity_repair_messages(
-                                    request_messages,
-                                    repaired,
-                                    hallucinated,
-                                    full_entity_summary,
-                        )
+                        try:
+                            candidate = _normalize_generation_result(
+                                await client.complete(
+                                    _build_entity_repair_messages(
+                                        request_messages,
+                                        repaired,
+                                        hallucinated,
+                                        full_entity_summary,
+                                        entity_repair_issue,
+                                    )
+                                )
                             )
-                        )
+                        except LLMResponseError as err:
+                            entity_repair_issue = _build_model_response_issue(err)
+                            continue
                         if candidate.get("needs_clarification"):
                             repaired = candidate
                             break
@@ -1995,6 +2058,7 @@ async def _run_generation_job(
                             cand_yaml,
                         )
                         if candidate_issues:
+                            entity_repair_issue = " ".join(candidate_issues[:6])
                             continue  # broke structure, retry
                         repaired = candidate
                         hallucinated = _find_hallucinated_entities(
@@ -2320,50 +2384,37 @@ async def async_install_repair_request(
     session = async_get_clientsession(hass)
     client = LLMClient.from_config(service_config, session=session)
 
-    assistant_payload = {
-        "yaml": _normalize_automation_yaml_text(yaml_string),
-        "summary": str(body.get("summary", "") or "").strip(),
-        "needs_clarification": False,
-        "clarifying_questions": [],
-    }
-
-    repair_messages: list[dict[str, str]] = [
-        {"role": "system", "content": _INSTALL_REPAIR_SYSTEM_PROMPT},
-        {
-            "role": "assistant",
-            "content": json.dumps(assistant_payload),
-        },
-        {
-            "role": "user",
-            "content": (
-                "Home Assistant rejected this automation when I tried to install it. "
-                f"Error: {install_error}\n\n"
-                "Fix the YAML to resolve this specific error. "
-                "Do not change anything else — preserve every trigger, condition, "
-                "action intent, entity, threshold, guard, delay, and notification message. "
-                "Return the corrected automation JSON now."
-            ),
-        },
-    ]
-
+    current_yaml = yaml_string
+    current_summary = str(body.get("summary", "") or "").strip()
     last_error = install_error
     for _attempt in range(_INSTALL_REPAIR_ATTEMPTS):
+        repair_messages = _build_install_repair_messages(
+            current_yaml,
+            current_summary,
+            last_error,
+        )
         try:
             result = await client.complete(repair_messages)
-        except (LLMConnectionError, LLMResponseError) as err:
+        except LLMConnectionError as err:
             return {"error": f"AI repair failed: {err}"}, 502
+        except LLMResponseError as err:
+            last_error = _build_model_response_issue(err)
+            continue
 
         normalized = _normalize_generation_result(result)
         fixed_yaml = normalized.get("yaml", "")
+        fixed_summary = normalized.get("summary", "") or current_summary
         issue = _validate_generated_yaml(fixed_yaml)
         if issue is not None:
             last_error = issue
+            current_yaml = fixed_yaml or current_yaml
+            current_summary = fixed_summary
             continue
 
         return {
             "success": True,
             "yaml": fixed_yaml,
-            "summary": normalized.get("summary", ""),
+            "summary": fixed_summary,
         }, 200
 
     return {

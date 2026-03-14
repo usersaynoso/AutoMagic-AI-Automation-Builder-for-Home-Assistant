@@ -805,7 +805,7 @@ async def test_run_generation_job_regenerates_after_repair_attempts_stay_invalid
     fake_client = MagicMock()
     fake_client._request_timeout = 420
     fake_client.complete = AsyncMock(
-        side_effect=[invalid_yaml, invalid_yaml, invalid_yaml, valid_yaml]
+        side_effect=[invalid_yaml, invalid_yaml, invalid_yaml, invalid_yaml, valid_yaml]
     )
 
     with patch(
@@ -833,8 +833,8 @@ async def test_run_generation_job_regenerates_after_repair_attempts_stay_invalid
 
     assert job["status"] == "completed"
     assert "mode: single" in job["yaml"]
-    assert fake_client.complete.await_count == 4
-    regeneration_messages = fake_client.complete.await_args_list[3].args[0]
+    assert fake_client.complete.await_count == 5
+    regeneration_messages = fake_client.complete.await_args_list[4].args[0]
     assert regeneration_messages[-1]["role"] == "user"
     assert "Ignore every prior draft and regenerate the full automation JSON" in regeneration_messages[-1]["content"]
 
@@ -1029,6 +1029,7 @@ async def test_run_generation_job_retries_with_specific_error_after_invalid_rege
             invalid_delay_yaml,
             invalid_delay_yaml,
             invalid_delay_yaml,
+            invalid_delay_yaml,
             valid_yaml,
         ]
     )
@@ -1059,9 +1060,9 @@ async def test_run_generation_job_retries_with_specific_error_after_invalid_rege
     assert job["status"] == "completed"
     assert _validate_generated_yaml(job["yaml"]) is None
     assert '  - delay: "00:05:00"' in job["yaml"]
-    assert fake_client.complete.await_count == 5
+    assert fake_client.complete.await_count == 6
 
-    follow_up_repair_messages = fake_client.complete.await_args_list[4].args[0]
+    follow_up_repair_messages = fake_client.complete.await_args_list[5].args[0]
     assert follow_up_repair_messages[-1]["role"] == "user"
     assert "Problems to fix: Action 0: 'delay'" in follow_up_repair_messages[-1]["content"]
     assert "regenerate the full automation JSON" not in follow_up_repair_messages[-1]["content"]
@@ -1134,6 +1135,83 @@ async def test_run_generation_job_retries_clean_regeneration_after_response_pars
     regeneration_messages = fake_client.complete.await_args_list[1].args[0]
     assert regeneration_messages[-1]["role"] == "user"
     assert "regenerate the full automation JSON from the original request" in regeneration_messages[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_run_generation_job_retries_after_repair_response_parsing_failure():
+    """Repair-time model response errors should be sent back to the AI instead of ending the job."""
+    hass = _make_hass()
+    job = _create_generation_job(hass, "Turn on the kitchen lights", ["light"])
+
+    entities = [
+        {"entity_id": "light.kitchen", "name": "Kitchen", "state": "off", "domain": "light"},
+    ]
+    invalid_yaml_response = {
+        "yaml": (
+            "alias: Kitchen Lights\n"
+            "trigger:\n"
+            "  - platform: state\n"
+            "    entity_id: light.kitchen\n"
+            "action:\n"
+            "  - service: light.turn_on\n"
+            "    target:\n"
+            "      entity_id: light.kitchen\n"
+        ),
+        "summary": "Broken draft",
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+    valid_yaml_response = {
+        "yaml": (
+            "alias: Kitchen Lights\n"
+            "description: Turns on the kitchen lights.\n"
+            "triggers:\n"
+            "  - trigger: state\n"
+            "    entity_id: light.kitchen\n"
+            '    to: "on"\n'
+            "conditions: []\n"
+            "actions:\n"
+            "  - action: light.turn_on\n"
+            "    target:\n"
+            "      entity_id: light.kitchen\n"
+            "mode: single\n"
+        ),
+        "summary": "Turns on the kitchen lights.",
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+
+    fake_client = MagicMock()
+    fake_client._request_timeout = 420
+    fake_client.complete = AsyncMock(
+        side_effect=[
+            invalid_yaml_response,
+            LLMResponseError("Failed to parse LLM response as JSON"),
+            valid_yaml_response,
+        ]
+    )
+
+    with patch(
+        "custom_components.automagic.api.get_entity_context",
+        AsyncMock(return_value=entities),
+    ), patch(
+        "custom_components.automagic.api.build_prompt",
+        return_value=[{"role": "system", "content": "system"}, {"role": "user", "content": "prompt"}],
+    ), patch(
+        "custom_components.automagic.api.async_get_clientsession",
+        return_value=MagicMock(),
+    ), patch(
+        "custom_components.automagic.api.LLMClient.from_config",
+        return_value=fake_client,
+    ):
+        await _run_generation_job(hass, job["job_id"], "Turn on the kitchen lights", ["light"])
+
+    assert job["status"] == "completed"
+    assert _validate_generated_yaml(job["yaml"]) is None
+    assert fake_client.complete.await_count == 3
+    follow_up_messages = fake_client.complete.await_args_list[2].args[0]
+    assert "still could not be used by AutoMagic" in follow_up_messages[-1]["content"]
+    assert "Failed to parse LLM response as JSON" in follow_up_messages[-1]["content"]
 
 
 @pytest.mark.asyncio
@@ -1660,6 +1738,278 @@ async def test_run_generation_job_repairs_prompt_coverage_issues_before_completi
     assert repair_messages[-1]["role"] == "user"
     assert "weekday schedule" in repair_messages[-1]["content"]
     assert 'must not be "Speaker"' in repair_messages[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_run_generation_job_keeps_repairing_latest_yaml_before_regeneration():
+    """Complex drafts should get another targeted repair pass before the backend discards them."""
+    hass = _make_hass()
+    prompt = (
+        "Every weekday morning, check if Janet (the robot vacuum) has done a clean in the last 24 hours. "
+        "If she hasn't, start her cleaning at 8am, but only if everyone has already left home - check this "
+        'by making sure the iPhone 13 audio output is not "Speaker" (meaning the phone is not actively being '
+        "used at home). While Janet is cleaning, turn the lounge strip lights and bar lamp to a dim warm white "
+        "at 20% brightness so she can see. When she finishes, turn those lights back off. If Janet doesn't "
+        'finish within 90 minutes of starting, send a notification to my iPhone saying "Janet is still cleaning '
+        'after 90 minutes - she might be stuck". Don\'t start her at all if either of the router LED switches '
+        "are already off, as that means the network is down and her cloud connection won't work."
+    )
+    job = _create_generation_job(hass, prompt, None)
+
+    entities = [
+        {
+            "entity_id": "vacuum.robot_vacuum",
+            "name": "Janet",
+            "state": "docked",
+            "domain": "vacuum",
+        },
+        {
+            "entity_id": "sensor.iphone_13_audio_output",
+            "name": "iPhone 13 Audio Output",
+            "state": "AirPlay",
+            "domain": "sensor",
+        },
+        {
+            "entity_id": "switch.router_led_left",
+            "name": "Router LED Left",
+            "state": "on",
+            "domain": "switch",
+        },
+        {
+            "entity_id": "switch.router_led_right",
+            "name": "Router LED Right",
+            "state": "on",
+            "domain": "switch",
+        },
+        {
+            "entity_id": "light.lounge_strip_lights_left",
+            "name": "Lounge Strip Lights Left",
+            "state": "off",
+            "domain": "light",
+        },
+        {
+            "entity_id": "light.lounge_strip_lights_right",
+            "name": "Lounge Strip Lights Right",
+            "state": "off",
+            "domain": "light",
+        },
+        {
+            "entity_id": "light.bar_lamp",
+            "name": "Bar Lamp",
+            "state": "off",
+            "domain": "light",
+        },
+        {
+            "entity_id": "notify.mobile_app_iphone_13",
+            "name": "Notify Iphone 13",
+            "state": "service",
+            "domain": "notify",
+            "device_class": "service",
+        },
+    ]
+    initial_invalid_yaml = {
+        "yaml": (
+            "alias: Start Janet Cleaning on Weekdays\n"
+            "description: Starts Janet cleaning when conditions are met.\n"
+            "triggers:\n"
+            "  - trigger: time\n"
+            '    at: "08:00:00"\n'
+            "conditions:\n"
+            "  - condition: state\n"
+            "    entity_id: switch.router_led_left\n"
+            '    state: "on"\n'
+            "actions:\n"
+            "  - action: vacuum.robot_vacuum.start\n"
+            "  - action: light.lounge_strip_lights_left.turn_on\n"
+            "  - action: notify.mobile_app_iphone_13\n"
+            "    data:\n"
+            '      message: "Janet is still cleaning after 90 minutes - she might be stuck"\n'
+            "mode: single\n"
+        ),
+        "summary": "Starts Janet cleaning.",
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+    partially_fixed_yaml = {
+        "yaml": (
+            "alias: Start Janet Cleaning on Weekdays\n"
+            "description: Starts Janet cleaning when conditions are met.\n"
+            "triggers:\n"
+            "  - trigger: time\n"
+            '    at: "08:00:00"\n'
+            "conditions:\n"
+            "  - condition: state\n"
+            "    entity_id: switch.router_led_left\n"
+            '    state: "on"\n'
+            "actions:\n"
+            "  - action: vacuum.start\n"
+            "    target:\n"
+            "      entity_id: vacuum.robot_vacuum\n"
+            "  - action: light.turn_on\n"
+            "    target:\n"
+            "      entity_id:\n"
+            "        - light.lounge_strip_lights_left\n"
+            "        - light.lounge_strip_lights_right\n"
+            "        - light.bar_lamp\n"
+            "    data:\n"
+            "      brightness_pct: 20\n"
+            "      kelvin: 2700\n"
+            '  - delay: "01:30:00"\n'
+            "  - action: notify.mobile_app_iphone_13\n"
+            "    data:\n"
+            '      message: "Janet is still cleaning after 90 minutes - she might be stuck"\n'
+            "mode: single\n"
+        ),
+        "summary": "Starts Janet cleaning when conditions are met.",
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+    still_incomplete_yaml = {
+        "yaml": (
+            "alias: Start Janet Cleaning on Weekdays\n"
+            "description: Starts Janet cleaning when conditions are met.\n"
+            "triggers:\n"
+            "  - trigger: time\n"
+            '    at: "08:00:00"\n'
+            "    weekday:\n"
+            "      - mon\n"
+            "      - tue\n"
+            "      - wed\n"
+            "      - thu\n"
+            "      - fri\n"
+            "conditions:\n"
+            "  - condition: state\n"
+            "    entity_id: switch.router_led_left\n"
+            '    state: "on"\n'
+            "actions:\n"
+            "  - action: vacuum.start\n"
+            "    target:\n"
+            "      entity_id: vacuum.robot_vacuum\n"
+            "  - action: light.turn_on\n"
+            "    target:\n"
+            "      entity_id:\n"
+            "        - light.lounge_strip_lights_left\n"
+            "        - light.lounge_strip_lights_right\n"
+            "        - light.bar_lamp\n"
+            "    data:\n"
+            "      brightness_pct: 20\n"
+            "      kelvin: 2700\n"
+            '  - delay: "01:30:00"\n'
+            "  - action: notify.mobile_app_iphone_13\n"
+            "    data:\n"
+            '      message: "Janet is still cleaning after 90 minutes - she might be stuck"\n'
+            "mode: single\n"
+        ),
+        "summary": "Starts Janet cleaning on weekdays.",
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+    fixed_yaml = {
+        "yaml": (
+            "alias: Start Janet Cleaning on Weekdays\n"
+            "description: Starts Janet cleaning at 8am on weekdays when the requested guards pass.\n"
+            "triggers:\n"
+            "  - trigger: time\n"
+            '    at: "08:00:00"\n'
+            "    weekday:\n"
+            "      - mon\n"
+            "      - tue\n"
+            "      - wed\n"
+            "      - thu\n"
+            "      - fri\n"
+            "conditions:\n"
+            "  - condition: state\n"
+            "    entity_id: switch.router_led_left\n"
+            '    state: "on"\n'
+            "  - condition: state\n"
+            "    entity_id: switch.router_led_right\n"
+            '    state: "on"\n'
+            "  - condition: not\n"
+            "    conditions:\n"
+            "      - condition: state\n"
+            "        entity_id: sensor.iphone_13_audio_output\n"
+            '        state: "Speaker"\n'
+            "actions:\n"
+            "  - action: vacuum.start\n"
+            "    target:\n"
+            "      entity_id: vacuum.robot_vacuum\n"
+            "  - action: light.turn_on\n"
+            "    target:\n"
+            "      entity_id:\n"
+            "        - light.lounge_strip_lights_left\n"
+            "        - light.lounge_strip_lights_right\n"
+            "        - light.bar_lamp\n"
+            "    data:\n"
+            "      brightness_pct: 20\n"
+            "      kelvin: 2700\n"
+            '  - delay: "01:30:00"\n'
+            "  - action: notify.mobile_app_iphone_13\n"
+            "    data:\n"
+            '      message: "Janet is still cleaning after 90 minutes - she might be stuck"\n'
+            "  - action: light.turn_off\n"
+            "    target:\n"
+            "      entity_id:\n"
+            "        - light.lounge_strip_lights_left\n"
+            "        - light.lounge_strip_lights_right\n"
+            "        - light.bar_lamp\n"
+            "mode: single\n"
+        ),
+        "summary": "Starts Janet cleaning on weekdays when the requested guards pass.",
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+
+    repair_calls = 0
+    regeneration_calls = 0
+
+    async def _progressive_complete(messages):
+        nonlocal repair_calls, regeneration_calls
+        last_content = messages[-1]["content"] if messages else ""
+        if "Ignore every prior draft and regenerate the full automation JSON" in last_content:
+            regeneration_calls += 1
+            return still_incomplete_yaml
+        if "Rewrite it into a valid final automation JSON now." in last_content:
+            repair_calls += 1
+            if regeneration_calls:
+                return still_incomplete_yaml
+            if repair_calls == 1:
+                return partially_fixed_yaml
+            if repair_calls == 2:
+                return still_incomplete_yaml
+            return fixed_yaml
+        return initial_invalid_yaml
+
+    fake_client = MagicMock()
+    fake_client._request_timeout = 420
+    fake_client.complete = AsyncMock(side_effect=_progressive_complete)
+
+    with patch(
+        "custom_components.automagic.api.get_entity_context",
+        AsyncMock(return_value=entities),
+    ), patch(
+        "custom_components.automagic.api.build_prompt",
+        return_value=[{"role": "user", "content": "prompt"}],
+    ), patch(
+        "custom_components.automagic.api.async_get_clientsession",
+        return_value=MagicMock(),
+    ), patch(
+        "custom_components.automagic.api.LLMClient.from_config",
+        return_value=fake_client,
+    ):
+        await _run_generation_job(
+            hass,
+            job["job_id"],
+            prompt,
+            None,
+        )
+
+    assert job["status"] == "completed"
+    assert _validate_generated_yaml(job["yaml"]) is None
+    assert repair_calls == 3
+    assert regeneration_calls == 0
+    final_repair_messages = fake_client.complete.await_args_list[3].args[0]
+    assert "switch.router_led_right" in final_repair_messages[-1]["content"]
+    assert 'must not be "Speaker"' in final_repair_messages[-1]["content"]
 
 
 @pytest.mark.asyncio
@@ -2550,6 +2900,159 @@ async def test_install_repair_returns_fixed_yaml():
     assert status == 200
     assert payload["success"] is True
     assert "light.turn_on" in payload["yaml"]
+
+
+@pytest.mark.asyncio
+async def test_install_repair_retries_with_latest_validation_issue():
+    """Install repair should send the newest validation failure back to the AI, not just the original error."""
+    hass = _make_hass()
+
+    legacy_service_yaml = (
+        "alias: Test\n"
+        "description: Legacy service draft.\n"
+        "triggers:\n"
+        "  - trigger: state\n"
+        "    entity_id: light.test\n"
+        '    to: "on"\n'
+        "conditions: []\n"
+        "actions:\n"
+        "  - service: light.turn_on\n"
+        "    target:\n"
+        "      entity_id: light.test\n"
+        "mode: single\n"
+    )
+    fixed_yaml = (
+        "alias: Test\n"
+        "description: Fixed automation.\n"
+        "triggers:\n"
+        "  - trigger: state\n"
+        "    entity_id: light.test\n"
+        '    to: "on"\n'
+        "conditions: []\n"
+        "actions:\n"
+        "  - action: light.turn_on\n"
+        "    target:\n"
+        "      entity_id: light.test\n"
+        "mode: single\n"
+    )
+
+    fake_client = AsyncMock()
+
+    async def _repair_complete(messages):
+        last_content = messages[-1]["content"] if messages else ""
+        if "use 'action:' instead of 'service:'" in last_content:
+            return {
+                "yaml": fixed_yaml,
+                "summary": "Fixed automation",
+                "needs_clarification": False,
+                "clarifying_questions": [],
+            }
+        return {
+            "yaml": legacy_service_yaml,
+            "summary": "Legacy service draft",
+            "needs_clarification": False,
+            "clarifying_questions": [],
+        }
+
+    fake_client.complete = AsyncMock(side_effect=_repair_complete)
+
+    body = {
+        "yaml": (
+            "alias: Test\n"
+            "triggers:\n"
+            "  - trigger: state\n"
+            "    entity_id: light.test\n"
+            '    to: "on"\n'
+            "conditions: []\n"
+            "actions:\n"
+            "  - action: light.test.turn_on\n"
+            "mode: single\n"
+        ),
+        "error": "Action 0: 'light.test.turn_on' does not match the required <domain>.<service_name> format",
+        "summary": "Turn on light",
+    }
+
+    with patch(
+        "custom_components.automagic.api.async_get_clientsession",
+        return_value=MagicMock(),
+    ), patch(
+        "custom_components.automagic.api.LLMClient.from_config",
+        return_value=fake_client,
+    ):
+        payload, status = await async_install_repair_request(hass, body)
+
+    assert status == 200
+    assert payload["success"] is True
+    assert "light.turn_on" in payload["yaml"]
+    assert fake_client.complete.await_count == 2
+    second_attempt_messages = fake_client.complete.await_args_list[1].args[0]
+    assert "use 'action:' instead of 'service:'" in second_attempt_messages[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_install_repair_retries_after_model_response_error():
+    """Install repair should feed model response errors back into the next repair attempt."""
+    hass = _make_hass()
+
+    fixed_yaml = (
+        "alias: Test\n"
+        "description: Fixed automation.\n"
+        "triggers:\n"
+        "  - trigger: state\n"
+        "    entity_id: light.test\n"
+        '    to: "on"\n'
+        "conditions: []\n"
+        "actions:\n"
+        "  - action: light.turn_on\n"
+        "    target:\n"
+        "      entity_id: light.test\n"
+        "mode: single\n"
+    )
+
+    fake_client = AsyncMock()
+    fake_client.complete = AsyncMock(
+        side_effect=[
+            LLMResponseError("Failed to parse LLM response as JSON"),
+            {
+                "yaml": fixed_yaml,
+                "summary": "Fixed automation",
+                "needs_clarification": False,
+                "clarifying_questions": [],
+            },
+        ]
+    )
+
+    body = {
+        "yaml": (
+            "alias: Test\n"
+            "triggers:\n"
+            "  - trigger: state\n"
+            "    entity_id: light.test\n"
+            '    to: "on"\n'
+            "conditions: []\n"
+            "actions:\n"
+            "  - action: light.test.turn_on\n"
+            "mode: single\n"
+        ),
+        "error": "Action 0: 'light.test.turn_on' does not match the required <domain>.<service_name> format",
+        "summary": "Turn on light",
+    }
+
+    with patch(
+        "custom_components.automagic.api.async_get_clientsession",
+        return_value=MagicMock(),
+    ), patch(
+        "custom_components.automagic.api.LLMClient.from_config",
+        return_value=fake_client,
+    ):
+        payload, status = await async_install_repair_request(hass, body)
+
+    assert status == 200
+    assert payload["success"] is True
+    assert fake_client.complete.await_count == 2
+    retry_messages = fake_client.complete.await_args_list[1].args[0]
+    assert "still could not be used by AutoMagic" in retry_messages[-1]["content"]
+    assert "Failed to parse LLM response as JSON" in retry_messages[-1]["content"]
 
 
 @pytest.mark.asyncio

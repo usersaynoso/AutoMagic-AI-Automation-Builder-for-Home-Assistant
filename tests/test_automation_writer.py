@@ -82,6 +82,19 @@ class TestValidateAutomation:
         with pytest.raises(AutomationValidationError, match="platform.*legacy"):
             validate_automation(parsed)
 
+    def test_nested_trigger_mapping_rejected(self):
+        """Nested trigger mappings should be rejected with a concrete correction hint."""
+        parsed = {
+            "alias": "Test",
+            "triggers": [{"trigger": {"platform": "time", "at": "08:00:00"}}],
+            "actions": [{"action": "light.turn_on"}],
+        }
+        with pytest.raises(
+            AutomationValidationError,
+            match=r"Trigger 0: 'trigger:' must be a plain string like 'trigger: time'",
+        ):
+            validate_automation(parsed)
+
     def test_legacy_service_in_action_rejected(self):
         """Action items with 'service:' but no 'action:' should be rejected."""
         parsed = {
@@ -114,6 +127,19 @@ class TestValidateAutomation:
         with pytest.raises(AutomationValidationError, match="mapping"):
             validate_automation("not a dict")
 
+    def test_top_level_weekday_rejected(self):
+        parsed = {
+            "alias": "Test",
+            "weekday": ["mon", "tue"],
+            "triggers": [{"trigger": "time", "at": "08:00:00"}],
+            "actions": [{"action": "light.turn_on"}],
+        }
+        with pytest.raises(
+            AutomationValidationError,
+            match=r"'weekday:' is not a valid top-level automation key",
+        ):
+            validate_automation(parsed)
+
     def test_with_conditions_valid(self):
         """Conditions are optional - should pass when present."""
         parsed = {
@@ -123,6 +149,24 @@ class TestValidateAutomation:
             "actions": [{"action": "light.turn_on", "target": {"entity_id": "light.hallway"}}],
         }
         validate_automation(parsed)  # Should not raise
+
+    def test_bare_condition_inside_actions_rejected(self):
+        parsed = {
+            "alias": "Test",
+            "triggers": [{"trigger": "state", "entity_id": "binary_sensor.door"}],
+            "actions": [
+                {
+                    "condition": "state",
+                    "entity_id": "light.hallway",
+                    "state": "on",
+                }
+            ],
+        }
+        with pytest.raises(
+            AutomationValidationError,
+            match=r"Action 0: bare 'condition:' inside actions: is not valid flow control",
+        ):
+            validate_automation(parsed)
 
     def test_action_format_three_segments_rejected(self):
         """Action with embedded entity_id like 'light.kitchen.turn_on' should be rejected."""

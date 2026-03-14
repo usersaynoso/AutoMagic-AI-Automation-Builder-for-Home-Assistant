@@ -21,6 +21,28 @@ _LOGGER = logging.getLogger(__name__)
 _LEGACY_TRIGGER_KEY = "platform"
 _LEGACY_ACTION_KEY = "service"
 _ACTION_FORMAT_RE = re.compile(r"^[a-z_]+\.[a-z_0-9]+$")
+_TOP_LEVEL_WEEKDAY_ERROR = (
+    "'weekday:' is not a valid top-level automation key. Weekday restrictions "
+    "must go inside a 'condition: time' block under conditions: or inside a "
+    "trigger's 'at:' schedule."
+)
+
+
+def _nested_trigger_mapping_error(index: int) -> str:
+    """Return the validation error for nested trigger mappings."""
+    return (
+        f"Trigger {index}: 'trigger:' must be a plain string like 'trigger: time', "
+        "not a nested mapping. Found 'trigger:' used as a block instead of a scalar."
+    )
+
+
+def _bare_action_condition_error(index: int) -> str:
+    """Return the validation error for invalid action-list conditions."""
+    return (
+        f"Action {index}: bare 'condition:' inside actions: is not valid flow control. "
+        "Use a 'choose:' block with a 'conditions:' list and 'sequence:' to branch, "
+        "or move the condition to the top-level conditions: block."
+    )
 
 
 class AutomationValidationError(Exception):
@@ -38,6 +60,9 @@ def validate_automation(parsed: dict[str, Any]) -> None:
     # Must have alias
     if "alias" not in parsed:
         raise AutomationValidationError("Automation must include 'alias'")
+
+    if "weekday" in parsed:
+        raise AutomationValidationError(_TOP_LEVEL_WEEKDAY_ERROR)
 
     # Must use plural 'triggers:' at top level
     if "triggers" not in parsed:
@@ -65,6 +90,8 @@ def validate_automation(parsed: dict[str, Any]) -> None:
     for i, trig in enumerate(triggers):
         if not isinstance(trig, dict):
             continue
+        if isinstance(trig.get("trigger"), dict):
+            raise AutomationValidationError(_nested_trigger_mapping_error(i))
         if _LEGACY_TRIGGER_KEY in trig and "trigger" not in trig:
             raise AutomationValidationError(
                 f"Trigger {i}: use 'trigger:' instead of 'platform:' (legacy syntax rejected)"
@@ -78,6 +105,8 @@ def validate_automation(parsed: dict[str, Any]) -> None:
     for i, act in enumerate(actions):
         if not isinstance(act, dict):
             continue
+        if "condition" in act:
+            raise AutomationValidationError(_bare_action_condition_error(i))
         if _LEGACY_ACTION_KEY in act and "action" not in act:
             raise AutomationValidationError(
                 f"Action {i}: use 'action:' instead of 'service:' (legacy syntax rejected)"

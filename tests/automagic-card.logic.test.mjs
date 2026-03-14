@@ -456,6 +456,29 @@ test("Repair issue text appends concrete YAML examples for negated state guards"
   );
 });
 
+test("Repair issue text includes concrete YAML examples for the new malformations", () => {
+  const harness = buildHarness();
+  const issueText = harness._buildRepairIssueText.call(harness, [
+    "Trigger 0: 'trigger:' must be a plain string like 'trigger: time', not a nested mapping. Found 'trigger:' used as a block instead of a scalar.",
+    "'weekday:' is not a valid top-level automation key. Weekday restrictions must go inside a 'condition: time' block under conditions: or inside a trigger's 'at:' schedule.",
+    "color_temp value 2700 looks like Kelvin. color_temp must be in mireds (153-500). Convert Kelvin to mireds with: mireds = round(1000000 / kelvin). For warm white 2700K use color_temp: 370, for 3000K use color_temp: 333.",
+    "Action 0: bare 'condition:' inside actions: is not valid flow control. Use a 'choose:' block with a 'conditions:' list and 'sequence:' to branch, or move the condition to the top-level conditions: block.",
+    "Preserve ALL resolved guard entities: switch.main_router_led, switch.mesh_mesh_led. The prompt said 'either' meaning both switches must be present as separate conditions.",
+  ]);
+
+  assert.match(issueText, /Correct trigger syntax:/);
+  assert.match(issueText, /triggers:\n\s+- trigger: time\n\s+at: "08:00:00"/);
+  assert.match(
+    issueText,
+    /Weekday restrictions must be a condition: time block like this:\n\s+- condition: time\n\s+weekday:/
+  );
+  assert.match(issueText, /Use mired color_temp values like this:/);
+  assert.match(issueText, /Use choose for action-time branching like this:/);
+  assert.match(issueText, /Keep both guard switches as separate conditions like this:/);
+  assert.match(issueText, /entity_id: switch\.main_router_led/);
+  assert.match(issueText, /entity_id: switch\.mesh_mesh_led/);
+});
+
 test("History delete only runs for failed or deleted entries", async () => {
   const harness = buildHarness();
   let deletedEntryId = "";
@@ -2500,6 +2523,44 @@ actions:
   );
 });
 
+test("YAML issue detection catches nested trigger blocks, top-level weekday keys, and bare action conditions", () => {
+  const harness = buildHarness();
+  const issues = harness._collectYamlIssues.call(
+    harness,
+    `alias: Broken Example
+weekday:
+  - mon
+triggers:
+  - trigger:
+      platform: time
+      at: "08:00:00"
+conditions: []
+actions:
+  - condition: state
+    entity_id: light.test
+    state: "on"
+  - action: light.turn_on
+    target:
+      entity_id: light.test`
+  );
+
+  assert.ok(
+    issues.includes(
+      "Trigger 0: 'trigger:' must be a plain string like 'trigger: time', not a nested mapping. Found 'trigger:' used as a block instead of a scalar."
+    )
+  );
+  assert.ok(
+    issues.includes(
+      "'weekday:' is not a valid top-level automation key. Weekday restrictions must go inside a 'condition: time' block under conditions: or inside a trigger's 'at:' schedule."
+    )
+  );
+  assert.ok(
+    issues.includes(
+      "Action 0: bare 'condition:' inside actions: is not valid flow control. Use a 'choose:' block with a 'conditions:' list and 'sequence:' to branch, or move the condition to the top-level conditions: block."
+    )
+  );
+});
+
 test("Prompt-aware repair issues catch missing grouped entities, notify targets, and follow-up branches", () => {
   const harness = buildHarness();
   const prompt =
@@ -2673,6 +2734,95 @@ actions:
       issue.includes(
         "Respect the explicit guard switch.meter_macs_the_architeuthis_electricity_supply_switch"
       )
+    )
+  );
+});
+
+test("Explicit state guard extraction resolves both router LED switches from either phrasing", () => {
+  const harness = buildHarness();
+  const guards = harness._extractExplicitStateGuardSpecs.call(
+    harness,
+    "Don't start it at all if either of the router LED switches are already off, as that means the network is down.",
+    [
+      {
+        entity_id: "switch.main_router_led",
+        name: "Main Router LED",
+        domain: "switch",
+      },
+      {
+        entity_id: "switch.mesh_mesh_led",
+        name: "Mesh Router LED",
+        domain: "switch",
+      },
+    ]
+  );
+
+  assert.deepEqual(guards, [
+    {
+      entity_id: "switch.main_router_led",
+      blockedState: "off",
+      requiredState: "on",
+    },
+    {
+      entity_id: "switch.mesh_mesh_led",
+      blockedState: "off",
+      requiredState: "on",
+    },
+  ]);
+});
+
+test("Prompt-aware coverage issues catch Kelvin color_temp values and partial either-switch guards", () => {
+  const harness = buildHarness();
+  const prompt =
+    "Don't start it at all if either of the router LED switches are already off, as that means the network is down. Turn the bar lamp to warm white.";
+  const issues = harness._collectYamlCoverageIssues.call(
+    harness,
+    prompt,
+    `alias: Router Guard Example
+description: Example
+triggers:
+  - trigger: time
+    at: "08:00:00"
+conditions:
+  - condition: state
+    entity_id: switch.main_router_led
+    state: "on"
+actions:
+  - action: light.turn_on
+    target:
+      entity_id: light.bar_lamp
+    data:
+      color_temp: 2700
+mode: single`,
+    {
+      entities: [
+        {
+          entity_id: "switch.main_router_led",
+          name: "Main Router LED",
+          domain: "switch",
+        },
+        {
+          entity_id: "switch.mesh_mesh_led",
+          name: "Mesh Router LED",
+          domain: "switch",
+        },
+        {
+          entity_id: "light.bar_lamp",
+          name: "Bar Lamp",
+          domain: "light",
+        },
+      ],
+    }
+  );
+
+  assert.ok(
+    issues.includes(
+      "color_temp value 2700 looks like Kelvin. color_temp must be in mireds (153-500). Convert Kelvin to mireds with: mireds = round(1000000 / kelvin). For warm white 2700K use color_temp: 370, for 3000K use color_temp: 333."
+    )
+  );
+  assert.ok(
+    issues.includes(
+      "Preserve ALL resolved guard entities: switch.mesh_mesh_led. The prompt said 'either' meaning both switches must be present as separate conditions."
     )
   );
 });

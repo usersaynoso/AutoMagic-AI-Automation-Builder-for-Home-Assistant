@@ -1358,6 +1358,15 @@ class AutoMagicCard extends LitElement {
     }
     const triggerSection = this._extractTopLevelSectionBlock(text, "triggers");
     if (
+      /^  -\s*trigger\s*:\s*(?:#.*)?$(?:\r?\n)\s+[a-z_][a-z0-9_]*\s*:/im.test(
+        triggerSection
+      )
+    ) {
+      issues.push(
+        "Trigger 0: 'trigger:' must be a plain string like 'trigger: time', not a nested mapping. Found 'trigger:' used as a block instead of a scalar."
+      );
+    }
+    if (
       /\btrigger\s*:\s*state\b[\s\S]*?\n\s+(?:above|below)\s*:/i.test(
         triggerSection
       ) ||
@@ -1380,6 +1389,11 @@ class AutoMagicCard extends LitElement {
     }
     if (/^\s*automation\s*:/m.test(text)) {
       issues.push("Do not wrap the automation in a top-level automation: block.");
+    }
+    if (/^weekday\s*:/m.test(text)) {
+      issues.push(
+        "'weekday:' is not a valid top-level automation key. Weekday restrictions must go inside a 'condition: time' block under conditions: or inside a trigger's 'at:' schedule."
+      );
     }
     if (/^\s*trigger:\s*\w+/m.test(text) && !/^\s*-\s*trigger\s*:/m.test(text)) {
       issues.push("Trigger entries must be list items under triggers: using - trigger:.");
@@ -1407,7 +1421,9 @@ class AutoMagicCard extends LitElement {
     }
     const actionSection = this._extractTopLevelSectionBlock(text, "actions");
     if (/^  -\s*condition\s*:/m.test(actionSection)) {
-      issues.push("Action items under actions: must not be conditions.");
+      issues.push(
+        "Action 0: bare 'condition:' inside actions: is not valid flow control. Use a 'choose:' block with a 'conditions:' list and 'sequence:' to branch, or move the condition to the top-level conditions: block."
+      );
     }
     if (/^  -\s*trigger\s*:/m.test(actionSection)) {
       issues.push("Action items under actions: must not be triggers.");
@@ -1450,6 +1466,13 @@ class AutoMagicCard extends LitElement {
     }
 
     const issues = [];
+    for (const match of text.matchAll(/\bcolor_temp\s*:\s*(\d+)\b/gi)) {
+      const value = Number(match[1]);
+      if (!Number.isFinite(value) || value <= 1000) continue;
+      issues.push(
+        `color_temp value ${value} looks like Kelvin. color_temp must be in mireds (153-500). Convert Kelvin to mireds with: mireds = round(1000000 / kelvin). For warm white 2700K use color_temp: 370, for 3000K use color_temp: 333.`
+      );
+    }
     const siblingGroups = this._collectSiblingGroups(requestText, entities);
     const groupClauseMappings = this._buildGroupClauseMappings(
       requestText,
@@ -1542,6 +1565,30 @@ class AutoMagicCard extends LitElement {
         );
       }
     });
+    if (
+      /\beither\b/i.test(requestText) &&
+      /\b(router\s+led|network\s+is\s+down)\b/i.test(requestText)
+    ) {
+      const resolvedGuardIds = [
+        ...new Set(
+          explicitStateGuards
+            .map((guard) => this._normalizeText(guard?.entity_id))
+            .filter(Boolean)
+        ),
+      ];
+      const missingGuardIds = resolvedGuardIds.filter(
+        (entityId) => !text.includes(entityId)
+      );
+      if (
+        resolvedGuardIds.length > 1 &&
+        missingGuardIds.length > 0 &&
+        missingGuardIds.length < resolvedGuardIds.length
+      ) {
+        issues.push(
+          `Preserve ALL resolved guard entities: ${missingGuardIds.join(", ")}. The prompt said 'either' meaning both switches must be present as separate conditions.`
+        );
+      }
+    }
 
     if (/\b(wait|delay)\b/i.test(requestText) && !/^\s*-\s*delay:|^\s*delay:/m.test(text)) {
       issues.push("Include a delay action for the requested wait.");
@@ -1684,9 +1731,53 @@ class AutoMagicCard extends LitElement {
         "Return syntactically valid YAML with correct indentation, list markers, and quoting."
       );
     }
+    if (combined.includes("must be a plain string like 'trigger: time'")) {
+      hints.push(
+        "Correct trigger syntax:\n" +
+          "  triggers:\n" +
+          "    - trigger: time\n" +
+          '      at: "08:00:00"'
+      );
+    }
+    if (combined.includes("'weekday:' is not a valid top-level automation key")) {
+      hints.push(
+        "Weekday restrictions must be a condition: time block like this:\n" +
+          "  - condition: time\n" +
+          "    weekday:\n" +
+          "      - mon\n" +
+          "      - tue\n" +
+          "      - wed\n" +
+          "      - thu\n" +
+          "      - fri"
+      );
+    }
     if (combined.includes("weekday schedule")) {
       hints.push(
         "Preserve requested weekday restrictions explicitly in weekday: or an equivalent weekday condition."
+      );
+    }
+    if (combined.includes("looks like kelvin") && combined.includes("color_temp")) {
+      hints.push(
+        "Use mired color_temp values like this:\n" +
+          "  - action: light.turn_on\n" +
+          "    target:\n" +
+          "      entity_id: light.example\n" +
+          "    data:\n" +
+          "      color_temp: 370"
+      );
+    }
+    if (combined.includes("bare 'condition:' inside actions:")) {
+      hints.push(
+        "Use choose for action-time branching like this:\n" +
+          "  - choose:\n" +
+          "      - conditions:\n" +
+          "          - condition: state\n" +
+          "            entity_id: binary_sensor.example\n" +
+          '            state: "on"\n' +
+          "        sequence:\n" +
+          "          - action: light.turn_on\n" +
+          "            target:\n" +
+          "              entity_id: light.example"
       );
     }
     const negatedGuardSpecs = this._extractNegatedStateGuardIssueSpecs(issues, 4);
@@ -1711,6 +1802,39 @@ class AutoMagicCard extends LitElement {
     if (combined.includes("color_name values should not use underscore")) {
       hints.push(
         "Use valid light color fields such as kelvin, color_temp, rgb_color, or a supported CSS color_name."
+      );
+    }
+    if (combined.includes("preserve all resolved guard entities")) {
+      const guardEntityIds = [];
+      this._normalizeRepairIssues(issues, 10).forEach((issue) => {
+        if (
+          !issue.toLowerCase().includes("preserve all resolved guard entities") &&
+          !issue.toLowerCase().includes("respect the explicit guard")
+        ) {
+          return;
+        }
+        for (const match of issue.matchAll(/[a-z0-9_]+\.[a-z0-9_]+/gi)) {
+          const entityId = this._normalizeText(match[0]);
+          if (!entityId || guardEntityIds.includes(entityId)) continue;
+          guardEntityIds.push(entityId);
+          if (guardEntityIds.length >= 2) break;
+        }
+      });
+      while (guardEntityIds.length < 2) {
+        guardEntityIds.push(
+          guardEntityIds.length === 0
+            ? "switch.main_router_led"
+            : "switch.mesh_mesh_led"
+        );
+      }
+      hints.push(
+        "Keep both guard switches as separate conditions like this:\n" +
+          "  - condition: state\n" +
+          `    entity_id: ${guardEntityIds[0]}\n` +
+          '    state: "on"\n' +
+          "  - condition: state\n" +
+          `    entity_id: ${guardEntityIds[1]}\n` +
+          '    state: "on"'
       );
     }
     return hints.filter((hint, index, items) => hint && items.indexOf(hint) === index);
@@ -2649,8 +2773,8 @@ class AutoMagicCard extends LitElement {
     if (!text || pool.length === 0) return [];
 
     const patterns = [
-      /(?:don't|do not)\s+run(?: any of this| this)?\s+if\s+(.+?)\s+is\s+already\s+(on|off|open|closed|locked|unlocked|active|inactive)\b/gi,
-      /\bunless\s+(.+?)\s+is\s+(on|off|open|closed|locked|unlocked|active|inactive)\b/gi,
+      /(?:don't|do not)\s+(?:run(?: any of this| this)?|start(?: any of this| this| it| her| him| them)?)\s+(?:at all\s+)?if\s+(.+?)\s+(?:is|are)\s+already\s+(on|off|open|closed|locked|unlocked|active|inactive)\b/gi,
+      /\bunless\s+(.+?)\s+(?:is|are)\s+(on|off|open|closed|locked|unlocked|active|inactive)\b/gi,
     ];
     const guards = [];
 
@@ -2660,30 +2784,85 @@ class AutoMagicCard extends LitElement {
         const blockedState = this._normalizeText(match[2]).toLowerCase();
         if (!entityPhrase || !blockedState) continue;
 
-        const candidates = [
-          ...this._findObviousNamedEntities(entityPhrase, pool, 4),
-          ...this._findEntitiesByPhrase(entityPhrase, pool, 4),
-        ].filter(
-          (entity, index, items) =>
-            items.findIndex(
-              (candidate) => candidate.entity_id === entity.entity_id
-            ) === index
-        );
-        const entity = candidates[0];
-        if (!entity?.entity_id) continue;
+        const phraseCandidates = [
+          entityPhrase,
+          entityPhrase.replace(
+            /\b(?:either|both|all|each|every)\s+of\s+the\b/gi,
+            " "
+          ),
+          entityPhrase.replace(
+            /\b(?:either|both|all|each|every|of|the)\b/gi,
+            " "
+          ),
+          entityPhrase
+            .replace(/\bswitches\b/gi, "switch")
+            .replace(/\blights\b/gi, "light")
+            .replace(/\bphases\b/gi, "phase")
+            .replace(/\bsensors\b/gi, "sensor")
+            .replace(/\boutputs\b/gi, "output")
+            .replace(/\binputs\b/gi, "input"),
+        ];
 
-        guards.push({
-          entity_id: entity.entity_id,
-          blockedState,
-          requiredState: this._invertEntityState(blockedState),
+        let candidates = [];
+        let resolvedPhrase = entityPhrase;
+        phraseCandidates.some((candidatePhrase) => {
+          const normalizedPhrase = this._normalizeText(candidatePhrase).replace(
+            /\s+/g,
+            " "
+          );
+          if (!normalizedPhrase) return false;
+          const matches = [
+            ...this._findObviousNamedEntities(normalizedPhrase, pool, 8),
+            ...this._findEntitiesByPhrase(normalizedPhrase, pool, 8),
+          ].filter(
+            (entity, index, items) =>
+              items.findIndex(
+                (candidate) => candidate.entity_id === entity.entity_id
+              ) === index
+          );
+          if (matches.length === 0) return false;
+          candidates = matches;
+          resolvedPhrase = normalizedPhrase;
+          return true;
+        });
+
+        if (candidates.length === 0) continue;
+        const expansionPrompt =
+          /\b(?:either|both|all|each|every|switch(?:es)?|lights?|phases?|outputs?|inputs?|sensors?)\b/i.test(
+            resolvedPhrase
+          ) ||
+          /\b(?:either|both|all|each|every|switch(?:es)?|lights?|phases?|outputs?|inputs?|sensors?)\b/i.test(
+            text
+          )
+            ? `all ${resolvedPhrase}`
+            : resolvedPhrase;
+        const expanded = this._expandEntityFamilies(
+          expansionPrompt,
+          candidates,
+          pool
+        );
+        (expanded.length > 0 ? expanded : candidates).forEach((entity) => {
+          if (!entity?.entity_id) return;
+          guards.push({
+            entity_id: entity.entity_id,
+            blockedState,
+            requiredState: this._invertEntityState(blockedState),
+          });
         });
       }
     });
 
     return guards.filter(
-      (guard, index, items) =>
-        items.findIndex((candidate) => candidate.entity_id === guard.entity_id) ===
-        index
+      (guard, index, items) => {
+        const key = `${guard.entity_id}\u0000${guard.blockedState}\u0000${guard.requiredState}`;
+        return (
+          items.findIndex(
+            (candidate) =>
+              `${candidate.entity_id}\u0000${candidate.blockedState}\u0000${candidate.requiredState}` ===
+              key
+          ) === index
+        );
+      }
     );
   }
 

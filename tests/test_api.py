@@ -14,6 +14,7 @@ from custom_components.automagic.api import (
     AutoMagicGenerateView,
     AutoMagicGenerateStatusView,
     AutoMagicHistoryEntryView,
+    _extract_explicit_state_guards,
     _build_yaml_regeneration_messages,
     _build_yaml_repair_hints,
     _build_yaml_repair_messages,
@@ -1662,8 +1663,93 @@ def test_collect_generated_yaml_issues_flags_semantic_mismatches_for_vacuum_prom
         'value_template: "{{ states(\'sensor.iphone_13_audio_output\') != \'Speaker\' }}"'
         in negated_guard_issue
     )
+    assert any("Include the resolved entity light.bar_lamp." in issue for issue in issues)
     assert any("Respect the explicit guard switch.router_led_right" in issue for issue in issues)
+    assert any(
+        "Preserve ALL resolved guard entities: switch.router_led_right. The prompt said 'either' meaning both switches must be present as separate conditions."
+        in issue
+        for issue in issues
+    )
     assert any("color_name values should not use underscore-separated names" in issue for issue in issues)
+
+
+def test_collect_generated_yaml_issues_flags_nested_trigger_weekday_action_condition_and_kelvin():
+    """Static YAML checks should catch new malformed structures even without entity context."""
+    yaml_text = (
+        "alias: Broken Example\n"
+        "weekday:\n"
+        "  - mon\n"
+        "triggers:\n"
+        "  - trigger:\n"
+        "      platform: time\n"
+        '      at: "08:00:00"\n'
+        "actions:\n"
+        "  - condition: state\n"
+        "    entity_id: light.test\n"
+        '    state: "on"\n'
+        "  - action: light.turn_on\n"
+        "    target:\n"
+        "      entity_id: light.test\n"
+        "    data:\n"
+        "      color_temp: 2700\n"
+        "mode: single\n"
+    )
+
+    issues = _collect_generated_yaml_issues("", [], yaml_text)
+
+    assert (
+        "'weekday:' is not a valid top-level automation key. Weekday restrictions must go inside a 'condition: time' block under conditions: or inside a trigger's 'at:' schedule."
+        in issues
+    )
+    assert (
+        "Trigger 0: 'trigger:' must be a plain string like 'trigger: time', not a nested mapping. Found 'trigger:' used as a block instead of a scalar."
+        in issues
+    )
+    assert (
+        "Action 0: bare 'condition:' inside actions: is not valid flow control. Use a 'choose:' block with a 'conditions:' list and 'sequence:' to branch, or move the condition to the top-level conditions: block."
+        in issues
+    )
+    assert (
+        "color_temp value 2700 looks like Kelvin. color_temp must be in mireds (153-500). Convert Kelvin to mireds with: mireds = round(1000000 / kelvin). For warm white 2700K use color_temp: 370, for 3000K use color_temp: 333."
+        in issues
+    )
+
+
+def test_extract_explicit_state_guards_matches_either_router_led_switch_phrase():
+    """The explicit guard extractor should resolve both router LED switches from 'either ... are already off'."""
+    prompt = (
+        "Don't start it at all if either of the router LED switches are already off, "
+        "as that means the network is down."
+    )
+    entities = [
+        {
+            "entity_id": "switch.main_router_led",
+            "name": "Main Router LED",
+            "state": "on",
+            "domain": "switch",
+        },
+        {
+            "entity_id": "switch.mesh_mesh_led",
+            "name": "Mesh Router LED",
+            "state": "on",
+            "domain": "switch",
+        },
+    ]
+
+    guards = _extract_explicit_state_guards(prompt, entities)
+
+    assert guards == [
+        {
+            "entity_id": "switch.main_router_led",
+            "blocked_state": "off",
+            "required_state": "on",
+        },
+        {
+            "entity_id": "switch.mesh_mesh_led",
+            "blocked_state": "off",
+            "required_state": "on",
+        },
+    ]
 
 
 def test_extract_negated_state_guards_matches_iphone_audio_output_phrase():
@@ -1745,6 +1831,45 @@ def test_negated_state_guard_repairs_include_concrete_yaml_examples():
         'value_template: "{{ states(\'sensor.iphone_13_audio_output\') != \'Speaker\' }}"'
         in regeneration_messages[-1]["content"]
     )
+
+
+def test_yaml_repair_hints_include_concrete_examples_for_new_issue_types():
+    """The repair user message should include concrete YAML snippets for each new issue type."""
+    issues = [
+        "Trigger 0: 'trigger:' must be a plain string like 'trigger: time', not a nested mapping. Found 'trigger:' used as a block instead of a scalar.",
+        "'weekday:' is not a valid top-level automation key. Weekday restrictions must go inside a 'condition: time' block under conditions: or inside a trigger's 'at:' schedule.",
+        "color_temp value 2700 looks like Kelvin. color_temp must be in mireds (153-500). Convert Kelvin to mireds with: mireds = round(1000000 / kelvin). For warm white 2700K use color_temp: 370, for 3000K use color_temp: 333.",
+        "Action 0: bare 'condition:' inside actions: is not valid flow control. Use a 'choose:' block with a 'conditions:' list and 'sequence:' to branch, or move the condition to the top-level conditions: block.",
+        "Preserve ALL resolved guard entities: switch.main_router_led, switch.mesh_mesh_led. The prompt said 'either' meaning both switches must be present as separate conditions.",
+    ]
+    request_messages = [{"role": "user", "content": "prompt"}]
+    result = {
+        "yaml": "alias: Test\ndescription: Test\ntriggers: []\nconditions: []\nactions: []\nmode: single\n",
+        "summary": "Test automation",
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+
+    hints = _build_yaml_repair_hints(issues)
+    repair_messages = _build_yaml_repair_messages(
+        request_messages,
+        result,
+        issues,
+        attempt_number=2,
+    )
+
+    assert any("Correct trigger syntax:" in hint for hint in hints)
+    assert any("Weekday restrictions must be a condition: time block like this:" in hint for hint in hints)
+    assert any("Use mired color_temp values like this:" in hint for hint in hints)
+    assert any("Use choose for action-time branching like this:" in hint for hint in hints)
+    assert any("Keep both guard switches as separate conditions like this:" in hint for hint in hints)
+    assert "Correct trigger syntax:" in repair_messages[-1]["content"]
+    assert "Weekday restrictions must be a condition: time block like this:" in repair_messages[-1]["content"]
+    assert "Use mired color_temp values like this:" in repair_messages[-1]["content"]
+    assert "Use choose for action-time branching like this:" in repair_messages[-1]["content"]
+    assert "Keep both guard switches as separate conditions like this:" in repair_messages[-1]["content"]
+    assert "entity_id: switch.main_router_led" in repair_messages[-1]["content"]
+    assert "entity_id: switch.mesh_mesh_led" in repair_messages[-1]["content"]
 
 
 @pytest.mark.asyncio

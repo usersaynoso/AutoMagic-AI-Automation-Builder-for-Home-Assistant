@@ -22,6 +22,9 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .automation_writer import (
     AutomationValidationError,
+    _TOP_LEVEL_WEEKDAY_ERROR,
+    _bare_action_condition_error,
+    _nested_trigger_mapping_error,
     install_automation,
     validate_automation,
 )
@@ -597,6 +600,31 @@ def _build_negated_state_guard_example_block(
     return "Concrete YAML examples for blocked-state guards:\n" + "\n\n".join(blocks)
 
 
+def _extract_multi_entity_guard_issue_entity_ids(
+    issues: str | list[str] | tuple[str, ...] | set[str] | None,
+    *,
+    limit: int = 2,
+) -> list[str]:
+    """Extract guard entity ids referenced in multi-entity guard repair issues."""
+    entity_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for issue in _normalize_issue_list(issues, limit=10):
+        if (
+            "preserve all resolved guard entities" not in issue.lower()
+            and "respect the explicit guard" not in issue.lower()
+        ):
+            continue
+        for entity_id in re.findall(r"[a-z0-9_]+\.[a-z0-9_]+", issue, re.IGNORECASE):
+            normalized = str(entity_id or "").strip()
+            if not normalized or normalized in seen_ids:
+                continue
+            entity_ids.append(normalized)
+            seen_ids.add(normalized)
+            if len(entity_ids) >= limit:
+                return entity_ids
+    return entity_ids
+
+
 def _build_yaml_repair_hints(issues: list[str]) -> list[str]:
     """Return generic repair guidance derived from the current issue set."""
     combined = " ".join(_normalize_issue_list(issues, limit=12)).lower()
@@ -622,9 +650,49 @@ def _build_yaml_repair_hints(issues: list[str]) -> list[str]:
         hints.append(
             "Return syntactically valid YAML with correct indentation, list markers, and quoting."
         )
+    if "must be a plain string like 'trigger: time'" in combined:
+        hints.append(
+            "Correct trigger syntax:\n"
+            "  triggers:\n"
+            "    - trigger: time\n"
+            '      at: "08:00:00"'
+        )
+    if "'weekday:' is not a valid top-level automation key" in combined:
+        hints.append(
+            "Weekday restrictions must be a condition: time block like this:\n"
+            "  - condition: time\n"
+            "    weekday:\n"
+            "      - mon\n"
+            "      - tue\n"
+            "      - wed\n"
+            "      - thu\n"
+            "      - fri"
+        )
     if "weekday schedule" in combined:
         hints.append(
             "Preserve requested weekday restrictions explicitly in weekday: or an equivalent weekday condition."
+        )
+    if "looks like kelvin" in combined and "color_temp" in combined:
+        hints.append(
+            "Use mired color_temp values like this:\n"
+            "  - action: light.turn_on\n"
+            "    target:\n"
+            "      entity_id: light.example\n"
+            "    data:\n"
+            "      color_temp: 370"
+        )
+    if "bare 'condition:' inside actions:" in combined:
+        hints.append(
+            "Use choose for action-time branching like this:\n"
+            "  - choose:\n"
+            "      - conditions:\n"
+            "          - condition: state\n"
+            "            entity_id: binary_sensor.example\n"
+            '            state: "on"\n'
+            "        sequence:\n"
+            "          - action: light.turn_on\n"
+            "            target:\n"
+            "              entity_id: light.example"
         )
     negated_guard_specs = _extract_negated_state_guard_issue_specs(issues, limit=4)
     if negated_guard_specs:
@@ -646,6 +714,19 @@ def _build_yaml_repair_hints(issues: list[str]) -> list[str]:
     if "color_name values should not use underscore" in combined:
         hints.append(
             "Use valid light color fields such as kelvin, color_temp, rgb_color, or a supported CSS color_name."
+        )
+    if "preserve all resolved guard entities" in combined:
+        guard_entity_ids = _extract_multi_entity_guard_issue_entity_ids(issues, limit=2)
+        if len(guard_entity_ids) < 2:
+            guard_entity_ids = ["switch.main_router_led", "switch.mesh_mesh_led"]
+        hints.append(
+            "Keep both guard switches as separate conditions like this:\n"
+            "  - condition: state\n"
+            f"    entity_id: {guard_entity_ids[0]}\n"
+            '    state: "on"\n'
+            "  - condition: state\n"
+            f"    entity_id: {guard_entity_ids[1]}\n"
+            '    state: "on"'
         )
     return list(dict.fromkeys(hints))
 
@@ -1265,6 +1346,45 @@ def _yaml_has_negated_state_guard(
     return any(re.search(pattern, yaml_text, re.IGNORECASE) for pattern in patterns)
 
 
+def _collect_static_generated_yaml_issues(
+    normalized_yaml: str,
+    parsed: Any,
+) -> list[str]:
+    """Collect prompt-independent YAML issues from the generated draft."""
+    issues: list[str] = []
+
+    if isinstance(parsed, dict):
+        if "weekday" in parsed:
+            issues.append(_TOP_LEVEL_WEEKDAY_ERROR)
+
+        triggers = parsed.get("triggers")
+        if isinstance(triggers, list):
+            for index, trigger_item in enumerate(triggers):
+                if (
+                    isinstance(trigger_item, dict)
+                    and isinstance(trigger_item.get("trigger"), dict)
+                ):
+                    issues.append(_nested_trigger_mapping_error(index))
+
+        actions = parsed.get("actions")
+        if isinstance(actions, list):
+            for index, action_item in enumerate(actions):
+                if isinstance(action_item, dict) and "condition" in action_item:
+                    issues.append(_bare_action_condition_error(index))
+
+    for match in re.finditer(r"\bcolor_temp\s*:\s*(\d+)\b", normalized_yaml, re.IGNORECASE):
+        value = int(match.group(1))
+        if value <= 1000:
+            continue
+        issues.append(
+            f"color_temp value {value} looks like Kelvin. color_temp must be in mireds "
+            "(153-500). Convert Kelvin to mireds with: mireds = round(1000000 / kelvin). "
+            "For warm white 2700K use color_temp: 370, for 3000K use color_temp: 333."
+        )
+
+    return issues
+
+
 def _collect_generated_yaml_issues(
     prompt_text: str,
     entities: list[dict[str, Any]],
@@ -1277,14 +1397,32 @@ def _collect_generated_yaml_issues(
         issues.append(syntax_issue)
 
     normalized_yaml = _normalize_automation_yaml_text(yaml_text)
+    parsed_yaml: Any = None
+    if normalized_yaml:
+        try:
+            parsed_yaml = yaml.safe_load(normalized_yaml)
+        except yaml.YAMLError:
+            parsed_yaml = None
+    issues.extend(_collect_static_generated_yaml_issues(normalized_yaml, parsed_yaml))
+
     if not normalized_yaml or not prompt_text or not entities:
         return list(dict.fromkeys(issue for issue in issues if issue))
+
+    yaml_entity_ids = _extract_entity_ids_from_yaml(normalized_yaml)
+    known_prompt_entity_ids = {
+        str(entity.get("entity_id") or "").strip()
+        for entity in entities
+        if str(entity.get("entity_id") or "").strip()
+    }
+    has_unknown_entity_ids = any(
+        entity_id not in known_prompt_entity_ids for entity_id in yaml_entity_ids
+    )
 
     if re.search(r"\b(notify|notification|iphone|phone|mobile)\b", prompt_text, re.IGNORECASE):
         notify_matches = _relevant_domain_matches(prompt_text, entities, "notify", 1, 4)
         if notify_matches:
             notify_entity_id = str(notify_matches[0].get("entity_id") or "").strip()
-            if notify_entity_id and notify_entity_id not in normalized_yaml:
+            if notify_entity_id and notify_entity_id not in yaml_entity_ids:
                 issues.append(f"Use the resolved notification target {notify_entity_id}.")
 
     weekdays = _extract_weekdays(prompt_text)
@@ -1293,17 +1431,12 @@ def _collect_generated_yaml_issues(
             "Preserve the requested weekday schedule in the automation trigger or guard."
         )
 
-    for guard in _extract_explicit_state_guards(prompt_text, entities):
-        entity_id = guard["entity_id"]
-        blocked_state = guard["blocked_state"]
-        required_state = guard["required_state"]
-        if required_state and _yaml_has_positive_state_guard(
-            normalized_yaml, entity_id, required_state
-        ):
-            continue
-        if _yaml_has_negated_state_guard(normalized_yaml, entity_id, blocked_state):
-            continue
-        issues.append(f"Respect the explicit guard {entity_id} before running the actions.")
+    explicit_state_guards = _extract_explicit_state_guards(prompt_text, entities)
+    guarded_entity_ids = {
+        str(guard.get("entity_id") or "").strip()
+        for guard in explicit_state_guards
+        if str(guard.get("entity_id") or "").strip()
+    }
 
     for guard in _extract_negated_state_guards(prompt_text, entities):
         if _yaml_has_negated_state_guard(
@@ -1315,6 +1448,68 @@ def _collect_generated_yaml_issues(
                 guard["entity_id"], guard["state"]
             )
         )
+
+    if not has_unknown_entity_ids:
+        for entity in _find_obvious_named_entities(prompt_text, entities, 20):
+            entity_id = str(entity.get("entity_id") or "").strip()
+            domain = str(entity.get("domain") or "").strip()
+            if (
+                not entity_id
+                or entity_id in guarded_entity_ids
+                or domain
+                not in {
+                    "climate",
+                    "cover",
+                    "fan",
+                    "input_boolean",
+                    "light",
+                    "lock",
+                    "media_player",
+                    "switch",
+                    "vacuum",
+                }
+            ):
+                continue
+            if entity_id not in yaml_entity_ids:
+                issues.append(f"Include the resolved entity {entity_id}.")
+
+    for guard in explicit_state_guards:
+        entity_id = guard["entity_id"]
+        blocked_state = guard["blocked_state"]
+        required_state = guard["required_state"]
+        if required_state and _yaml_has_positive_state_guard(
+            normalized_yaml, entity_id, required_state
+        ):
+            continue
+        if _yaml_has_negated_state_guard(normalized_yaml, entity_id, blocked_state):
+            continue
+        issues.append(f"Respect the explicit guard {entity_id} before running the actions.")
+
+    if (
+        re.search(r"\beither\b", prompt_text, re.IGNORECASE)
+        and re.search(r"\b(router\s+led|network\s+is\s+down)\b", prompt_text, re.IGNORECASE)
+    ):
+        resolved_guard_ids = [
+            entity_id
+            for entity_id in dict.fromkeys(
+                guard["entity_id"] for guard in explicit_state_guards if guard.get("entity_id")
+            )
+            if entity_id
+        ]
+        present_guard_ids = [entity_id for entity_id in resolved_guard_ids if entity_id in yaml_entity_ids]
+        missing_guard_ids = [
+            entity_id for entity_id in resolved_guard_ids if entity_id not in yaml_entity_ids
+        ]
+        if (
+            len(resolved_guard_ids) > 1
+            and present_guard_ids
+            and missing_guard_ids
+        ):
+            issues.append(
+                "Preserve ALL resolved guard entities: "
+                f"{', '.join(missing_guard_ids)}. "
+                "The prompt said 'either' meaning both switches must be present as separate conditions."
+            )
 
     if re.search(
         r"\bcolor_name:\s*['\"]?[a-z0-9]+_[a-z0-9_]+['\"]?",

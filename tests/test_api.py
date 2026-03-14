@@ -968,6 +968,106 @@ async def test_run_generation_job_repair_failure_includes_helpful_detail():
     assert job.get("detail"), "detail should be set when repair fails"
     assert "correction" in job["detail"].lower() or "repair" in job["detail"].lower() or "formatting" in job["detail"].lower()
 
+
+@pytest.mark.asyncio
+async def test_run_generation_job_retries_with_specific_error_after_invalid_regeneration():
+    """If regeneration still returns invalid YAML, the backend should send that new error back for correction."""
+    hass = _make_hass()
+    job = _create_generation_job(hass, "Turn on the kitchen lights after five minutes", ["light"])
+
+    entities = [
+        {"entity_id": "light.kitchen", "name": "Kitchen", "state": "off", "domain": "light"},
+    ]
+    invalid_delay_yaml = {
+        "yaml": (
+            "alias: Kitchen Lights\n"
+            "description: Broken delay draft.\n"
+            "triggers:\n"
+            "  - trigger: state\n"
+            "    entity_id: light.kitchen\n"
+            '    to: "on"\n'
+            "conditions: []\n"
+            "actions:\n"
+            "  - action: delay\n"
+            "    data:\n"
+            '      duration: "00:05:00"\n'
+            "  - action: light.turn_on\n"
+            "    target:\n"
+            "      entity_id: light.kitchen\n"
+            "mode: single\n"
+        ),
+        "summary": "Broken delay draft",
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+    valid_yaml = {
+        "yaml": (
+            "alias: Kitchen Lights\n"
+            "description: Turns on the kitchen lights five minutes after the trigger.\n"
+            "triggers:\n"
+            "  - trigger: state\n"
+            "    entity_id: light.kitchen\n"
+            '    to: "on"\n'
+            "conditions: []\n"
+            "actions:\n"
+            '  - delay: "00:05:00"\n'
+            "  - action: light.turn_on\n"
+            "    target:\n"
+            "      entity_id: light.kitchen\n"
+            "mode: single\n"
+        ),
+        "summary": "Turns on the kitchen lights five minutes after the trigger.",
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+    fake_client = MagicMock()
+    fake_client._request_timeout = 420
+    fake_client.complete = AsyncMock(
+        side_effect=[
+            invalid_delay_yaml,
+            invalid_delay_yaml,
+            invalid_delay_yaml,
+            invalid_delay_yaml,
+            valid_yaml,
+        ]
+    )
+
+    with patch(
+        "custom_components.automagic.api.get_entity_context",
+        AsyncMock(return_value=entities),
+    ), patch(
+        "custom_components.automagic.api.build_prompt",
+        return_value=[
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "prompt"},
+        ],
+    ), patch(
+        "custom_components.automagic.api.async_get_clientsession",
+        return_value=MagicMock(),
+    ), patch(
+        "custom_components.automagic.api.LLMClient.from_config",
+        return_value=fake_client,
+    ):
+        await _run_generation_job(
+            hass,
+            job["job_id"],
+            "Turn on the kitchen lights after five minutes",
+            ["light"],
+        )
+
+    assert job["status"] == "completed"
+    assert _validate_generated_yaml(job["yaml"]) is None
+    assert '  - delay: "00:05:00"' in job["yaml"]
+    assert fake_client.complete.await_count == 5
+
+    follow_up_repair_messages = fake_client.complete.await_args_list[4].args[0]
+    assert follow_up_repair_messages[-1]["role"] == "user"
+    assert "Problems to fix: Action 0: 'delay'" in follow_up_repair_messages[-1]["content"]
+    assert "regenerate the full automation JSON" not in follow_up_repair_messages[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_run_generation_job_retries_clean_regeneration_after_response_parsing_failure():
     """Initial response parsing failures should trigger one clean regeneration pass before erroring."""
     hass = _make_hass()
     job = _create_generation_job(hass, "Turn on the kitchen lights", ["light"])
@@ -1712,6 +1812,151 @@ async def test_generate_view_can_continue_after_clarification():
         "role": "user",
         "content": "Use light.kitchen.",
     }
+
+
+@pytest.mark.asyncio
+async def test_generate_view_can_continue_after_completed_yaml_preview():
+    """Follow-up change requests should resume the completed YAML thread with the prior automation context."""
+    hass = _make_hass()
+    hass.async_create_task = MagicMock(return_value=MagicMock())
+
+    parent_job = _create_generation_job(
+        hass,
+        "Turn on the kitchen lights at 10am every day",
+        ["light"],
+        conversation_messages=[
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "Turn on the kitchen lights at 10am every day"},
+        ],
+        root_prompt="Turn on the kitchen lights at 10am every day",
+    )
+    parent_job["status"] = "completed"
+    parent_job["yaml"] = (
+        "alias: Kitchen Lights\n"
+        "description: Turns on the kitchen lights at 10:00 every day.\n"
+        "triggers:\n"
+        "  - trigger: time\n"
+        '    at: "10:00:00"\n'
+        "conditions: []\n"
+        "actions:\n"
+        "  - action: light.turn_on\n"
+        "    target:\n"
+        "      entity_id: light.kitchen\n"
+        "mode: single\n"
+    )
+    parent_job["summary"] = "Turns on the kitchen lights at 10:00 every day."
+
+    request = FakeRequest(
+        hass,
+        body={
+            "prompt": "Change it to 11am instead.",
+            "continue_job_id": parent_job["job_id"],
+        },
+    )
+    view = AutoMagicGenerateView()
+    view.json = lambda data, status_code=200: {"status_code": status_code, **data}
+
+    with patch(
+        "custom_components.automagic.api._run_generation_job",
+        AsyncMock(),
+    ):
+        result = await view.post(request)
+
+    assert result["status_code"] == 202
+    jobs = hass.data[f"{DOMAIN}_generation_jobs"]
+    child_job = jobs[result["job_id"]]
+    assert child_job["root_prompt"] == "Turn on the kitchen lights at 10am every day"
+    assert child_job["conversation_messages"][-2]["role"] == "assistant"
+    assert "Current automation YAML:" in child_job["conversation_messages"][-2]["content"]
+    assert 'at: "10:00:00"' in child_job["conversation_messages"][-2]["content"]
+    assert child_job["conversation_messages"][-1] == {
+        "role": "user",
+        "content": "Change it to 11am instead.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_generation_job_skips_deterministic_shortcut_for_follow_up_threads():
+    """Follow-up threads should use the stored conversation context instead of regenerating from the original prompt."""
+    hass = _make_hass()
+    job = _create_generation_job(
+        hass,
+        "Turn on the kitchen lights at 10am every day",
+        ["light"],
+        conversation_messages=[
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "Turn on the kitchen lights at 10am every day"},
+            {
+                "role": "assistant",
+                "content": (
+                    "Summary:\nTurns on the kitchen lights at 10:00 every day.\n\n"
+                    "Current automation YAML:\n"
+                    "alias: Kitchen Lights\n"
+                    "description: Turns on the kitchen lights at 10:00 every day.\n"
+                    "triggers:\n"
+                    "  - trigger: time\n"
+                    '    at: "10:00:00"\n'
+                    "conditions: []\n"
+                    "actions:\n"
+                    "  - action: light.turn_on\n"
+                    "    target:\n"
+                    "      entity_id: light.kitchen\n"
+                    "mode: single\n"
+                ),
+            },
+            {"role": "user", "content": "Change it to 11am instead."},
+        ],
+        root_prompt="Turn on the kitchen lights at 10am every day",
+    )
+
+    entities = [
+        {"entity_id": "light.kitchen", "name": "Kitchen", "state": "off", "domain": "light"},
+    ]
+    fake_client = MagicMock()
+    fake_client._request_timeout = 420
+    fake_client.complete = AsyncMock(
+        return_value={
+            "yaml": (
+                "alias: Kitchen Lights\n"
+                "description: Turns on the kitchen lights at 11:00 every day.\n"
+                "triggers:\n"
+                "  - trigger: time\n"
+                '    at: "11:00:00"\n'
+                "conditions: []\n"
+                "actions:\n"
+                "  - action: light.turn_on\n"
+                "    target:\n"
+                "      entity_id: light.kitchen\n"
+                "mode: single\n"
+            ),
+            "summary": "Turns on the kitchen lights at 11:00 every day.",
+            "needs_clarification": False,
+            "clarifying_questions": [],
+        }
+    )
+
+    with patch(
+        "custom_components.automagic.api.get_entity_context",
+        AsyncMock(return_value=entities),
+    ), patch(
+        "custom_components.automagic.api.async_get_clientsession",
+        return_value=MagicMock(),
+    ), patch(
+        "custom_components.automagic.api.LLMClient.from_config",
+        return_value=fake_client,
+    ):
+        await _run_generation_job(
+            hass,
+            job["job_id"],
+            "Turn on the kitchen lights at 10am every day",
+            ["light"],
+        )
+
+    assert job["status"] == "completed"
+    assert 'at: "11:00:00"' in job["yaml"]
+    assert fake_client.complete.await_count == 1
+    assert job["conversation_messages"][-1]["role"] == "assistant"
+    assert 'at: "11:00:00"' in job["conversation_messages"][-1]["content"]
 
 
 @pytest.mark.asyncio

@@ -5944,9 +5944,13 @@ class AutoMagicCard extends LitElement {
 
     try {
       const continueBackendJobId =
-        previousState === STATES.CLARIFY &&
         previousGenerationJobId &&
-        !previousConversationMessages
+        !previousConversationMessages &&
+        [
+          STATES.CLARIFY,
+          STATES.PREVIEW,
+          STATES.SUCCESS,
+        ].includes(previousState)
           ? previousGenerationJobId
           : "";
       const canUseDirectFallback = this._canUseDirectGenerationFallback();

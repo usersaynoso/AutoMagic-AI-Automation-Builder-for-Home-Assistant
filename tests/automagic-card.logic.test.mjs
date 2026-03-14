@@ -2914,6 +2914,14 @@ test("System prompt instructs the model to handle follow-up edits and questions"
   assert.match(cardSource, /boolean logic exactly/i);
 });
 
+test("Backend follow-ups keep the completed YAML thread alive after preview or install", () => {
+  assert.match(
+    cardSource,
+    /STATES\.CLARIFY,\s*[\s\S]*STATES\.PREVIEW,\s*[\s\S]*STATES\.SUCCESS/
+  );
+  assert.match(cardSource, /continue_job_id/);
+});
+
 test("Direct generation source prefers the resolved final pass for very complex prompts", () => {
   assert.match(cardSource, /_shouldPreferResolvedFinalPass\(prompt\)/);
   assert.match(cardSource, /_shouldPreferYamlOnlyResolvedPass\(/);

@@ -111,6 +111,8 @@ Use Home Assistant 2024.10+ syntax only.
 - Use action: inside action items, not service:.
 - action values must be exactly <domain>.<service_name> (e.g. light.turn_on, notify.mobile_app_iphone). \
 Never include an entity_id in the action value. Use a separate target: entity_id: field instead.
+- Script steps such as delay, wait_for_trigger, wait_template, choose, if, repeat, variables, stop, event, and scene must use their own YAML keys. \
+For example use - delay: "00:05:00", not - action: delay.
 - Include description:, triggers:, conditions:, actions:, and mode:.
 - Do not wrap the YAML in markdown fences, yaml:, automation:, or a list item.
 - Put notify text under data: with a message key.
@@ -127,6 +129,8 @@ Use Home Assistant 2024.10+ syntax only.
 - Use action: inside action items, not service:.
 - action values must be exactly <domain>.<service_name> (e.g. light.turn_on, notify.mobile_app_iphone). \
 Never include an entity_id in the action value. Use a separate target: entity_id: field instead.
+- Script steps such as delay, wait_for_trigger, wait_template, choose, if, repeat, variables, stop, event, and scene must use their own YAML keys. \
+For example use - delay: "00:05:00", not - action: delay.
 - Do not wrap the YAML in markdown fences, yaml:, automation:, or a list item.
 - Put notify text under data: with a message key.
 - Preserve the user's thresholds, guards, delays, entities, and notification text.
@@ -142,6 +146,8 @@ Use Home Assistant 2024.10+ syntax only.
 - Use action: inside action items, not service:.
 - action values must be exactly <domain>.<service_name> (e.g. light.turn_on, notify.mobile_app_iphone). \
 Never include an entity_id in the action value. Use a separate target: entity_id: field instead.
+- Script steps such as delay, wait_for_trigger, wait_template, choose, if, repeat, variables, stop, event, and scene must use their own YAML keys. \
+For example use - delay: "00:05:00", not - action: delay.
 - Include description:, triggers:, conditions:, actions:, and mode:.
 - Do not wrap the YAML in markdown fences, yaml:, automation:, or a list item.
 - Put notify text under data: with a message key.
@@ -161,6 +167,8 @@ Use Home Assistant 2024.10+ syntax only.
 - Use action: inside action items, not service:.
 - action values must be exactly <domain>.<service_name> (e.g. light.turn_on, notify.mobile_app_iphone). \
 Never include an entity_id in the action value. Use a separate target: entity_id: field instead.
+- Script steps such as delay, wait_for_trigger, wait_template, choose, if, repeat, variables, stop, event, and scene must use their own YAML keys. \
+For example use - delay: "00:05:00", not - action: delay.
 - Include description:, triggers:, conditions:, actions:, and mode:.
 - Do not wrap the YAML in markdown fences, yaml:, automation:, or a list item.
 - Put notify text under data: with a message key.
@@ -445,6 +453,40 @@ def _build_clarification_message(
     return "\n\n".join(part for part in parts if part).strip()
 
 
+def _build_automation_context_message(summary: str, yaml_text: str) -> str:
+    """Build a plain-text assistant turn that preserves the current YAML for follow-ups."""
+    parts: list[str] = []
+    summary_text = str(summary or "").strip()
+    normalized_yaml = _normalize_automation_yaml_text(yaml_text)
+
+    if summary_text:
+        parts.append(f"Summary:\n{summary_text}")
+    if normalized_yaml:
+        parts.append(f"Current automation YAML:\n{normalized_yaml}")
+
+    return "\n\n".join(part for part in parts if part).strip()
+
+
+def _append_assistant_turn(
+    job: dict[str, Any],
+    assistant_message: str,
+) -> None:
+    """Append an assistant turn to the stored conversation if it is not already present."""
+    message_text = str(assistant_message or "").strip()
+    if not message_text:
+        return
+
+    messages = _clone_messages(job.get("conversation_messages")) or []
+    if messages and messages[-1].get("role") == "assistant" and messages[-1].get(
+        "content"
+    ) == message_text:
+        job["conversation_messages"] = messages
+        return
+
+    messages.append({"role": "assistant", "content": message_text})
+    job["conversation_messages"] = messages
+
+
 def _mark_job_running(job: dict[str, Any], message: str, detail: str) -> None:
     """Update a generation job as actively running."""
     now_iso = _utcnow_iso()
@@ -481,7 +523,12 @@ def _mark_job_complete(
     job["summary"] = result.get("summary", "")
     job["clarifying_questions"] = []
     job["entities_used"] = entities_used
-    job["assistant_message"] = None
+    assistant_message = _build_automation_context_message(
+        job["summary"],
+        job["yaml"],
+    )
+    job["assistant_message"] = assistant_message or None
+    _append_assistant_turn(job, assistant_message)
     job["error"] = None
 
 
@@ -1304,6 +1351,7 @@ async def _regenerate_generation_result(
 ) -> dict[str, Any]:
     """Regenerate a clean automation from the original request when repair is exhausted."""
     last_issue = str(issue or "").strip() or "The model returned invalid automation YAML."
+    last_result: dict[str, Any] | None = None
     for _attempt in range(_YAML_REGENERATION_ATTEMPTS):
         regenerated = _normalize_generation_result(
             await client.complete(
@@ -1312,9 +1360,24 @@ async def _regenerate_generation_result(
         )
         if regenerated.get("needs_clarification"):
             return regenerated
+        last_result = regenerated
         last_issue = _validate_generated_yaml(regenerated.get("yaml", "")) or ""
         if not last_issue:
             return regenerated
+
+    current = last_result
+    if current is not None and last_issue:
+        for _attempt in range(_YAML_REPAIR_ATTEMPTS):
+            current = _normalize_generation_result(
+                await client.complete(
+                    _build_yaml_repair_messages(request_messages, current, last_issue)
+                )
+            )
+            if current.get("needs_clarification"):
+                return current
+            last_issue = _validate_generated_yaml(current.get("yaml", "")) or ""
+            if not last_issue:
+                return current
 
     raise LLMResponseError(
         last_issue or "The model returned invalid automation YAML."
@@ -1448,20 +1511,19 @@ async def _run_generation_job(
         for entity in prompt_entities
     )
 
-    deterministic_result = _build_deterministic_generation_result(
-        prompt_text,
-        prompt_entities,
-    )
-    if deterministic_result is not None:
-        _mark_job_complete(
-            job,
-            deterministic_result,
-            [entity["entity_id"] for entity in prompt_entities],
-        )
-        return
-
     messages = _clone_messages(job.get("conversation_messages"))
     if not messages:
+        deterministic_result = _build_deterministic_generation_result(
+            prompt_text,
+            prompt_entities,
+        )
+        if deterministic_result is not None:
+            _mark_job_complete(
+                job,
+                deterministic_result,
+                [entity["entity_id"] for entity in prompt_entities],
+            )
+            return
         messages = build_prompt(prompt_text, entity_summary, prompt_entities)
     job["conversation_messages"] = _clone_messages(messages)
 
@@ -1756,14 +1818,40 @@ async def async_start_generation_request(
             return {"error": "Clarification request not found"}, 404
 
         _sync_job_with_task(parent_job)
-        if parent_job.get("status") != "needs_clarification":
+        parent_status = str(parent_job.get("status") or "").strip()
+        if parent_status not in {"needs_clarification", "completed"}:
             return {
-                "error": "That request is not waiting for clarification anymore"
+                "error": "That request is not available for follow-up anymore"
             }, 400
 
         base_messages = _clone_messages(parent_job.get("conversation_messages"))
+        if parent_status == "completed":
+            assistant_message = _build_automation_context_message(
+                str(parent_job.get("summary") or ""),
+                str(parent_job.get("yaml") or ""),
+            )
+            if assistant_message:
+                if base_messages is None:
+                    original_prompt = str(
+                        parent_job.get("root_prompt")
+                        or parent_job.get("prompt")
+                        or ""
+                    ).strip()
+                    base_messages = [
+                        {"role": "user", "content": original_prompt},
+                    ]
+                if not (
+                    base_messages
+                    and base_messages[-1].get("role") == "assistant"
+                    and base_messages[-1].get("content") == assistant_message
+                ):
+                    base_messages = [
+                        *(base_messages or []),
+                        {"role": "assistant", "content": assistant_message},
+                    ]
+
         if not base_messages:
-            return {"error": "Unable to resume the clarification thread"}, 400
+            return {"error": "Unable to resume the follow-up thread"}, 400
 
         conversation_messages = base_messages + [
             {"role": "user", "content": prompt_text}

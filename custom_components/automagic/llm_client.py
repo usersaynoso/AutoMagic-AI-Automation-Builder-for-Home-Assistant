@@ -47,6 +47,7 @@ _FIELD_LINE_RE = re.compile(
 _PLAIN_SCALAR_LINE_RE = re.compile(
     r"^(\s*(?:-\s+)?[A-Za-z_][A-Za-z0-9_]*\s*:\s*)(.+?)\s*$"
 )
+_ALWAYS_QUOTE_SCALAR_KEYS = frozenset({"description", "message"})
 
 STATUS_PROBE_TIMEOUT = 5
 COMPLETION_RETRY_ATTEMPTS = 3
@@ -303,8 +304,45 @@ def _sanitize_plain_yaml_scalars(text: str) -> str:
     if not re.search(r"^\s*(?:-\s*)?alias\s*:", normalized, re.MULTILINE):
         return normalized
 
+    # De-indent: when model output is extracted from a ``yaml:`` wrapper,
+    # ``.strip()`` (inside ``_normalize_text``) removes the leading
+    # whitespace of the very first line but leaves all subsequent lines at
+    # their original deeper indentation.  Detect this by comparing the
+    # first non-empty line's indent (0 after strip) to the minimum indent
+    # of the remaining non-empty lines and shift everything down.
+    lines = normalized.splitlines()
+    non_empty = [line for line in lines if line.strip()]
+    if len(non_empty) > 1:
+        first_indent = len(non_empty[0]) - len(non_empty[0].lstrip())
+        rest_indents = [
+            len(line) - len(line.lstrip()) for line in non_empty[1:]
+        ]
+        min_rest_indent = min(rest_indents)
+        if first_indent == 0 and min_rest_indent > 0:
+            lines = [
+                line[min_rest_indent:]
+                if (
+                    line.strip()
+                    and len(line) >= min_rest_indent
+                    and line[:min_rest_indent].isspace()
+                )
+                else line
+                for line in lines
+            ]
+    elif non_empty:
+        # Single non-empty line or uniform indent — fall back to simple
+        # common-indent strip.
+        min_indent = min(
+            len(line) - len(line.lstrip()) for line in non_empty
+        )
+        if min_indent > 0:
+            lines = [
+                line[min_indent:] if len(line) >= min_indent else line
+                for line in lines
+            ]
+
     sanitized_lines: list[str] = []
-    for line in normalized.splitlines():
+    for line in lines:
         match = _PLAIN_SCALAR_LINE_RE.match(line)
         if match is None:
             sanitized_lines.append(line)
@@ -314,14 +352,20 @@ def _sanitize_plain_yaml_scalars(text: str) -> str:
         value = raw_value.strip()
         if (
             not value
-            or ":" not in value
             or value.startswith(("'", '"', "[", "{", "|", ">", "!", "&", "*"))
             or value.startswith(("{{", "{%"))
         ):
             sanitized_lines.append(line)
             continue
 
-        sanitized_lines.append(f"{prefix}{json.dumps(value)}")
+        # Extract the bare key name so we can decide whether to force-quote.
+        key_match = re.match(r"\s*(?:-\s+)?([A-Za-z_]\w*)", prefix)
+        key_name = key_match.group(1).lower() if key_match else ""
+
+        if ":" in value or key_name in _ALWAYS_QUOTE_SCALAR_KEYS:
+            sanitized_lines.append(f"{prefix}{json.dumps(value)}")
+        else:
+            sanitized_lines.append(line)
 
     return "\n".join(sanitized_lines)
 

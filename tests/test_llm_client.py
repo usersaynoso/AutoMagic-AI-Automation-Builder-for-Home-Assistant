@@ -402,6 +402,84 @@ async def test_complete_quotes_plain_scalar_yaml_values_with_extra_colons():
 
 
 @pytest.mark.asyncio
+async def test_complete_deindents_uniformly_indented_yaml_from_model():
+    """YAML wrapped in a yaml: block arrives with uniform indentation that .strip() only fixes for line 1."""
+    content = json.dumps(
+        {
+            "yaml": (
+                "   alias: Janet Cleaning Schedule\n"
+                "   description: Every weekday morning check if Janet has cleaned.\n"
+                "   triggers:\n"
+                "     - trigger: time\n"
+                '       at: "08:00:00"\n'
+                "   conditions: []\n"
+                "   actions:\n"
+                "     - action: vacuum.start\n"
+                "       target:\n"
+                "         entity_id: vacuum.janet\n"
+                "   mode: single\n"
+            ),
+            "summary": "Ready",
+            "needs_clarification": False,
+            "clarifying_questions": [],
+        }
+    )
+    resp = FakeResponse(200, _make_completion_response(content))
+    session = FakeSession(resp)
+
+    client = LLMClient(
+        endpoint_url="http://localhost:11434",
+        model="llama3",
+        session=session,
+    )
+    result = await client.complete([{"role": "user", "content": "test"}])
+
+    import yaml as _yaml
+
+    parsed = _yaml.safe_load(result["yaml"])
+    assert parsed["alias"] == "Janet Cleaning Schedule"
+    assert parsed["triggers"][0]["trigger"] == "time"
+    assert parsed["actions"][0]["action"] == "vacuum.start"
+
+
+@pytest.mark.asyncio
+async def test_complete_always_quotes_alias_description_message_fields():
+    """alias, description, and message must be quoted even without colons."""
+    content = json.dumps(
+        {
+            "yaml": (
+                "alias: Janet Weekday Morning Vacuum\n"
+                "description: Every weekday morning check if Janet has cleaned\n"
+                "triggers:\n"
+                "  - trigger: time\n"
+                "conditions: []\n"
+                "actions:\n"
+                "  - action: notify.phone\n"
+                "    data:\n"
+                "      message: Janet is still cleaning after 90 minutes\n"
+                "mode: single\n"
+            ),
+            "summary": "Ready",
+            "needs_clarification": False,
+            "clarifying_questions": [],
+        }
+    )
+    resp = FakeResponse(200, _make_completion_response(content))
+    session = FakeSession(resp)
+
+    client = LLMClient(
+        endpoint_url="http://localhost:11434",
+        model="llama3",
+        session=session,
+    )
+    result = await client.complete([{"role": "user", "content": "test"}])
+
+    assert 'alias: Janet Weekday Morning Vacuum' in result["yaml"]
+    assert 'description: "Every weekday morning check if Janet has cleaned"' in result["yaml"]
+    assert 'message: "Janet is still cleaning after 90 minutes"' in result["yaml"]
+
+
+@pytest.mark.asyncio
 async def test_complete_salvages_malformed_json_wrapper_with_raw_yaml():
     """Broken JSON wrappers with raw multiline yaml should still be accepted."""
     raw = (

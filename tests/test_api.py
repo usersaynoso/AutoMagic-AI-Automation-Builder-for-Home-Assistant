@@ -743,7 +743,7 @@ async def test_run_generation_job_repairs_invalid_yaml_before_marking_complete()
         )
 
     assert job["status"] == "completed"
-    assert "description: Turns on the kitchen lights." in job["yaml"]
+    assert 'description: "Turns on the kitchen lights."' in job["yaml"]
     assert fake_client.complete.await_count == 2
     repair_messages = fake_client.complete.await_args_list[1].args[0]
     assert repair_messages[-1]["role"] == "user"
@@ -1025,7 +1025,7 @@ async def test_run_generation_job_repair_failure_includes_helpful_detail():
         )
 
     assert job["status"] == "completed"
-    assert "description: Turns on the kitchen lights." in job["yaml"]
+    assert 'description: "Turns on the kitchen lights."' in job["yaml"]
     assert fake_client.complete.await_count == 2
     regeneration_messages = fake_client.complete.await_args_list[1].args[0]
     assert regeneration_messages[-1]["role"] == "user"
@@ -1574,7 +1574,7 @@ async def test_run_generation_job_repairs_invalid_yaml_after_auto_clarification(
         )
 
     assert job["status"] == "completed"
-    assert "description: Warns on phase imbalance." in job["yaml"]
+    assert 'description: "Warns on phase imbalance."' in job["yaml"]
     assert fake_client.complete.await_count == 3
     repair_messages = fake_client.complete.await_args_list[2].args[0]
     assert repair_messages[-1]["role"] == "user"

@@ -392,6 +392,7 @@ class AutoMagicCard extends LitElement {
     this._directEndpoint = "";
     this._directModel = "";
     this._wsUnavailable = false;
+    this._repairNoticeShown = false;
   }
 
   setConfig(config) {
@@ -5375,6 +5376,24 @@ class AutoMagicCard extends LitElement {
     while (Date.now() - startedAt < 15 * 60 * 1000) {
       try {
         const payload = await this._requestGenerationStatusWithToken(jobId);
+
+        if (payload?.repair_in_progress && !this._repairNoticeShown) {
+          this._repairNoticeShown = true;
+          this._loadingMessage = payload.message || "Fixing a YAML formatting issue…";
+          this._loadingDetail = payload.detail || "AutoMagic detected invalid YAML and is asking the AI to correct it.";
+          this._appendChatMessage({
+            role: "assistant",
+            type: "status",
+            tone: "warning",
+            text: payload.detail ||
+              "AutoMagic detected that the generated YAML had a formatting issue and has " +
+              "automatically sent the specific error back to the AI, asking for a correction.",
+          });
+        } else if (payload?.message && !payload?.repair_in_progress) {
+          this._loadingMessage = payload.message;
+          this._loadingDetail = payload.detail || "";
+        }
+
         if (
           ["completed", "error", "needs_clarification"].includes(payload?.status)
         ) {
@@ -5397,6 +5416,7 @@ class AutoMagicCard extends LitElement {
   }
 
   async _runBackendGeneration(prompt, requestText = null, continueJobId = "") {
+    this._repairNoticeShown = false;
     const selectedService = this._selectedService();
     this._startLoadingTicker(
       "Waiting for your model to respond...",
@@ -6104,6 +6124,7 @@ class AutoMagicCard extends LitElement {
     this._lastEntityPool = [];
     this._directEndpoint = "";
     this._directModel = "";
+    this._repairNoticeShown = false;
   }
 
   _handleRetry() {
@@ -6150,6 +6171,18 @@ class AutoMagicCard extends LitElement {
       }
 
       this._updateLoadingState(result);
+
+      if (result.repair_in_progress && !this._repairNoticeShown) {
+        this._repairNoticeShown = true;
+        this._appendChatMessage({
+          role: "assistant",
+          type: "status",
+          tone: "warning",
+          text: result.detail ||
+            "AutoMagic detected that the generated YAML had a formatting issue and has " +
+            "automatically sent the specific error back to the AI, asking for a correction.",
+        });
+      }
 
       if (result.status === "needs_clarification") {
         this._clearGenerationPolling();

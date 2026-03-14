@@ -836,7 +836,135 @@ async def test_run_generation_job_regenerates_after_repair_attempts_stay_invalid
 
 
 @pytest.mark.asyncio
-async def test_run_generation_job_regenerates_after_initial_response_error():
+async def test_run_generation_job_sets_repair_in_progress_on_invalid_yaml():
+    """When the first LLM response has invalid YAML, repair_in_progress is exposed via detail."""
+    hass = _make_hass()
+    job = _create_generation_job(hass, "Turn on the kitchen lights", ["light"])
+
+    entities = [
+        {"entity_id": "light.kitchen", "name": "Kitchen", "state": "off", "domain": "light"},
+    ]
+    invalid_yaml_response = {
+        "yaml": (
+            "alias: Kitchen Lights\n"
+            "trigger:\n"
+            "  - platform: state\n"
+            "    entity_id: light.kitchen\n"
+            "action:\n"
+            "  - service: light.turn_on\n"
+            "    target:\n"
+            "      entity_id: light.kitchen\n"
+        ),
+        "summary": "Broken draft",
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+    valid_yaml_response = {
+        "yaml": (
+            "alias: Kitchen Lights\n"
+            "description: Turns on the kitchen lights.\n"
+            "triggers:\n"
+            "  - trigger: state\n"
+            "    entity_id: light.kitchen\n"
+            '    to: "on"\n'
+            "conditions: []\n"
+            "actions:\n"
+            "  - action: light.turn_on\n"
+            "    target:\n"
+            "      entity_id: light.kitchen\n"
+            "mode: single\n"
+        ),
+        "summary": "Turns on the kitchen lights.",
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+
+    # Track whether repair_in_progress was set during execution
+    repair_states_seen: list[bool] = []
+
+    original_complete = None
+
+    async def _tracking_complete(messages):
+        # Capture the job's repair_in_progress value just before the repair call returns.
+        repair_states_seen.append(bool(job.get("repair_in_progress")))
+        return await original_complete(messages)
+
+    fake_client = MagicMock()
+    fake_client._request_timeout = 420
+    original_complete = AsyncMock(side_effect=[invalid_yaml_response, valid_yaml_response])
+    fake_client.complete = AsyncMock(side_effect=_tracking_complete)
+
+    with patch(
+        "custom_components.automagic.api.get_entity_context",
+        AsyncMock(return_value=entities),
+    ), patch(
+        "custom_components.automagic.api.build_prompt",
+        return_value=[{"role": "system", "content": "system"}, {"role": "user", "content": "prompt"}],
+    ), patch(
+        "custom_components.automagic.api.async_get_clientsession",
+        return_value=MagicMock(),
+    ), patch(
+        "custom_components.automagic.api.LLMClient.from_config",
+        return_value=fake_client,
+    ):
+        await _run_generation_job(hass, job["job_id"], "Turn on the kitchen lights", ["light"])
+
+    assert job["status"] == "completed"
+    # repair_in_progress must be cleared once the job finishes
+    assert not job.get("repair_in_progress")
+    # The repair path must have been active during the second LLM call
+    assert any(repair_states_seen), "repair_in_progress was never set during the repair attempt"
+
+
+@pytest.mark.asyncio
+async def test_run_generation_job_repair_failure_includes_helpful_detail():
+    """When all YAML repairs are exhausted, the job detail explains that auto-repair was attempted."""
+    hass = _make_hass()
+    job = _create_generation_job(hass, "Turn on the kitchen lights", ["light"])
+
+    entities = [
+        {"entity_id": "light.kitchen", "name": "Kitchen", "state": "off", "domain": "light"},
+    ]
+    invalid_yaml_response = {
+        "yaml": (
+            "alias: Kitchen Lights\n"
+            "trigger:\n"
+            "  - platform: state\n"
+            "    entity_id: light.kitchen\n"
+            "action:\n"
+            "  - service: light.turn_on\n"
+            "    target:\n"
+            "      entity_id: light.kitchen\n"
+        ),
+        "summary": "Broken draft",
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+    fake_client = MagicMock()
+    fake_client._request_timeout = 420
+    # Return invalid YAML for every attempt so all repair+regen passes exhaust
+    fake_client.complete = AsyncMock(return_value=invalid_yaml_response)
+
+    with patch(
+        "custom_components.automagic.api.get_entity_context",
+        AsyncMock(return_value=entities),
+    ), patch(
+        "custom_components.automagic.api.build_prompt",
+        return_value=[{"role": "system", "content": "system"}, {"role": "user", "content": "prompt"}],
+    ), patch(
+        "custom_components.automagic.api.async_get_clientsession",
+        return_value=MagicMock(),
+    ), patch(
+        "custom_components.automagic.api.LLMClient.from_config",
+        return_value=fake_client,
+    ):
+        await _run_generation_job(hass, job["job_id"], "Turn on the kitchen lights", ["light"])
+
+    assert job["status"] == "error"
+    assert not job.get("repair_in_progress"), "repair_in_progress must be False after failure"
+    assert job.get("detail"), "detail should be set when repair fails"
+    assert "correction" in job["detail"].lower() or "repair" in job["detail"].lower() or "formatting" in job["detail"].lower()
+
     """Initial response parsing failures should trigger one clean regeneration pass before erroring."""
     hass = _make_hass()
     job = _create_generation_job(hass, "Turn on the kitchen lights", ["light"])

@@ -354,6 +354,7 @@ def _create_generation_job(
         "service_config": selected_service,
         "error": None,
         "task": None,
+        "repair_in_progress": False,
     }
 
     _get_generation_jobs(hass)[job["job_id"]] = job
@@ -548,6 +549,9 @@ def _serialize_generation_job(job: dict[str, Any]) -> dict[str, Any]:
         payload["summary"] = job.get("summary", "")
         payload["clarifying_questions"] = job.get("clarifying_questions", [])
         payload["entities_used"] = job.get("entities_used", [])
+
+    if job.get("repair_in_progress"):
+        payload["repair_in_progress"] = True
 
     return payload
 
@@ -1379,23 +1383,54 @@ async def _run_generation_job(
         if result is None:
             return None
 
+        # Detect YAML issues before launching the repair loop so we can update
+        # the job status immediately — the frontend polls this and will show it
+        # in the chat thread as an informational notice.
+        preliminary = _normalize_generation_result(result)
+        if not preliminary.get("needs_clarification"):
+            initial_issue = _validate_generated_yaml(preliminary.get("yaml", ""))
+            if initial_issue:
+                job["repair_in_progress"] = True
+                _mark_job_running(
+                    job,
+                    "Fixing a YAML formatting issue…",
+                    (
+                        "The model returned automation YAML with a formatting problem. "
+                        "AutoMagic has automatically sent the specific error back to the AI "
+                        f"and is requesting a correction. Error: {initial_issue[:300]}"
+                    ),
+                )
+
         try:
-            return await _repair_generation_result(
+            repaired = await _repair_generation_result(
                 client,
                 request_messages,
                 prompt_text,
                 prompt_entities,
                 result,
             )
+            job["repair_in_progress"] = False
+            return repaired
         except LLMConnectionError as err:
+            job["repair_in_progress"] = False
             _LOGGER.error("LLM connection error during YAML repair: %s", err)
             _mark_job_error(job, str(err))
             return None
         except LLMResponseError as err:
+            job["repair_in_progress"] = False
             _LOGGER.error("LLM response error during YAML repair: %s", err)
-            _mark_job_error(job, str(err))
+            _mark_job_error(
+                job,
+                str(err),
+                (
+                    "AutoMagic detected a YAML formatting issue and automatically sent the "
+                    "error back to the AI, but could not produce a valid automation after "
+                    "multiple correction attempts. Try rephrasing your request."
+                ),
+            )
             return None
         except Exception as err:  # pragma: no cover - defensive guard
+            job["repair_in_progress"] = False
             _LOGGER.exception("Unexpected YAML repair error")
             _mark_job_error(job, f"Unexpected generation error: {err}")
             return None

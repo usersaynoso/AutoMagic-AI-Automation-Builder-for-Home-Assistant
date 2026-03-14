@@ -14,6 +14,7 @@ from custom_components.automagic.api import (
     AutoMagicGenerateView,
     AutoMagicGenerateStatusView,
     AutoMagicHistoryEntryView,
+    _collect_generated_yaml_issues,
     _create_generation_job,
     _extract_entity_ids_from_yaml,
     _find_hallucinated_entities,
@@ -1297,13 +1298,37 @@ async def test_run_generation_job_sanitizes_colon_heavy_yaml_for_reported_vacuum
                 "  - condition: state\n"
                 "    entity_id: switch.router_led_left\n"
                 '    state: "on"\n'
+                "  - condition: state\n"
+                "    entity_id: switch.router_led_right\n"
+                '    state: "on"\n'
+                "  - condition: not\n"
+                "    conditions:\n"
+                "      - condition: state\n"
+                "        entity_id: sensor.iphone_13_audio_output\n"
+                '        state: "Speaker"\n'
                 "actions:\n"
                 "  - action: vacuum.start\n"
                 "    target:\n"
                 "      entity_id: vacuum.robot_vacuum\n"
+                "  - action: light.turn_on\n"
+                "    target:\n"
+                "      entity_id:\n"
+                "        - light.lounge_strip_lights_left\n"
+                "        - light.lounge_strip_lights_right\n"
+                "        - light.bar_lamp\n"
+                "    data:\n"
+                "      brightness_pct: 20\n"
+                "      kelvin: 2700\n"
+                '  - delay: "01:30:00"\n'
                 "  - action: notify.mobile_app_iphone_13\n"
                 "    data:\n"
                 "      message: The robot vacuum is still cleaning after 90 minutes: it might be stuck\n"
+                "  - action: light.turn_off\n"
+                "    target:\n"
+                "      entity_id:\n"
+                "        - light.lounge_strip_lights_left\n"
+                "        - light.lounge_strip_lights_right\n"
+                "        - light.bar_lamp\n"
                 "mode: single\n"
             ),
             "summary": "Starts the robot vacuum if the conditions are met.",
@@ -1344,6 +1369,297 @@ async def test_run_generation_job_sanitizes_colon_heavy_yaml_for_reported_vacuum
         'message: "The robot vacuum is still cleaning after 90 minutes: it might be stuck"'
         in job["yaml"]
     )
+
+
+def test_collect_generated_yaml_issues_flags_semantic_mismatches_for_vacuum_prompt():
+    """Prompt-aware backend validation should catch the reported weekday, guard, and color mistakes."""
+    prompt = (
+        "Every weekday morning, check if Janet (the robot vacuum) has done a clean in the last 24 hours. "
+        "If she hasn't, start her cleaning at 8am, but only if everyone has already left home - check this "
+        'by making sure the iPhone 13 audio output is not "Speaker" (meaning the phone is not actively being '
+        "used at home). While Janet is cleaning, turn the lounge strip lights and bar lamp to a dim warm white "
+        "at 20% brightness so she can see. When she finishes, turn those lights back off. If Janet doesn't "
+        'finish within 90 minutes of starting, send a notification to my iPhone saying "Janet is still cleaning '
+        'after 90 minutes - she might be stuck". Don\'t start her at all if either of the router LED switches '
+        "are already off, as that means the network is down and her cloud connection won't work."
+    )
+    entities = [
+        {
+            "entity_id": "vacuum.robot_vacuum",
+            "name": "Janet",
+            "state": "docked",
+            "domain": "vacuum",
+        },
+        {
+            "entity_id": "sensor.iphone_13_audio_output",
+            "name": "iPhone 13 Audio Output",
+            "state": "AirPlay",
+            "domain": "sensor",
+        },
+        {
+            "entity_id": "switch.router_led_left",
+            "name": "Router LED Left",
+            "state": "on",
+            "domain": "switch",
+        },
+        {
+            "entity_id": "switch.router_led_right",
+            "name": "Router LED Right",
+            "state": "on",
+            "domain": "switch",
+        },
+        {
+            "entity_id": "light.lounge_strip_lights_left",
+            "name": "Lounge Strip Lights Left",
+            "state": "off",
+            "domain": "light",
+        },
+        {
+            "entity_id": "light.lounge_strip_lights_right",
+            "name": "Lounge Strip Lights Right",
+            "state": "off",
+            "domain": "light",
+        },
+        {
+            "entity_id": "light.bar_lamp",
+            "name": "Bar Lamp",
+            "state": "off",
+            "domain": "light",
+        },
+        {
+            "entity_id": "notify.mobile_app_iphone_13",
+            "name": "Notify Iphone 13",
+            "state": "service",
+            "domain": "notify",
+            "device_class": "service",
+        },
+    ]
+    yaml_text = (
+        "alias: Start Janet Cleaning on Weekdays\n"
+        "description: Every weekday morning, check if Janet has cleaned in the last 24 hours and start her cleaning if conditions are met.\n"
+        "triggers:\n"
+        "  - trigger: time\n"
+        '    at: "08:00:00"\n'
+        "conditions:\n"
+        "  - condition: state\n"
+        "    entity_id: sensor.iphone_13_audio_output\n"
+        '    state: "Speaker"\n'
+        "  - condition: state\n"
+        "    entity_id: switch.router_led_left\n"
+        '    state: "on"\n'
+        "actions:\n"
+        "  - action: automation.toggle_vacuum_to_clean_or_not\n"
+        "  - action: light.turn_on\n"
+        "    target:\n"
+        "      entity_id: light.lounge_strip_lights_left\n"
+        "    data:\n"
+        "      brightness_pct: 20\n"
+        '      color_name: "warm_white"\n'
+        "  - action: notify.mobile_app_iphone_13\n"
+        "    data:\n"
+        '      message: "Janet is still cleaning after 90 minutes - she might be stuck"\n'
+        "mode: single\n"
+    )
+
+    issues = _collect_generated_yaml_issues(prompt, entities, yaml_text)
+
+    assert any("weekday schedule" in issue for issue in issues)
+    assert any(
+        'sensor.iphone_13_audio_output must not be "Speaker"' in issue
+        for issue in issues
+    )
+    assert any("Respect the explicit guard switch.router_led_right" in issue for issue in issues)
+    assert any("color_name values should not use underscore-separated names" in issue for issue in issues)
+
+
+@pytest.mark.asyncio
+async def test_run_generation_job_repairs_prompt_coverage_issues_before_completion():
+    """Semantically wrong but parseable YAML should be sent back to the AI for correction."""
+    hass = _make_hass()
+    prompt = (
+        "Every weekday morning, check if Janet (the robot vacuum) has done a clean in the last 24 hours. "
+        "If she hasn't, start her cleaning at 8am, but only if everyone has already left home - check this "
+        'by making sure the iPhone 13 audio output is not "Speaker" (meaning the phone is not actively being '
+        "used at home). While Janet is cleaning, turn the lounge strip lights and bar lamp to a dim warm white "
+        "at 20% brightness so she can see. When she finishes, turn those lights back off. If Janet doesn't "
+        'finish within 90 minutes of starting, send a notification to my iPhone saying "Janet is still cleaning '
+        'after 90 minutes - she might be stuck". Don\'t start her at all if either of the router LED switches '
+        "are already off, as that means the network is down and her cloud connection won't work."
+    )
+    job = _create_generation_job(hass, prompt, None)
+
+    entities = [
+        {
+            "entity_id": "vacuum.robot_vacuum",
+            "name": "Janet",
+            "state": "docked",
+            "domain": "vacuum",
+        },
+        {
+            "entity_id": "sensor.iphone_13_audio_output",
+            "name": "iPhone 13 Audio Output",
+            "state": "AirPlay",
+            "domain": "sensor",
+        },
+        {
+            "entity_id": "switch.router_led_left",
+            "name": "Router LED Left",
+            "state": "on",
+            "domain": "switch",
+        },
+        {
+            "entity_id": "switch.router_led_right",
+            "name": "Router LED Right",
+            "state": "on",
+            "domain": "switch",
+        },
+        {
+            "entity_id": "light.lounge_strip_lights_left",
+            "name": "Lounge Strip Lights Left",
+            "state": "off",
+            "domain": "light",
+        },
+        {
+            "entity_id": "light.lounge_strip_lights_right",
+            "name": "Lounge Strip Lights Right",
+            "state": "off",
+            "domain": "light",
+        },
+        {
+            "entity_id": "light.bar_lamp",
+            "name": "Bar Lamp",
+            "state": "off",
+            "domain": "light",
+        },
+        {
+            "entity_id": "notify.mobile_app_iphone_13",
+            "name": "Notify Iphone 13",
+            "state": "service",
+            "domain": "notify",
+            "device_class": "service",
+        },
+    ]
+    bad_yaml = {
+        "yaml": (
+            "alias: Start Janet Cleaning on Weekdays\n"
+            "description: Every weekday morning, check if Janet has cleaned in the last 24 hours and start her cleaning if conditions are met.\n"
+            "triggers:\n"
+            "  - trigger: time\n"
+            '    at: "08:00:00"\n'
+            "conditions:\n"
+            "  - condition: state\n"
+            "    entity_id: sensor.iphone_13_audio_output\n"
+            '    state: "Speaker"\n'
+            "  - condition: state\n"
+            "    entity_id: switch.router_led_left\n"
+            '    state: "on"\n'
+            "actions:\n"
+            "  - action: automation.toggle_vacuum_to_clean_or_not\n"
+            "  - action: light.turn_on\n"
+            "    target:\n"
+            "      entity_id: light.lounge_strip_lights_left\n"
+            "    data:\n"
+            "      brightness_pct: 20\n"
+            '      color_name: "warm_white"\n'
+            "  - delay: '01:30:00'\n"
+            "  - action: notify.mobile_app_iphone_13\n"
+            "    data:\n"
+            '      message: "Janet is still cleaning after 90 minutes - she might be stuck"\n'
+            "mode: single\n"
+        ),
+        "summary": "Starts Janet cleaning if the conditions are met.",
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+    fixed_yaml = {
+        "yaml": (
+            "alias: Start Janet Cleaning on Weekdays\n"
+            "description: Starts Janet cleaning at 8am on weekdays when she has not cleaned recently and the home is empty.\n"
+            "triggers:\n"
+            "  - trigger: time\n"
+            '    at: "08:00:00"\n'
+            "    weekday:\n"
+            "      - mon\n"
+            "      - tue\n"
+            "      - wed\n"
+            "      - thu\n"
+            "      - fri\n"
+            "conditions:\n"
+            "  - condition: state\n"
+            "    entity_id: switch.router_led_left\n"
+            '    state: "on"\n'
+            "  - condition: state\n"
+            "    entity_id: switch.router_led_right\n"
+            '    state: "on"\n'
+            "  - condition: not\n"
+            "    conditions:\n"
+            "      - condition: state\n"
+            "        entity_id: sensor.iphone_13_audio_output\n"
+            '        state: "Speaker"\n'
+            "actions:\n"
+            "  - action: vacuum.start\n"
+            "    target:\n"
+            "      entity_id: vacuum.robot_vacuum\n"
+            "  - action: light.turn_on\n"
+            "    target:\n"
+            "      entity_id:\n"
+            "        - light.lounge_strip_lights_left\n"
+            "        - light.lounge_strip_lights_right\n"
+            "        - light.bar_lamp\n"
+            "    data:\n"
+            "      brightness_pct: 20\n"
+            "      kelvin: 2700\n"
+            '  - delay: "01:30:00"\n'
+            "  - action: notify.mobile_app_iphone_13\n"
+            "    data:\n"
+            '      message: "Janet is still cleaning after 90 minutes - she might be stuck"\n'
+            "  - action: light.turn_off\n"
+            "    target:\n"
+            "      entity_id:\n"
+            "        - light.lounge_strip_lights_left\n"
+            "        - light.lounge_strip_lights_right\n"
+            "        - light.bar_lamp\n"
+            "mode: single\n"
+        ),
+        "summary": "Starts Janet cleaning on weekdays when the requested guards pass.",
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+    fake_client = MagicMock()
+    fake_client._request_timeout = 420
+    fake_client.complete = AsyncMock(side_effect=[bad_yaml, fixed_yaml])
+
+    with patch(
+        "custom_components.automagic.api.get_entity_context",
+        AsyncMock(return_value=entities),
+    ), patch(
+        "custom_components.automagic.api.build_prompt",
+        return_value=[{"role": "user", "content": "prompt"}],
+    ), patch(
+        "custom_components.automagic.api.async_get_clientsession",
+        return_value=MagicMock(),
+    ), patch(
+        "custom_components.automagic.api.LLMClient.from_config",
+        return_value=fake_client,
+    ):
+        await _run_generation_job(
+            hass,
+            job["job_id"],
+            prompt,
+            None,
+        )
+
+    assert job["status"] == "completed"
+    assert _validate_generated_yaml(job["yaml"]) is None
+    assert '        state: "Speaker"' in job["yaml"]
+    assert "vacuum.robot_vacuum" in job["yaml"]
+    assert "switch.router_led_right" in job["yaml"]
+    assert "kelvin: 2700" in job["yaml"]
+    assert fake_client.complete.await_count == 2
+    repair_messages = fake_client.complete.await_args_list[1].args[0]
+    assert repair_messages[-1]["role"] == "user"
+    assert "weekday schedule" in repair_messages[-1]["content"]
+    assert 'must not be "Speaker"' in repair_messages[-1]["content"]
 
 
 @pytest.mark.asyncio

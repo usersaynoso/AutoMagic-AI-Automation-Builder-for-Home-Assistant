@@ -101,6 +101,16 @@ _EXPLICIT_GUARD_RE = re.compile(
     r"(?:don't|do not)\s+run(?: any of this| this)?\s+if\s+(.+?)\s+is\s+already\s+(on|off|open|closed|locked|unlocked|active|inactive)\b",
     re.IGNORECASE,
 )
+_PLURAL_ENTITY_HINT_RE = re.compile(
+    r"\b(all|both|three|every|each|either|switch(?:es)?|lights?|phases?|outputs?|inputs?|sensors?)\b",
+    re.IGNORECASE,
+)
+_NEGATED_STATE_GUARD_PATTERNS = (
+    re.compile(
+        r"(?:making sure|make sure|ensure(?: that)?|checking(?: this)? by making sure|only if|provided that)\s+(.+?)\s+(?:is|are)\s+not\s+['\"]([^'\"]+)['\"]",
+        re.IGNORECASE,
+    ),
+)
 _YAML_REPAIR_SYSTEM_PROMPT = """\
 You are an expert Home Assistant automation syntax repair assistant.
 Return only a JSON object with exactly four keys: yaml, summary, needs_clarification, clarifying_questions.
@@ -766,6 +776,307 @@ def _invert_entity_state(state: str) -> str:
     return opposites.get(str(state or "").strip().lower(), "")
 
 
+def _extract_weekdays(prompt_text: str) -> list[str]:
+    """Extract weekday abbreviations implied by the prompt."""
+    text = str(prompt_text or "").strip().lower()
+    if not text:
+        return []
+
+    if re.search(r"\bevery weekday(?:s)?\b|\beach weekday\b", text):
+        return ["mon", "tue", "wed", "thu", "fri"]
+    if re.search(r"\bevery weekend(?:s)?\b|\beach weekend\b", text):
+        return ["sat", "sun"]
+
+    mappings = (
+        ("monday", "mon"),
+        ("tuesday", "tue"),
+        ("wednesday", "wed"),
+        ("thursday", "thu"),
+        ("friday", "fri"),
+        ("saturday", "sat"),
+        ("sunday", "sun"),
+    )
+    return [
+        short
+        for word, short in mappings
+        if re.search(rf"\b{word}s?\b", text)
+    ]
+
+
+def _resolve_prompt_entities(
+    phrase: str,
+    prompt_text: str,
+    entities: list[dict[str, Any]],
+    *,
+    max_matches: int = 8,
+) -> list[dict[str, Any]]:
+    """Resolve prompt phrasing to one or more Home Assistant entities."""
+    if not phrase or not entities:
+        return []
+
+    phrase_candidates = [
+        phrase,
+        re.sub(
+            r"\b(?:either|both|all|each|every)\s+of\s+the\b",
+            " ",
+            phrase,
+            flags=re.IGNORECASE,
+        ),
+        re.sub(
+            r"\b(?:either|both|all|each|every|of|the)\b",
+            " ",
+            phrase,
+            flags=re.IGNORECASE,
+        ),
+    ]
+    singularized = phrase
+    for plural, singular in (
+        ("switches", "switch"),
+        ("lights", "light"),
+        ("phases", "phase"),
+        ("sensors", "sensor"),
+        ("outputs", "output"),
+        ("inputs", "input"),
+    ):
+        singularized = re.sub(rf"\b{plural}\b", singular, singularized, flags=re.IGNORECASE)
+    phrase_candidates.append(singularized)
+
+    seed_entities: list[dict[str, Any]] = []
+    for candidate_phrase in phrase_candidates:
+        normalized_phrase = " ".join(str(candidate_phrase or "").split())
+        if not normalized_phrase:
+            continue
+        seed_entities = _find_obvious_named_entities(
+            normalized_phrase, entities, max_matches
+        )
+        if seed_entities:
+            phrase = normalized_phrase
+            break
+    if not seed_entities:
+        return []
+
+    expansion_prompt = phrase
+    if _PLURAL_ENTITY_HINT_RE.search(phrase) or _PLURAL_ENTITY_HINT_RE.search(
+        prompt_text
+    ):
+        expansion_prompt = f"all {phrase}"
+    expanded = _expand_variant_entities(expansion_prompt, entities, seed_entities)
+    matched = expanded or seed_entities
+
+    deduped: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for entity in matched:
+        entity_id = str(entity.get("entity_id") or "").strip()
+        if not entity_id or entity_id in seen_ids:
+            continue
+        deduped.append(entity)
+        seen_ids.add(entity_id)
+    return deduped
+
+
+def _extract_explicit_state_guards(
+    prompt_text: str,
+    entities: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """Extract explicit do-not-run state guards implied by the prompt."""
+    text = str(prompt_text or "").strip()
+    if not text or not entities:
+        return []
+
+    patterns = (
+        _EXPLICIT_GUARD_RE,
+        re.compile(
+            r"(?:don't|do not)\s+(?:run(?: any of this| this)?|start(?: any of this| this| it| her| him| them)?)"
+            r"(?:\s+at all)?\s+if\s+(.+?)\s+(?:is|are)\s+already\s+"
+            r"(on|off|open|closed|locked|unlocked|active|inactive)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\bunless\s+(.+?)\s+(?:is|are)\s+"
+            r"(on|off|open|closed|locked|unlocked|active|inactive)\b",
+            re.IGNORECASE,
+        ),
+    )
+    guards: list[dict[str, str]] = []
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            phrase = str(match.group(1) or "").strip()
+            blocked_state = str(match.group(2) or "").strip().lower()
+            if not phrase or not blocked_state:
+                continue
+            required_state = _invert_entity_state(blocked_state)
+            for entity in _resolve_prompt_entities(phrase, prompt_text, entities):
+                entity_id = str(entity.get("entity_id") or "").strip()
+                if not entity_id:
+                    continue
+                guards.append(
+                    {
+                        "entity_id": entity_id,
+                        "blocked_state": blocked_state,
+                        "required_state": required_state,
+                    }
+                )
+
+    deduped: list[dict[str, str]] = []
+    seen_keys: set[tuple[str, str, str]] = set()
+    for guard in guards:
+        key = (
+            guard["entity_id"],
+            guard["blocked_state"],
+            guard["required_state"],
+        )
+        if key in seen_keys:
+            continue
+        deduped.append(guard)
+        seen_keys.add(key)
+    return deduped
+
+
+def _extract_negated_state_guards(
+    prompt_text: str,
+    entities: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """Extract state requirements phrased as entity != value in the prompt."""
+    text = str(prompt_text or "").strip()
+    if not text or not entities:
+        return []
+
+    guards: list[dict[str, str]] = []
+    for pattern in _NEGATED_STATE_GUARD_PATTERNS:
+        for match in pattern.finditer(text):
+            phrase = str(match.group(1) or "").strip().strip(" ,(")
+            state = str(match.group(2) or "").strip()
+            if not phrase or not state:
+                continue
+            for entity in _resolve_prompt_entities(
+                phrase, prompt_text, entities, max_matches=4
+            ):
+                entity_id = str(entity.get("entity_id") or "").strip()
+                if not entity_id:
+                    continue
+                guards.append({"entity_id": entity_id, "state": state})
+
+    deduped: list[dict[str, str]] = []
+    seen_keys: set[tuple[str, str]] = set()
+    for guard in guards:
+        key = (guard["entity_id"], guard["state"])
+        if key in seen_keys:
+            continue
+        deduped.append(guard)
+        seen_keys.add(key)
+    return deduped
+
+
+def _yaml_has_weekdays(yaml_text: str, weekdays: list[str]) -> bool:
+    """Return True when the YAML preserves all requested weekdays."""
+    if not yaml_text or not weekdays:
+        return False
+    normalized = str(yaml_text or "").lower()
+    if "weekday:" not in normalized:
+        return False
+    return all(re.search(rf"^\s*-\s*{weekday}\s*$", normalized, re.MULTILINE) for weekday in weekdays)
+
+
+def _yaml_has_positive_state_guard(
+    yaml_text: str,
+    entity_id: str,
+    state: str,
+) -> bool:
+    """Return True when the YAML contains a direct state condition for entity == state."""
+    if not yaml_text or not entity_id or not state:
+        return False
+
+    entity_pattern = re.escape(entity_id)
+    state_pattern = re.escape(str(state).strip())
+    return bool(
+        re.search(
+            rf"entity_id:\s*{entity_pattern}[\s\S]{{0,180}}state:\s*['\"]?{state_pattern}['\"]?",
+            yaml_text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _yaml_has_negated_state_guard(
+    yaml_text: str,
+    entity_id: str,
+    state: str,
+) -> bool:
+    """Return True when the YAML preserves a guard requiring entity != state."""
+    if not yaml_text or not entity_id or not state:
+        return False
+
+    entity_pattern = re.escape(entity_id)
+    state_pattern = re.escape(str(state).strip())
+    patterns = (
+        rf"condition:\s*not[\s\S]{{0,260}}entity_id:\s*{entity_pattern}[\s\S]{{0,180}}state:\s*['\"]?{state_pattern}['\"]?",
+        rf"value_template:\s*>?-?[\s\S]{{0,320}}states?\(['\"]{entity_pattern}['\"]\)\s*!=\s*['\"]{state_pattern}['\"]",
+        rf"value_template:\s*>?-?[\s\S]{{0,320}}not\s+is_state\(['\"]{entity_pattern}['\"],\s*['\"]{state_pattern}['\"]\)",
+    )
+    return any(re.search(pattern, yaml_text, re.IGNORECASE) for pattern in patterns)
+
+
+def _collect_generated_yaml_issues(
+    prompt_text: str,
+    entities: list[dict[str, Any]],
+    yaml_text: str,
+) -> list[str]:
+    """Collect structural and prompt-coverage issues that require another repair pass."""
+    issues: list[str] = []
+    syntax_issue = _validate_generated_yaml(yaml_text)
+    if syntax_issue:
+        issues.append(syntax_issue)
+
+    normalized_yaml = _normalize_automation_yaml_text(yaml_text)
+    if not normalized_yaml or not prompt_text or not entities:
+        return list(dict.fromkeys(issue for issue in issues if issue))
+
+    if re.search(r"\b(notify|notification|iphone|phone|mobile)\b", prompt_text, re.IGNORECASE):
+        notify_matches = _relevant_domain_matches(prompt_text, entities, "notify", 1, 4)
+        if notify_matches:
+            notify_entity_id = str(notify_matches[0].get("entity_id") or "").strip()
+            if notify_entity_id and notify_entity_id not in normalized_yaml:
+                issues.append(f"Use the resolved notification target {notify_entity_id}.")
+
+    weekdays = _extract_weekdays(prompt_text)
+    if weekdays and not _yaml_has_weekdays(normalized_yaml, weekdays):
+        issues.append(
+            "Preserve the requested weekday schedule in the automation trigger or guard."
+        )
+
+    for guard in _extract_explicit_state_guards(prompt_text, entities):
+        entity_id = guard["entity_id"]
+        blocked_state = guard["blocked_state"]
+        required_state = guard["required_state"]
+        if required_state and _yaml_has_positive_state_guard(
+            normalized_yaml, entity_id, required_state
+        ):
+            continue
+        if _yaml_has_negated_state_guard(normalized_yaml, entity_id, blocked_state):
+            continue
+        issues.append(f"Respect the explicit guard {entity_id} before running the actions.")
+
+    for guard in _extract_negated_state_guards(prompt_text, entities):
+        if _yaml_has_negated_state_guard(
+            normalized_yaml, guard["entity_id"], guard["state"]
+        ):
+            continue
+        issues.append(
+            f'Preserve the requested guard that {guard["entity_id"]} must not be "{guard["state"]}".'
+        )
+
+    if re.search(
+        r"\bcolor_name:\s*['\"]?[a-z0-9]+_[a-z0-9_]+['\"]?",
+        normalized_yaml,
+        re.IGNORECASE,
+    ):
+        issues.append(
+            "Use a valid Home Assistant light color. color_name values should not use underscore-separated names such as warm_white; prefer kelvin, color_temp, or a valid CSS color name."
+        )
+
+    return list(dict.fromkeys(issue for issue in issues if issue))
+
+
 def _build_entity_target_lines(entity_ids: list[str], indent: str = "      ") -> list[str]:
     """Build a Home Assistant entity target block."""
     cleaned_ids = [entity_id for entity_id in entity_ids if entity_id]
@@ -1347,6 +1658,8 @@ def _build_entity_repair_messages(
 async def _regenerate_generation_result(
     client: LLMClient,
     request_messages: list[dict[str, str]],
+    prompt_text: str,
+    entities: list[dict[str, Any]],
     issue: str,
 ) -> dict[str, Any]:
     """Regenerate a clean automation from the original request when repair is exhausted."""
@@ -1361,8 +1674,13 @@ async def _regenerate_generation_result(
         if regenerated.get("needs_clarification"):
             return regenerated
         last_result = regenerated
-        last_issue = _validate_generated_yaml(regenerated.get("yaml", "")) or ""
-        if not last_issue:
+        regenerated_issues = _collect_generated_yaml_issues(
+            prompt_text,
+            entities,
+            regenerated.get("yaml", ""),
+        )
+        last_issue = " ".join(regenerated_issues[:6])
+        if not regenerated_issues:
             return regenerated
 
     current = last_result
@@ -1375,8 +1693,13 @@ async def _regenerate_generation_result(
             )
             if current.get("needs_clarification"):
                 return current
-            last_issue = _validate_generated_yaml(current.get("yaml", "")) or ""
-            if not last_issue:
+            repaired_issues = _collect_generated_yaml_issues(
+                prompt_text,
+                entities,
+                current.get("yaml", ""),
+            )
+            last_issue = " ".join(repaired_issues[:6])
+            if not repaired_issues:
                 return current
 
     raise LLMResponseError(
@@ -1396,15 +1719,24 @@ async def _repair_generation_result(
     if current.get("needs_clarification"):
         return current
 
-    issue = _validate_generated_yaml(current.get("yaml", ""))
-    if issue is None:
+    issues = _collect_generated_yaml_issues(
+        prompt_text,
+        entities,
+        current.get("yaml", ""),
+    )
+    if not issues:
         return current
 
     deterministic = _build_deterministic_generation_result(prompt_text, entities)
-    if deterministic is not None:
+    if deterministic is not None and not _collect_generated_yaml_issues(
+        prompt_text,
+        entities,
+        deterministic.get("yaml", ""),
+    ):
         return deterministic
 
     for _attempt in range(_YAML_REPAIR_ATTEMPTS):
+        issue = " ".join(issues[:6])
         current = _normalize_generation_result(
             await client.complete(
                 _build_yaml_repair_messages(request_messages, current, issue)
@@ -1412,11 +1744,21 @@ async def _repair_generation_result(
         )
         if current.get("needs_clarification"):
             return current
-        issue = _validate_generated_yaml(current.get("yaml", ""))
-        if issue is None:
+        issues = _collect_generated_yaml_issues(
+            prompt_text,
+            entities,
+            current.get("yaml", ""),
+        )
+        if not issues:
             return current
 
-    return await _regenerate_generation_result(client, request_messages, issue or "")
+    return await _regenerate_generation_result(
+        client,
+        request_messages,
+        prompt_text,
+        entities,
+        " ".join(issues[:6]),
+    )
 
 
 async def _maybe_refresh_backend_status(
@@ -1549,6 +1891,8 @@ async def _run_generation_job(
                 return await _regenerate_generation_result(
                     client,
                     request_messages,
+                    prompt_text,
+                    prompt_entities,
                     str(err),
                 )
             except LLMConnectionError as regen_err:
@@ -1582,14 +1926,19 @@ async def _run_generation_job(
         # in the chat thread as an informational notice.
         preliminary = _normalize_generation_result(result)
         if not preliminary.get("needs_clarification"):
-            initial_issue = _validate_generated_yaml(preliminary.get("yaml", ""))
-            if initial_issue:
+            initial_issues = _collect_generated_yaml_issues(
+                prompt_text,
+                prompt_entities,
+                preliminary.get("yaml", ""),
+            )
+            if initial_issues:
+                initial_issue = " ".join(initial_issues[:4])
                 job["repair_in_progress"] = True
                 _mark_job_running(
                     job,
-                    "Fixing a YAML formatting issue…",
+                    "Fixing a YAML issue…",
                     (
-                        "The model returned automation YAML with a formatting problem. "
+                        "The model returned automation YAML with a syntax or logic problem. "
                         "AutoMagic has automatically sent the specific error back to the AI "
                         f"and is requesting a correction. Error: {initial_issue[:300]}"
                     ),
@@ -1633,14 +1982,19 @@ async def _run_generation_job(
                                     repaired,
                                     hallucinated,
                                     full_entity_summary,
-                                )
+                        )
                             )
                         )
                         if candidate.get("needs_clarification"):
                             repaired = candidate
                             break
                         cand_yaml = candidate.get("yaml", "")
-                        if _validate_generated_yaml(cand_yaml) is not None:
+                        candidate_issues = _collect_generated_yaml_issues(
+                            prompt_text,
+                            prompt_entities,
+                            cand_yaml,
+                        )
+                        if candidate_issues:
                             continue  # broke structure, retry
                         repaired = candidate
                         hallucinated = _find_hallucinated_entities(

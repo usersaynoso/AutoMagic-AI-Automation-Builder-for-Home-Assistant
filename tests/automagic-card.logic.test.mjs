@@ -255,6 +255,7 @@ function buildHarness() {
     "_extractJsonObjectText",
     "_buildAutomationContextMessage",
     "_extractTopLevelSectionBlock",
+    "_yamlGuardIsInConditionsBlock",
     "_extractActionBlocks",
     "_pushRepairStatus",
     "_collectYamlIssues",
@@ -475,6 +476,20 @@ test("Repair issue text includes concrete YAML examples for the new malformation
   assert.match(issueText, /Use mired color_temp values like this:/);
   assert.match(issueText, /Use choose for action-time branching like this:/);
   assert.match(issueText, /Keep both guard switches as separate conditions like this:/);
+  assert.match(issueText, /entity_id: switch\.main_router_led/);
+  assert.match(issueText, /entity_id: switch\.mesh_mesh_led/);
+});
+
+test("Repair issue text includes the top-level conditions guard hint", () => {
+  const harness = buildHarness();
+  const issueText = harness._buildRepairIssueText.call(harness, [
+    "Guard switch.main_router_led must be in the top-level conditions: block, not inside a choose: branch. Automations that must not start when switch.main_router_led is off need this as an upfront blocking condition.",
+  ]);
+
+  assert.match(
+    issueText,
+    /Guards that prevent the entire automation from running belong in conditions:, not in choose: branches:/
+  );
   assert.match(issueText, /entity_id: switch\.main_router_led/);
   assert.match(issueText, /entity_id: switch\.mesh_mesh_led/);
 });
@@ -2827,6 +2842,107 @@ mode: single`,
   );
 });
 
+test("Guard placement only counts inside the top-level conditions block", () => {
+  const harness = buildHarness();
+
+  assert.equal(
+    harness._yamlGuardIsInConditionsBlock.call(
+      harness,
+      `alias: Router Guard
+description: Example
+triggers: []
+conditions:
+  - condition: state
+    entity_id: switch.main_router_led
+    state: "on"
+actions: []
+mode: single`,
+      "switch.main_router_led"
+    ),
+    true
+  );
+  assert.equal(
+    harness._yamlGuardIsInConditionsBlock.call(
+      harness,
+      `alias: Router Guard
+description: Example
+triggers: []
+conditions: []
+actions:
+  - choose:
+      - conditions:
+          - condition: state
+            entity_id: switch.main_router_led
+            state: "on"
+        sequence:
+          - action: light.turn_on
+            target:
+              entity_id: light.bar_lamp
+mode: single`,
+      "switch.main_router_led"
+    ),
+    false
+  );
+});
+
+test("Prompt-aware coverage issues reject guards nested only inside choose branches", () => {
+  const harness = buildHarness();
+  const issues = harness._collectYamlCoverageIssues.call(
+    harness,
+    "Don't start it at all if either of the router LED switches are already off, as that means the network is down.",
+    `alias: Router Guard Example
+description: Example
+triggers:
+  - trigger: time
+    at: "08:00:00"
+conditions: []
+actions:
+  - choose:
+      - conditions:
+          - condition: state
+            entity_id: switch.main_router_led
+            state: "on"
+          - condition: state
+            entity_id: switch.mesh_mesh_led
+            state: "on"
+        sequence:
+          - action: light.turn_on
+            target:
+              entity_id: light.bar_lamp
+mode: single`,
+    {
+      entities: [
+        {
+          entity_id: "switch.main_router_led",
+          name: "Main Router LED",
+          domain: "switch",
+        },
+        {
+          entity_id: "switch.mesh_mesh_led",
+          name: "Mesh Router LED",
+          domain: "switch",
+        },
+        {
+          entity_id: "light.bar_lamp",
+          name: "Bar Lamp",
+          domain: "light",
+        },
+      ],
+    }
+  );
+
+  assert.ok(
+    issues.includes(
+      "Guard switch.main_router_led must be in the top-level conditions: block, not inside a choose: branch. Automations that must not start when switch.main_router_led is off need this as an upfront blocking condition."
+    )
+  );
+  assert.ok(
+    issues.includes(
+      "Guard switch.mesh_mesh_led must be in the top-level conditions: block, not inside a choose: branch. Automations that must not start when switch.mesh_mesh_led is off need this as an upfront blocking condition."
+    )
+  );
+});
+
 test("Group clause mappings split comma-delimited action branches cleanly", () => {
   const harness = buildHarness();
   const mappings = harness._buildGroupClauseMappings.call(
@@ -3457,4 +3573,9 @@ test("Source includes a dedicated syntax rewrite fallback for invalid YAML", () 
   assert.match(cardSource, /The previous response returned planning keys instead of automation YAML\./);
   assert.match(cardSource, /For nested outcomes such as 'if still above X after Y, do A, otherwise do B'/i);
   assert.match(cardSource, /The previous response did not include the required complete automation YAML\./);
+});
+
+test("Source encodes do-not-run guards as top-level conditions", () => {
+  assert.match(cardSource, /top-level conditions: block/);
+  assert.match(cardSource, /not as a choose: branch inside actions:/);
 });

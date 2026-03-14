@@ -63,6 +63,11 @@ class TestBuildPrompt:
         """System prompt must tell LLM not to invent entity IDs."""
         assert "Never invent entity_ids" in SYSTEM_PROMPT
 
+    def test_system_prompt_requires_upfront_blocking_guards(self):
+        """System prompt should require do-not-run guards in top-level conditions."""
+        assert "top-level conditions: block" in SYSTEM_PROMPT
+        assert "not as a choose: branch inside" in SYSTEM_PROMPT
+
     def test_empty_entity_summary(self):
         """Should still produce valid messages with empty entity list."""
         result = build_prompt("Turn on lights", "")

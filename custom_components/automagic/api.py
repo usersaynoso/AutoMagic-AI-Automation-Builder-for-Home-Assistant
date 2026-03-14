@@ -694,6 +694,17 @@ def _build_yaml_repair_hints(issues: list[str]) -> list[str]:
             "            target:\n"
             "              entity_id: light.example"
         )
+    if "top-level conditions: block" in combined:
+        hints.append(
+            "Guards that prevent the entire automation from running belong in conditions:, not in choose: branches:\n"
+            "  conditions:\n"
+            "    - condition: state\n"
+            "      entity_id: switch.main_router_led\n"
+            '      state: "on"\n'
+            "    - condition: state\n"
+            "      entity_id: switch.mesh_mesh_led\n"
+            '      state: "on"'
+        )
     negated_guard_specs = _extract_negated_state_guard_issue_specs(issues, limit=4)
     if negated_guard_specs:
         for entity_id, state in negated_guard_specs[:2]:
@@ -1307,6 +1318,25 @@ def _yaml_has_weekdays(yaml_text: str, weekdays: list[str]) -> bool:
     return all(re.search(rf"^\s*-\s*{weekday}\s*$", normalized, re.MULTILINE) for weekday in weekdays)
 
 
+def _yaml_guard_is_in_conditions_block(yaml_text: str, entity_id: str) -> bool:
+    """Return True when entity_id appears in the top-level conditions: block, not just actions:."""
+    if not yaml_text or not entity_id:
+        return False
+    lines = yaml_text.split("\n")
+    in_conditions = False
+    entity_text = str(entity_id or "").strip()
+    for line in lines:
+        if re.match(r"^conditions\s*:", line):
+            in_conditions = True
+            continue
+        if in_conditions:
+            if re.match(r"^[a-z_]\w*\s*:", line) and not line.startswith(" "):
+                break
+            if entity_text in line:
+                return True
+    return False
+
+
 def _yaml_has_positive_state_guard(
     yaml_text: str,
     entity_id: str,
@@ -1477,11 +1507,20 @@ def _collect_generated_yaml_issues(
         entity_id = guard["entity_id"]
         blocked_state = guard["blocked_state"]
         required_state = guard["required_state"]
+        has_guard = False
         if required_state and _yaml_has_positive_state_guard(
             normalized_yaml, entity_id, required_state
         ):
-            continue
-        if _yaml_has_negated_state_guard(normalized_yaml, entity_id, blocked_state):
+            has_guard = True
+        elif _yaml_has_negated_state_guard(normalized_yaml, entity_id, blocked_state):
+            has_guard = True
+        if has_guard:
+            if not _yaml_guard_is_in_conditions_block(normalized_yaml, entity_id):
+                issues.append(
+                    f"Guard {entity_id} must be in the top-level conditions: block, not inside a "
+                    f"choose: branch. Automations that must not start when {entity_id} is "
+                    f"{blocked_state} need this as an upfront blocking condition."
+                )
             continue
         issues.append(f"Respect the explicit guard {entity_id} before running the actions.")
 

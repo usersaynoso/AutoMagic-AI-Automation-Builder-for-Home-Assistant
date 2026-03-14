@@ -100,6 +100,9 @@ window, or follow-up action is already stated elsewhere in the same prompt.
 when matching sensor families from the provided entities.
 - Treat time-window guards or exclusions such as "not between 9am and 5pm on a \
 weekday" as conditions, not as the automation's trigger schedule.
+- When the user says "don't start/run X if Y is already off/on", encode that as a \
+blocking condition in the top-level conditions: block, not as a choose: branch inside \
+actions:. The automation should not execute at all when the guard fails.
 - Preserve the user's boolean logic exactly when they combine OR and AND clauses across \
 different sensor or entity families.
 - When the user asks to report whichever sensor triggered, capture the triggering sensor \

@@ -209,6 +209,7 @@ OUTPUT RULES:
 - Read the entire request as one combined condition/action sequence before deciding anything is missing. Do not ask about a sub-step when the needed threshold, guard, time window, or follow-up action is already stated elsewhere in the same prompt.
 - Interpret wattage/watts/kW as power, amps/amperage as current, and volts as voltage when matching sensor families from the provided entities.
 - Treat time-window guards or exclusions such as "not between 9am and 5pm on a weekday" as conditions, not as the automation's trigger schedule.
+- When the user says "don't start/run X if Y is already off/on", encode that as a blocking condition in the top-level conditions: block, not as a choose: branch inside actions:. The automation should not execute at all when the guard fails.
 - Preserve the user's boolean logic exactly when they combine OR and AND clauses across different sensor or entity families.
 - When the user asks to report whichever sensor triggered, capture the triggering sensor name and value in variables so the notification text includes the real sensor and reading.
 - When a matched entity has sibling variants such as left/right, L1/L2/L3, or numbered variants, and the user asks for all/both/three/every member of the set, include the full relevant sibling set.
@@ -1311,6 +1312,16 @@ class AutoMagicCard extends LitElement {
     return sectionLines.join("\n");
   }
 
+  _yamlGuardIsInConditionsBlock(yaml, entityId) {
+    const conditionsBlock = this._extractTopLevelSectionBlock(yaml, "conditions");
+    const normalizedEntityId = this._normalizeText(entityId);
+    if (!conditionsBlock || !normalizedEntityId) return false;
+
+    return conditionsBlock
+      .split(/\r?\n/)
+      .some((line, index) => index > 0 && line.includes(normalizedEntityId));
+  }
+
   _extractActionBlocks(yaml) {
     const section = this._extractTopLevelSectionBlock(yaml, "actions");
     if (!section) return [];
@@ -1563,6 +1574,10 @@ class AutoMagicCard extends LitElement {
         issues.push(
           `Respect the explicit guard ${guard.entity_id} before running the actions.`
         );
+      } else if (!this._yamlGuardIsInConditionsBlock(text, guard.entity_id)) {
+        issues.push(
+          `Guard ${guard.entity_id} must be in the top-level conditions: block, not inside a choose: branch. Automations that must not start when ${guard.entity_id} is ${guard.blockedState} need this as an upfront blocking condition.`
+        );
       }
     });
     if (
@@ -1778,6 +1793,18 @@ class AutoMagicCard extends LitElement {
           "          - action: light.turn_on\n" +
           "            target:\n" +
           "              entity_id: light.example"
+      );
+    }
+    if (combined.includes("top-level conditions: block")) {
+      hints.push(
+        "Guards that prevent the entire automation from running belong in conditions:, not in choose: branches:\n" +
+          "  conditions:\n" +
+          "    - condition: state\n" +
+          "      entity_id: switch.main_router_led\n" +
+          '      state: "on"\n' +
+          "    - condition: state\n" +
+          "      entity_id: switch.mesh_mesh_led\n" +
+          '      state: "on"'
       );
     }
     const negatedGuardSpecs = this._extractNegatedStateGuardIssueSpecs(issues, 4);

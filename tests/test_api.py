@@ -26,6 +26,7 @@ from custom_components.automagic.api import (
     _get_config_data,
     _run_generation_job,
     _validate_generated_yaml,
+    _yaml_guard_is_in_conditions_block,
     async_delete_history_entry_request,
     async_get_history_payload,
     async_get_services_payload,
@@ -1772,6 +1773,116 @@ def test_extract_negated_state_guards_matches_iphone_audio_output_phrase():
     assert guards == [{"entity_id": "sensor.iphone_13_audio_output", "state": "Speaker"}]
 
 
+def test_yaml_guard_is_in_conditions_block_only_matches_top_level_conditions():
+    """Guard placement should only count when the entity is inside the top-level conditions block."""
+    yaml_with_top_level_guard = (
+        "alias: Router Guard\n"
+        "description: Test\n"
+        "triggers: []\n"
+        "conditions:\n"
+        "  - condition: state\n"
+        "    entity_id: switch.main_router_led\n"
+        '    state: "on"\n'
+        "actions: []\n"
+        "mode: single\n"
+    )
+    yaml_with_choose_guard = (
+        "alias: Router Guard\n"
+        "description: Test\n"
+        "triggers: []\n"
+        "conditions: []\n"
+        "actions:\n"
+        "  - choose:\n"
+        "      - conditions:\n"
+        "          - condition: state\n"
+        "            entity_id: switch.main_router_led\n"
+        '            state: "on"\n'
+        "        sequence:\n"
+        "          - action: light.turn_on\n"
+        "            target:\n"
+        "              entity_id: light.bar_lamp\n"
+        "mode: single\n"
+    )
+
+    assert _yaml_guard_is_in_conditions_block(
+        yaml_with_top_level_guard, "switch.main_router_led"
+    )
+    assert not _yaml_guard_is_in_conditions_block(
+        yaml_with_choose_guard, "switch.main_router_led"
+    )
+
+
+def test_collect_generated_yaml_issues_flags_guards_nested_in_choose_branch():
+    """Prompt-aware validation should reject explicit guards that only exist inside choose branches."""
+    prompt = (
+        "Don't start it at all if either of the router LED switches are already off, "
+        "as that means the network is down."
+    )
+    entities = [
+        {
+            "entity_id": "switch.main_router_led",
+            "name": "Main Router LED",
+            "state": "on",
+            "domain": "switch",
+        },
+        {
+            "entity_id": "switch.mesh_mesh_led",
+            "name": "Mesh Router LED",
+            "state": "on",
+            "domain": "switch",
+        },
+        {
+            "entity_id": "light.bar_lamp",
+            "name": "Bar Lamp",
+            "state": "off",
+            "domain": "light",
+        },
+    ]
+    yaml_text = (
+        "alias: Router Guard\n"
+        "description: Test\n"
+        "triggers:\n"
+        "  - trigger: time\n"
+        '    at: "08:00:00"\n'
+        "conditions: []\n"
+        "actions:\n"
+        "  - choose:\n"
+        "      - conditions:\n"
+        "          - condition: state\n"
+        "            entity_id: switch.main_router_led\n"
+        '            state: "on"\n'
+        "          - condition: state\n"
+        "            entity_id: switch.mesh_mesh_led\n"
+        '            state: "on"\n'
+        "        sequence:\n"
+        "          - action: light.turn_on\n"
+        "            target:\n"
+        "              entity_id: light.bar_lamp\n"
+        "mode: single\n"
+    )
+
+    issues = _collect_generated_yaml_issues(prompt, entities, yaml_text)
+
+    assert any(
+        (
+            "Guard switch.main_router_led must be in the top-level conditions: block, "
+            "not inside a choose: branch. Automations that must not start when "
+            "switch.main_router_led is off need this as an upfront blocking condition."
+        )
+        in issue
+        for issue in issues
+    )
+    assert any(
+        (
+            "Guard switch.mesh_mesh_led must be in the top-level conditions: block, "
+            "not inside a choose: branch. Automations that must not start when "
+            "switch.mesh_mesh_led is off need this as an upfront blocking condition."
+        )
+        in issue
+        for issue in issues
+    )
+
+
 def test_negated_state_guard_repairs_include_concrete_yaml_examples():
     """Repair hints and retry prompts should embed the exact blocked-state YAML shape."""
     issues = [
@@ -1870,6 +1981,27 @@ def test_yaml_repair_hints_include_concrete_examples_for_new_issue_types():
     assert "Keep both guard switches as separate conditions like this:" in repair_messages[-1]["content"]
     assert "entity_id: switch.main_router_led" in repair_messages[-1]["content"]
     assert "entity_id: switch.mesh_mesh_led" in repair_messages[-1]["content"]
+
+
+def test_yaml_repair_hints_include_top_level_conditions_guard_example():
+    """Repair hints should explain that blocking guards belong in top-level conditions."""
+    hints = _build_yaml_repair_hints(
+        [
+            (
+                "Guard switch.main_router_led must be in the top-level conditions: block, "
+                "not inside a choose: branch. Automations that must not start when "
+                "switch.main_router_led is off need this as an upfront blocking condition."
+            )
+        ]
+    )
+
+    assert any(
+        "Guards that prevent the entire automation from running belong in conditions:, not in choose: branches:"
+        in hint
+        for hint in hints
+    )
+    assert any("entity_id: switch.main_router_led" in hint for hint in hints)
+    assert any("entity_id: switch.mesh_mesh_led" in hint for hint in hints)
 
 
 @pytest.mark.asyncio

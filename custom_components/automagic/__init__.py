@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 
+from homeassistant import config_entries
 from homeassistant.components import frontend
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
@@ -19,8 +21,18 @@ from .api import (
     AutoMagicInstallView,
     AutoMagicServicesView,
 )
-from .const import CONF_DEFAULT_SERVICE_ID, DOMAIN
-from .service_config import build_service_config, normalize_config_data
+from .const import (
+    CONF_API_KEY,
+    CONF_DEFAULT_SERVICE_ID,
+    CONF_ENDPOINT_URL,
+    CONF_MODEL,
+    CONF_PROVIDER,
+    CONF_REQUEST_TIMEOUT,
+    CONF_SERVICE_ID,
+    DOMAIN,
+    PROVIDER_OPENAI,
+)
+from .service_config import build_service_config, build_service_label, normalize_config_data
 from .ws_api import async_register_websocket_commands
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
@@ -29,6 +41,7 @@ _CARD_URL = "/automagic/automagic-card.js"
 _DATA_STATIC_REGISTERED = "static_registered"
 _DATA_VIEWS_REGISTERED = "views_registered"
 _DATA_WS_REGISTERED = "ws_registered"
+_SERVICE_SUBENTRY_TYPE = "service"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -41,9 +54,84 @@ def _entry_title(data: dict) -> str:
 
 def _entry_runtime_config(entry: ConfigEntry) -> dict:
     """Return normalized entry data including any service subentries."""
+    values = _entry_subentries(entry)
+    return normalize_config_data(entry.data, values)
+
+
+def _entry_subentries(entry: ConfigEntry) -> list:
+    """Return config subentries as a list."""
     subentries = getattr(entry, "subentries", {})
     values = subentries.values() if hasattr(subentries, "values") else subentries
-    return normalize_config_data(entry.data, values)
+    return list(values or [])
+
+
+def _primary_service_config(entry: ConfigEntry) -> dict | None:
+    """Return the primary service config stored on the entry."""
+    endpoint_url = str(entry.data.get(CONF_ENDPOINT_URL, "") or "").strip()
+    model = str(entry.data.get(CONF_MODEL, "") or "").strip()
+    provider = str(entry.data.get(CONF_PROVIDER, "") or "").strip().lower()
+    api_key = str(entry.data.get(CONF_API_KEY, "") or "").strip()
+
+    if not model:
+        return None
+    if provider != PROVIDER_OPENAI and not endpoint_url:
+        return None
+
+    return build_service_config(
+        endpoint_url,
+        model,
+        service_id=entry.data.get(CONF_SERVICE_ID),
+        provider=provider or None,
+        api_key=api_key or None,
+        max_tokens=entry.data.get("max_tokens"),
+        request_timeout=entry.data.get(CONF_REQUEST_TIMEOUT),
+        temperature=entry.data.get("temperature"),
+    )
+
+
+def _find_primary_service_subentry(entry: ConfigEntry, service_id: str):
+    """Return the subentry that mirrors the primary service, if present."""
+    normalized_service_id = str(service_id or "").strip()
+    if not normalized_service_id:
+        return None
+
+    for subentry in _entry_subentries(entry):
+        data = getattr(subentry, "data", None)
+        if not isinstance(data, Mapping):
+            continue
+        if str(data.get(CONF_SERVICE_ID, "") or "").strip() == normalized_service_id:
+            return subentry
+    return None
+
+
+def _sync_primary_service_subentry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Ensure the primary configured service also exists as a visible service subentry."""
+    service = _primary_service_config(entry)
+    if service is None:
+        return
+
+    title = build_service_label(service)
+    existing = _find_primary_service_subentry(entry, service[CONF_SERVICE_ID])
+
+    if existing is None:
+        hass.config_entries.async_add_subentry(
+            entry,
+            config_entries.ConfigSubentry(
+                data=service,
+                subentry_type=_SERVICE_SUBENTRY_TYPE,
+                title=title,
+                unique_id=service[CONF_SERVICE_ID],
+            ),
+        )
+        return
+
+    hass.config_entries.async_update_subentry(
+        entry,
+        existing,
+        data=service,
+        title=title,
+        unique_id=service[CONF_SERVICE_ID],
+    )
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -81,6 +169,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     desired_title = _entry_title(entry.data)
     if entry.title != desired_title:
         hass.config_entries.async_update_entry(entry, title=desired_title)
+
+    _sync_primary_service_subentry(hass, entry)
 
     domain_data = hass.data.setdefault(DOMAIN, {})
     domain_data[entry.entry_id] = _entry_runtime_config(entry)

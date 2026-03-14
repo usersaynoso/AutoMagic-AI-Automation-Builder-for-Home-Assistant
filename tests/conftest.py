@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass, field
 from types import ModuleType
 from unittest.mock import MagicMock
+from uuid import uuid4
 
 
 class _StubModule(ModuleType):
@@ -111,8 +113,18 @@ class _ConfigSubentryFlow:
         return getattr(self, "_entry", MagicMock())
 
 
+@dataclass
+class _ConfigSubentry:
+    data: dict
+    subentry_type: str
+    title: str
+    unique_id: str | None = None
+    subentry_id: str = field(default_factory=lambda: uuid4().hex)
+
+
 config_entries.ConfigFlow = _ConfigFlow
 config_entries.ConfigEntry = MagicMock
+config_entries.ConfigSubentry = _ConfigSubentry
 config_entries.ConfigSubentryFlow = _ConfigSubentryFlow
 config_entries.OptionsFlow = type("OptionsFlow", (), {})
 homeassistant_mod.config_entries = config_entries

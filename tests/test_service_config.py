@@ -126,3 +126,33 @@ def test_normalize_config_data_includes_service_subentries():
         "primary",
         "backup",
     ]
+
+
+def test_normalize_config_data_deduplicates_primary_service_subentry_mirror():
+    """A visible primary-service subentry should not duplicate the runtime service list."""
+    primary = build_service_config(
+        "http://localhost:11434",
+        "qwen2.5:14b",
+        service_id="primary",
+    )
+    mirrored_primary = {
+        "data": build_service_config(
+            "http://localhost:11434",
+            "qwen2.5:14b",
+            service_id="primary",
+        )
+    }
+    backup = {
+        "data": build_service_config(
+            "http://remote:1234",
+            "gpt-4o-mini",
+            service_id="backup",
+        )
+    }
+
+    normalized = normalize_config_data(primary, [mirrored_primary, backup])
+
+    assert [service[CONF_SERVICE_ID] for service in normalized[CONF_SERVICES]] == [
+        "primary",
+        "backup",
+    ]

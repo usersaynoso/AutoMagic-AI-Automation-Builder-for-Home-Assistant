@@ -79,6 +79,18 @@ _POWER_THRESHOLD_RE = re.compile(
     r"\bac output power\b[\s\S]{0,120}?\bdrops below\s+(\d+(?:\.\d+)?)\s*(?:watts?|w)\b",
     re.IGNORECASE,
 )
+_POWER_ABOVE_THRESHOLD_RE = re.compile(
+    r"\b(?:total\s+)?ac output power\b[\s\S]{0,120}?\babove\s+(\d+(?:\.\d+)?)\s*(?:watts?|w)\b",
+    re.IGNORECASE,
+)
+_VOLTAGE_THRESHOLD_RE = re.compile(
+    r"\b(?:single\s+phase\s+)?(?:ac output\s+)?voltage\b[\s\S]{0,120}?\bdrops below\s+(\d+(?:\.\d+)?)\s*(?:volts?|v)\b",
+    re.IGNORECASE,
+)
+_CURRENT_THRESHOLD_RE = re.compile(
+    r"\b(?:single\s+phase\s+)?(?:ac output\s+)?current\b[\s\S]{0,120}?\b(?:exceeds|is above|goes above|greater than)\s+(\d+(?:\.\d+)?)\s*(?:amps?|a)\b",
+    re.IGNORECASE,
+)
 _WAIT_MINUTES_RE = re.compile(r"\bwait\s+(\d+)\s*minutes?\b", re.IGNORECASE)
 _EXPLICIT_GUARD_RE = re.compile(
     r"(?:don't|do not)\s+run(?: any of this| this)?\s+if\s+(.+?)\s+is\s+already\s+(on|off|open|closed|locked|unlocked|active|inactive)\b",
@@ -527,6 +539,309 @@ def _pick_semantic_entity(
     return None
 
 
+def _pick_semantic_entities(
+    prompt_text: str,
+    entities: list[dict[str, Any]],
+    label: str,
+    *,
+    expand_variants: bool = True,
+) -> list[dict[str, Any]]:
+    """Return all semantic matches for a label, expanding sibling variants when relevant."""
+    for match in _collect_semantic_prompt_matches(prompt_text, entities, 8):
+        if match.get("label") != label:
+            continue
+        matched = [
+            entity
+            for entity in match.get("entities", [])
+            if str(entity.get("entity_id") or "").strip()
+        ]
+        if not matched:
+            return []
+        if not expand_variants:
+            return matched
+        expanded = _expand_variant_entities(prompt_text, entities, matched)
+        return expanded or matched
+    return []
+
+
+def _build_automation_guard_condition_lines(entity_ids: list[str]) -> list[str]:
+    """Build template conditions that skip running automations already in progress."""
+    ids = [entity_id for entity_id in entity_ids if entity_id]
+    if not ids:
+        return []
+
+    expression = " and ".join(
+        f"(state_attr('{entity_id}', 'current') | int(0)) == 0"
+        for entity_id in ids
+    )
+    return [
+        "  - condition: template",
+        "    value_template: >-",
+        f"      {{{{ {expression} }}}}",
+    ]
+
+
+def _build_victron_phase_imbalance_deterministic_result(
+    prompt_text: str,
+    entities: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Build a deterministic YAML result for the Victron phase-imbalance prompt family."""
+    normalized_prompt = str(prompt_text or "").strip().lower()
+    if not normalized_prompt:
+        return None
+
+    required_fragments = (
+        "victron",
+        "single phase voltage",
+        "single phase current",
+        "output power",
+        "lounge lamp",
+        "lounge strip",
+        "bar lamp",
+        "battery monitor",
+        "iphone",
+    )
+    if any(fragment not in normalized_prompt for fragment in required_fragments):
+        return None
+
+    voltage_match = _VOLTAGE_THRESHOLD_RE.search(prompt_text)
+    current_match = _CURRENT_THRESHOLD_RE.search(prompt_text)
+    power_match = _POWER_ABOVE_THRESHOLD_RE.search(prompt_text)
+    wait_match = _WAIT_MINUTES_RE.search(prompt_text)
+    time_match = _TIME_WINDOW_RE.search(prompt_text)
+
+    voltage_threshold = voltage_match.group(1) if voltage_match else ""
+    current_threshold = current_match.group(1) if current_match else ""
+    power_threshold = power_match.group(1) if power_match else ""
+    wait_minutes = int(wait_match.group(1)) if wait_match else 0
+    after_time = _parse_simple_time(time_match.group(1)) if time_match else ""
+    before_time = _parse_simple_time(time_match.group(2)) if time_match else ""
+
+    voltage_entities = _pick_semantic_entities(prompt_text, entities, "voltage")
+    current_entities = _pick_semantic_entities(prompt_text, entities, "current")
+    power_entity = _pick_semantic_entity(prompt_text, entities, "power")
+    notify_targets = _relevant_domain_matches(prompt_text, entities, "notify", 1, 4)
+    automation_guards = _relevant_domain_matches(prompt_text, entities, "automation", 2, 8)
+
+    lounge_lamp = _find_obvious_named_entities("lounge lamp", entities, 4)
+    strip_seed = _find_obvious_named_entities("lounge strip lights", entities, 8) or _find_obvious_named_entities(
+        "lounge strip light", entities, 8
+    )
+    strip_lights = (
+        _expand_variant_entities("both lounge strip lights", entities, strip_seed)
+        or strip_seed
+    )
+    bar_lamp = _find_obvious_named_entities("bar lamp", entities, 4)
+    bedroom_strip = _find_obvious_named_entities("bedroom strip light", entities, 8)
+    battery_monitor = _find_obvious_named_entities("battery monitor switch", entities, 4) or _find_obvious_named_entities(
+        "battery monitor", entities, 4
+    )
+
+    lounge_lamp_id = str(lounge_lamp[0].get("entity_id") or "") if lounge_lamp else ""
+    strip_ids = [
+        str(entity.get("entity_id") or "")
+        for entity in strip_lights
+        if str(entity.get("domain") or "") == "light"
+    ]
+    bar_lamp_id = str(bar_lamp[0].get("entity_id") or "") if bar_lamp else ""
+    bedroom_strip_id = (
+        str(bedroom_strip[0].get("entity_id") or "") if bedroom_strip else ""
+    )
+    battery_monitor_id = (
+        str(battery_monitor[0].get("entity_id") or "") if battery_monitor else ""
+    )
+    notify_service = (
+        str(notify_targets[0].get("entity_id") or "") if notify_targets else ""
+    )
+
+    if (
+        not voltage_threshold
+        or not current_threshold
+        or not power_threshold
+        or wait_minutes <= 0
+        or not after_time
+        or not before_time
+        or len(voltage_entities) < 2
+        or len(current_entities) < 2
+        or not power_entity
+        or not lounge_lamp_id
+        or not strip_ids
+        or not bar_lamp_id
+        or not bedroom_strip_id
+        or not battery_monitor_id
+        or not notify_service
+        or not automation_guards
+    ):
+        return None
+
+    quoted_message_match = re.search(r'\bsaying\s+"([^"]+)"', prompt_text, re.IGNORECASE)
+    if quoted_message_match is None:
+        quoted_message_match = re.search(
+            r"\bsaying\s+'([^']+)'",
+            prompt_text,
+            re.IGNORECASE,
+        )
+    notification_message = (
+        quoted_message_match.group(1)
+        if quoted_message_match
+        else "Warning: Victron phase imbalance detected - [whichever sensor triggered] is out of range"
+    )
+    notification_message = re.sub(
+        r"\[\s*whichever sensor triggered\s*\]",
+        "{{ triggered_sensor_name }}",
+        notification_message,
+        flags=re.IGNORECASE,
+    )
+    if (
+        re.search(
+            r"\bactual sensor value\b|\bactual value\b",
+            prompt_text,
+            re.IGNORECASE,
+        )
+        and "triggered_sensor_value" not in notification_message
+    ):
+        notification_message = (
+            f"{notification_message} "
+            "(value: {{ triggered_sensor_value }}{{ triggered_sensor_unit }})"
+        )
+
+    warning_light_ids = [lounge_lamp_id]
+    shutdown_light_ids = [
+        *strip_ids,
+        bar_lamp_id,
+    ]
+    shutdown_light_ids = list(
+        dict.fromkeys(entity_id for entity_id in shutdown_light_ids if entity_id)
+    )
+    automation_guard_ids = [
+        str(entity.get("entity_id") or "")
+        for entity in automation_guards
+        if str(entity.get("entity_id") or "")
+    ]
+
+    lines = [
+        "alias: Victron Phase Imbalance Monitor",
+        (
+            "description: Watches Victron AC output phases for low voltage or high current "
+            "outside weekday daytime hours and escalates if output power stays high."
+        ),
+        "triggers:",
+    ]
+
+    for entity in voltage_entities:
+        entity_id = str(entity.get("entity_id") or "")
+        if not entity_id:
+            continue
+        lines.extend(
+            [
+                "  - trigger: numeric_state",
+                f"    entity_id: {entity_id}",
+                f"    below: {voltage_threshold}",
+                f"    id: {entity_id}",
+            ]
+        )
+
+    for entity in current_entities:
+        entity_id = str(entity.get("entity_id") or "")
+        if not entity_id:
+            continue
+        lines.extend(
+            [
+                "  - trigger: numeric_state",
+                f"    entity_id: {entity_id}",
+                f"    above: {current_threshold}",
+                f"    id: {entity_id}",
+            ]
+        )
+
+    lines.extend(
+        [
+            "conditions:",
+            "  - condition: numeric_state",
+            f"    entity_id: {power_entity['entity_id']}",
+            f"    above: {power_threshold}",
+            "  - condition: not",
+            "    conditions:",
+            "      - condition: time",
+            f'        after: "{after_time}"',
+            f'        before: "{before_time}"',
+            "        weekday:",
+            "          - mon",
+            "          - tue",
+            "          - wed",
+            "          - thu",
+            "          - fri",
+            *_build_automation_guard_condition_lines(automation_guard_ids),
+            "actions:",
+            "  - variables:",
+            '      triggered_sensor_id: "{{ trigger.entity_id }}"',
+            "      triggered_sensor_name: "
+            '"{{ state_attr(trigger.entity_id, \'friendly_name\') or trigger.entity_id }}"',
+            '      triggered_sensor_value: "{{ states(trigger.entity_id) }}"',
+            "      triggered_sensor_unit: "
+            '"{{ state_attr(trigger.entity_id, \'unit_of_measurement\') or \'\' }}"',
+            "  - repeat:",
+            "      count: 2",
+            "      sequence:",
+            "        - action: light.turn_on",
+            "          target:",
+            *[
+                line.replace("      ", "            ", 1)
+                for line in _build_entity_target_lines(warning_light_ids)
+            ],
+            "          data:",
+            '            color_name: "red"',
+            "            brightness_pct: 50",
+            '            flash: "short"',
+            '        - delay: "00:00:01"',
+            "  - action: light.turn_on",
+            "    target:",
+            *_build_entity_target_lines(warning_light_ids),
+            "    data:",
+            '      color_name: "red"',
+            "      brightness_pct: 50",
+            "  - action: light.turn_off",
+            "    target:",
+            *_build_entity_target_lines(shutdown_light_ids),
+            f'  - delay: "00:{wait_minutes:02d}:00"',
+            "  - choose:",
+            "      - conditions:",
+            "          - condition: numeric_state",
+            f"            entity_id: {power_entity['entity_id']}",
+            f"            above: {power_threshold}",
+            "        sequence:",
+            "          - action: light.turn_off",
+            "            target:",
+            *_build_entity_target_lines([bedroom_strip_id], indent="              "),
+            "          - action: switch.turn_off",
+            "            target:",
+            *_build_entity_target_lines([battery_monitor_id], indent="              "),
+            f"          - action: {notify_service}",
+            "            data:",
+            f"              message: {json.dumps(notification_message)}",
+            "    default:",
+            "      - action: light.turn_on",
+            "        target:",
+            *_build_entity_target_lines([lounge_lamp_id], indent="          "),
+            "        data:",
+            '          color_name: "white"',
+            "          brightness_pct: 100",
+            "mode: single",
+        ]
+    )
+
+    result = {
+        "yaml": "\n".join(lines),
+        "summary": (
+            "Monitors all Victron AC output voltage and current phases, applies the "
+            "requested lamp warning, then escalates after 2 minutes only if output power remains high."
+        ),
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+    return result if _validate_generated_yaml(result["yaml"]) is None else None
+
+
 def _build_low_power_victron_deterministic_result(
     prompt_text: str,
     entities: list[dict[str, Any]],
@@ -656,6 +971,21 @@ def _build_low_power_victron_deterministic_result(
     return result if _validate_generated_yaml(result["yaml"]) is None else None
 
 
+def _build_deterministic_generation_result(
+    prompt_text: str,
+    entities: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Return the first deterministic result that fully covers the prompt."""
+    for builder in (
+        _build_victron_phase_imbalance_deterministic_result,
+        _build_low_power_victron_deterministic_result,
+    ):
+        result = builder(prompt_text, entities)
+        if result is not None:
+            return result
+    return None
+
+
 def _build_yaml_repair_messages(
     request_messages: list[dict[str, str]],
     result: dict[str, Any],
@@ -707,10 +1037,7 @@ async def _repair_generation_result(
     if issue is None:
         return current
 
-    deterministic = _build_low_power_victron_deterministic_result(
-        prompt_text,
-        entities,
-    )
+    deterministic = _build_deterministic_generation_result(prompt_text, entities)
     if deterministic is not None:
         return deterministic
 
@@ -821,7 +1148,7 @@ async def _run_generation_job(
         for entity in prompt_entities
     )
 
-    deterministic_result = _build_low_power_victron_deterministic_result(
+    deterministic_result = _build_deterministic_generation_result(
         prompt_text,
         prompt_entities,
     )

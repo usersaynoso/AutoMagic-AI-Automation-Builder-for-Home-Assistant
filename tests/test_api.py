@@ -15,6 +15,7 @@ from custom_components.automagic.api import (
     _create_generation_job,
     _get_config_data,
     _run_generation_job,
+    _validate_generated_yaml,
     async_get_services_payload,
     async_start_generation_request,
 )
@@ -325,6 +326,165 @@ async def test_run_generation_job_uses_deterministic_victron_low_power_fallback(
     assert 'before: "06:00:00"' in job["yaml"]
     assert 'state: "on"' in job["yaml"]
     assert "notify.mobile_app_iphone_13" in job["yaml"]
+
+
+@pytest.mark.asyncio
+async def test_run_generation_job_uses_deterministic_victron_phase_imbalance_fallback():
+    """The Victron phase-imbalance prompt should compile without relying on brittle model YAML."""
+    hass = _make_hass()
+    prompt = (
+        "Monitor all three AC output phases from the Victron. "
+        "If any single phase voltage drops below 210 volts OR any single phase current exceeds 15 amps, "
+        "AND the total AC output power is above 100 watts, AND it's not between 9am and 5pm on a weekday, "
+        "turn the lounge lamp red at 50% brightness and flash it twice, then turn off both lounge strip lights "
+        "and the bar lamp. Wait 2 minutes. If the output power is still above 100 watts, turn off the bedroom "
+        "strip light and disable the battery monitor switch. Then send a notification to my iPhone saying "
+        '"Warning: Victron phase imbalance detected - [whichever sensor triggered] is out of range" '
+        "with the actual sensor value included in the message. If the output power has dropped below 100 watts "
+        "during the 2 minute wait, instead turn the lounge lamp back to white at full brightness and do nothing "
+        "else. Don't run any of this if the electricity balance automation is already active."
+    )
+    job = _create_generation_job(hass, prompt, None)
+
+    entities = [
+        {
+            "entity_id": "sensor.victron_mk3_ac_output_voltage",
+            "name": "AC Output Voltage",
+            "state": "230",
+            "domain": "sensor",
+            "device_class": "voltage",
+        },
+        {
+            "entity_id": "sensor.victron_mk3_ac_output_voltage_l2",
+            "name": "AC Output Voltage L2",
+            "state": "229",
+            "domain": "sensor",
+            "device_class": "voltage",
+        },
+        {
+            "entity_id": "sensor.victron_mk3_ac_output_voltage_l3",
+            "name": "AC Output Voltage L3",
+            "state": "228",
+            "domain": "sensor",
+            "device_class": "voltage",
+        },
+        {
+            "entity_id": "sensor.victron_mk3_ac_output_current",
+            "name": "AC Output Current",
+            "state": "11",
+            "domain": "sensor",
+            "device_class": "current",
+        },
+        {
+            "entity_id": "sensor.victron_mk3_ac_output_current_l2",
+            "name": "AC Output Current L2",
+            "state": "12",
+            "domain": "sensor",
+            "device_class": "current",
+        },
+        {
+            "entity_id": "sensor.victron_mk3_ac_output_current_l3",
+            "name": "AC Output Current L3",
+            "state": "13",
+            "domain": "sensor",
+            "device_class": "current",
+        },
+        {
+            "entity_id": "sensor.victron_mk3_ac_output_power",
+            "name": "AC Output Power",
+            "state": "333",
+            "domain": "sensor",
+            "device_class": "power",
+        },
+        {
+            "entity_id": "light.lounge_lamp",
+            "name": "Lounge Lamp",
+            "state": "off",
+            "domain": "light",
+        },
+        {
+            "entity_id": "light.lounge_strip_lights_left",
+            "name": "Lounge Strip Lights Left",
+            "state": "on",
+            "domain": "light",
+        },
+        {
+            "entity_id": "light.lounge_strip_lights_right",
+            "name": "Lounge Strip Lights Right",
+            "state": "on",
+            "domain": "light",
+        },
+        {
+            "entity_id": "light.bar_lamp",
+            "name": "Bar Lamp",
+            "state": "on",
+            "domain": "light",
+        },
+        {
+            "entity_id": "light.bedroom_strip_light_left",
+            "name": "Bedroom Strip Light Left",
+            "state": "on",
+            "domain": "light",
+        },
+        {
+            "entity_id": "switch.victron_mk3_battery_monitor",
+            "name": "Battery Monitor",
+            "state": "on",
+            "domain": "switch",
+        },
+        {
+            "entity_id": "notify.mobile_app_iphone_13",
+            "name": "Notify Iphone 13",
+            "state": "service",
+            "domain": "notify",
+            "device_class": "service",
+        },
+        {
+            "entity_id": "automation.electricity_balance_above_ps1",
+            "name": "Electricity balance ABOVE £1",
+            "state": "on",
+            "domain": "automation",
+        },
+        {
+            "entity_id": "automation.electricity_balance_low",
+            "name": "Electricity balance low",
+            "state": "off",
+            "domain": "automation",
+        },
+    ]
+
+    with patch(
+        "custom_components.automagic.api.get_entity_context",
+        AsyncMock(return_value=entities),
+    ), patch(
+        "custom_components.automagic.api.async_get_clientsession",
+        side_effect=AssertionError("Backend client setup should not run for the deterministic fallback"),
+    ):
+        await _run_generation_job(
+            hass,
+            job["job_id"],
+            prompt,
+            None,
+        )
+
+    assert job["status"] == "completed"
+    assert _validate_generated_yaml(job["yaml"]) is None
+    assert "alias: Victron Phase Imbalance Monitor" in job["yaml"]
+    assert "sensor.victron_mk3_ac_output_voltage_l2" in job["yaml"]
+    assert "sensor.victron_mk3_ac_output_current_l3" in job["yaml"]
+    assert 'after: "09:00:00"' in job["yaml"]
+    assert 'before: "17:00:00"' in job["yaml"]
+    assert "state_attr('automation.electricity_balance_above_ps1', 'current')" in job["yaml"]
+    assert "count: 2" in job["yaml"]
+    assert 'color_name: "red"' in job["yaml"]
+    assert "brightness_pct: 50" in job["yaml"]
+    assert 'delay: "00:02:00"' in job["yaml"]
+    assert "switch.victron_mk3_battery_monitor" in job["yaml"]
+    assert "notify.mobile_app_iphone_13" in job["yaml"]
+    assert "triggered_sensor_name" in job["yaml"]
+    assert "triggered_sensor_value" in job["yaml"]
+    assert 'color_name: "white"' in job["yaml"]
+    assert "brightness_pct: 100" in job["yaml"]
 
 
 @pytest.mark.asyncio

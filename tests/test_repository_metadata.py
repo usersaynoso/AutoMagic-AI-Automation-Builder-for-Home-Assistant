@@ -45,7 +45,7 @@ def test_manifest_declares_single_config_entry_service_integration():
     assert manifest["integration_type"] == "service"
     assert manifest["issue_tracker"] == f"{CANONICAL_REPO_URL}/issues"
     assert manifest["single_config_entry"] is True
-    assert manifest["version"] == "0.2.14"
+    assert manifest["version"] == "0.2.15"
 
 
 def test_manifest_keys_follow_home_assistant_ordering_rules():

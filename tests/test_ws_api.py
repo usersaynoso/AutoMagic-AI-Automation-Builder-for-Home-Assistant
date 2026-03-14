@@ -10,6 +10,7 @@ from custom_components.automagic.ws_api import (
     async_register_websocket_commands,
     websocket_generate,
     websocket_generate_status,
+    websocket_history_delete,
     websocket_services,
 )
 
@@ -23,7 +24,7 @@ def test_register_websocket_commands_registers_all_handlers():
     ) as register_command:
         async_register_websocket_commands(hass)
 
-    assert register_command.call_count == 6
+    assert register_command.call_count == 7
 
 
 @pytest.mark.asyncio
@@ -89,4 +90,48 @@ async def test_websocket_services_sends_service_payload():
             "services": [{"service_id": "primary"}],
             "default_service_id": "primary",
         },
+    )
+
+
+@pytest.mark.asyncio
+async def test_websocket_history_delete_sends_updated_history():
+    """History delete websocket handler should return the refreshed history payload."""
+    hass = MagicMock()
+    connection = MagicMock()
+    msg = {"id": 13, "type": "automagic/history_delete", "entry_id": "failed-1"}
+
+    with patch(
+        "custom_components.automagic.ws_api.async_delete_history_entry_request",
+        AsyncMock(return_value=({"history": [{"entry_id": "installed-1"}]}, 200)),
+    ):
+        await websocket_history_delete(hass, connection, msg)
+
+    connection.send_result.assert_called_once_with(
+        13,
+        {"history": [{"entry_id": "installed-1"}]},
+    )
+
+
+@pytest.mark.asyncio
+async def test_websocket_history_delete_sends_errors_for_blocked_rows():
+    """History delete websocket handler should reject non-removable rows."""
+    hass = MagicMock()
+    connection = MagicMock()
+    msg = {"id": 15, "type": "automagic/history_delete", "entry_id": "installed-1"}
+
+    with patch(
+        "custom_components.automagic.ws_api.async_delete_history_entry_request",
+        AsyncMock(
+            return_value=(
+                {"error": "Only failed or deleted history entries can be removed"},
+                400,
+            )
+        ),
+    ):
+        await websocket_history_delete(hass, connection, msg)
+
+    connection.send_error.assert_called_once_with(
+        15,
+        "history_delete_failed",
+        "Only failed or deleted history entries can be removed",
     )

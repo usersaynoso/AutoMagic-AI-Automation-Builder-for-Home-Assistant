@@ -28,6 +28,7 @@ API_PATH_GENERATE_STATUS = "/api/automagic/generate/{job_id}"
 API_PATH_INSTALL = "/api/automagic/install"
 API_PATH_ENTITIES = "/api/automagic/entities"
 API_PATH_HISTORY = "/api/automagic/history"
+API_PATH_HISTORY_ENTRY = "/api/automagic/history/{entry_id}"
 API_PATH_SERVICES = "/api/automagic/services"
 
 HA_MIN_VERSION = (2024, 10)

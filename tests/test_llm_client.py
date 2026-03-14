@@ -366,15 +366,15 @@ async def test_complete_quotes_plain_scalar_yaml_values_with_extra_colons():
     content = json.dumps(
         {
             "yaml": (
-                "alias: Janet cleaning: weekday morning\n"
-                "description: Every weekday morning: check if Janet cleaned recently.\n"
+                "alias: Robot vacuum cleaning: weekday morning\n"
+                "description: Every weekday morning: check if the robot vacuum cleaned recently.\n"
                 "triggers:\n"
                 "  - trigger: time\n"
                 "    at: 08:00:00\n"
                 "actions:\n"
                 "  - action: notify.mobile_app_iphone_13\n"
                 "    data:\n"
-                "      message: Warning: Janet might be stuck\n"
+                "      message: Warning: Robot vacuum might be stuck\n"
                 "mode: single\n"
             ),
             "summary": "Ready to install",
@@ -392,13 +392,13 @@ async def test_complete_quotes_plain_scalar_yaml_values_with_extra_colons():
     )
     result = await client.complete([{"role": "user", "content": "test"}])
 
-    assert result["yaml"].startswith('alias: "Janet cleaning: weekday morning"')
+    assert result["yaml"].startswith('alias: "Robot vacuum cleaning: weekday morning"')
     assert (
-        'description: "Every weekday morning: check if Janet cleaned recently."'
+        'description: "Every weekday morning: check if the robot vacuum cleaned recently."'
         in result["yaml"]
     )
     assert 'at: "08:00:00"' in result["yaml"]
-    assert 'message: "Warning: Janet might be stuck"' in result["yaml"]
+    assert 'message: "Warning: Robot vacuum might be stuck"' in result["yaml"]
 
 
 @pytest.mark.asyncio

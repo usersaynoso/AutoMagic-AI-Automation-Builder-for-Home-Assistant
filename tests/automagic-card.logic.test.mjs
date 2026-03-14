@@ -262,6 +262,10 @@ function buildHarness() {
     "_shouldRetryBackendStatus",
     "_serviceLabel",
     "_selectedService",
+    "_historyStatus",
+    "_historyStatusBadge",
+    "_historyCanDelete",
+    "_handleDeleteHistory",
     "_isLikelyDirectFallbackHost",
     "_canUseDirectGenerationFallback",
     "_buildGenerationRequestPayload",
@@ -344,6 +348,119 @@ function buildHarness() {
   });
   return harness;
 }
+
+test("Model picker sits above the prompt composer and locks after the first message", () => {
+  assert.match(cardSource, /const isModelLocked = isFollowUp;/);
+  assert.match(cardSource, /<label class="service-picker composer-service-picker">/);
+  assert.match(
+    cardSource,
+    /\?disabled=\$\{isBusy \|\| isModelLocked \|\| this\._services\.length <= 1\}/
+  );
+  assert.match(cardSource, /Locked for this thread/);
+});
+
+test("History delete only runs for failed or deleted entries", async () => {
+  const harness = buildHarness();
+  let deletedEntryId = "";
+
+  const card = {
+    _history: [
+      { entry_id: "failed-1", status: "failed", can_delete: true },
+      { entry_id: "installed-1", status: "installed", can_delete: false },
+    ],
+    _historyError: "",
+    _deletingHistoryEntryId: "",
+    _expandedHistory: 0,
+    _normalizeText: harness._normalizeText,
+    _historyCanDelete: harness._historyCanDelete,
+    _formatError: harness._formatError,
+    _requestDeleteHistory: async (entryId) => {
+      deletedEntryId = entryId;
+      return {
+        history: [{ entry_id: "installed-1", status: "installed", can_delete: false }],
+      };
+    },
+  };
+
+  await harness._handleDeleteHistory.call(
+    card,
+    { stopPropagation() {} },
+    card._history[0]
+  );
+
+  assert.equal(deletedEntryId, "failed-1");
+  assert.deepEqual(card._history, [
+    { entry_id: "installed-1", status: "installed", can_delete: false },
+  ]);
+  assert.equal(card._expandedHistory, -1);
+  assert.equal(card._deletingHistoryEntryId, "");
+
+  deletedEntryId = "";
+  await harness._handleDeleteHistory.call(
+    card,
+    { stopPropagation() {} },
+    { entry_id: "installed-1", status: "installed", can_delete: false }
+  );
+  assert.equal(deletedEntryId, "");
+});
+
+test("History delete surfaces backend errors in the history banner", async () => {
+  const harness = buildHarness();
+
+  const card = {
+    _history: [{ entry_id: "deleted-1", status: "deleted", can_delete: true }],
+    _historyError: "",
+    _deletingHistoryEntryId: "",
+    _expandedHistory: 0,
+    _normalizeText: harness._normalizeText,
+    _historyCanDelete: harness._historyCanDelete,
+    _formatError: harness._formatError,
+    _requestDeleteHistory: async () => {
+      throw new Error("Only failed or deleted history entries can be removed");
+    },
+  };
+
+  await harness._handleDeleteHistory.call(
+    card,
+    { stopPropagation() {} },
+    card._history[0]
+  );
+
+  assert.match(
+    card._historyError,
+    /Delete failed: Only failed or deleted history entries can be removed/
+  );
+  assert.equal(card._deletingHistoryEntryId, "");
+  assert.equal(card._history.length, 1);
+});
+
+test("History helpers prefer backend status and can_delete flags", () => {
+  const harness = buildHarness();
+  const explicitDeleted = {
+    entry_id: "deleted-1",
+    status: "deleted",
+    can_delete: true,
+    success: true,
+    alias: "Installed Automation",
+  };
+  const explicitInstalled = {
+    entry_id: "installed-1",
+    status: "installed",
+    can_delete: false,
+    success: false,
+  };
+
+  assert.equal(
+    harness._historyStatus.call(harness, explicitDeleted, new Set(["Installed Automation"])),
+    "deleted"
+  );
+  assert.equal(harness._historyCanDelete.call(harness, explicitDeleted), true);
+  assert.equal(
+    harness._historyStatus.call(harness, explicitInstalled, null),
+    "installed"
+  );
+  assert.equal(harness._historyCanDelete.call(harness, explicitInstalled), false);
+});
 
 const entities = [
   {
@@ -2096,7 +2213,7 @@ test("JSON payload yaml strings quote plain scalar values that contain extra col
         message: {
           content: JSON.stringify({
             yaml:
-              "alias: Janet cleaning: weekday morning\ndescription: Every weekday morning: check if Janet cleaned recently.\ntriggers:\n  - trigger: time\n    at: 08:00:00\nactions:\n  - action: notify.mobile_app_iphone_13\n    data:\n      message: Warning: Janet might be stuck\n",
+              "alias: Robot vacuum cleaning: weekday morning\ndescription: Every weekday morning: check if the robot vacuum cleaned recently.\ntriggers:\n  - trigger: time\n    at: 08:00:00\nactions:\n  - action: notify.mobile_app_iphone_13\n    data:\n      message: Warning: Robot vacuum might be stuck\n",
             summary: "Ready to install",
             needs_clarification: false,
             clarifying_questions: [],
@@ -2109,15 +2226,15 @@ test("JSON payload yaml strings quote plain scalar values that contain extra col
   assert.equal(result.needs_clarification, false);
   assert.match(
     result.yaml,
-    /^alias: "Janet cleaning: weekday morning"$/m
+    /^alias: "Robot vacuum cleaning: weekday morning"$/m
   );
   assert.match(
     result.yaml,
-    /^description: "Every weekday morning: check if Janet cleaned recently\."$/m
+    /^description: "Every weekday morning: check if the robot vacuum cleaned recently\."$/m
   );
   assert.match(
     result.yaml,
-    /^\s+message: "Warning: Janet might be stuck"$/m
+    /^\s+message: "Warning: Robot vacuum might be stuck"$/m
   );
   assert.match(result.yaml, /^\s+at: "08:00:00"$/m);
 });
@@ -2769,6 +2886,7 @@ test("Backend generation payload includes the selected service id", () => {
 
 test("Create view source exposes a configured model picker", () => {
   assert.match(cardSource, /class="service-select"/);
+  assert.match(cardSource, /class="service-picker composer-service-picker"/);
   assert.match(cardSource, /automagic\/services/);
   assert.match(cardSource, /service_id/);
 });

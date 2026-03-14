@@ -10,6 +10,7 @@ from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant
 
 from .api import (
+    async_delete_history_entry_request,
     async_get_entities_payload,
     async_get_generation_status_payload,
     async_get_history_payload,
@@ -100,6 +101,31 @@ async def websocket_history(
 @websocket_api.async_response
 @websocket_api.websocket_command(
     {
+        vol.Required("type"): "automagic/history_delete",
+        vol.Required("entry_id"): str,
+    }
+)
+async def websocket_history_delete(
+    hass: HomeAssistant, connection: Any, msg: dict[str, Any]
+) -> None:
+    """Delete a removable history row over websocket."""
+    payload, status = await async_delete_history_entry_request(
+        hass,
+        msg["entry_id"],
+    )
+    if status >= 400:
+        connection.send_error(
+            msg["id"],
+            "history_delete_failed",
+            payload.get("error", "Failed to delete history entry"),
+        )
+        return
+    connection.send_result(msg["id"], payload)
+
+
+@websocket_api.async_response
+@websocket_api.websocket_command(
+    {
         vol.Required("type"): "automagic/services",
     }
 )
@@ -118,4 +144,5 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_install)
     websocket_api.async_register_command(hass, websocket_entities)
     websocket_api.async_register_command(hass, websocket_history)
+    websocket_api.async_register_command(hass, websocket_history_delete)
     websocket_api.async_register_command(hass, websocket_services)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -12,10 +13,13 @@ import pytest
 from custom_components.automagic.api import (
     AutoMagicGenerateView,
     AutoMagicGenerateStatusView,
+    AutoMagicHistoryEntryView,
     _create_generation_job,
     _get_config_data,
     _run_generation_job,
     _validate_generated_yaml,
+    async_delete_history_entry_request,
+    async_get_history_payload,
     async_get_services_payload,
     async_start_generation_request,
 )
@@ -63,6 +67,12 @@ def _make_hass():
         }
     }
     hass.async_create_task = lambda coro: asyncio.create_task(coro)
+    hass.config.path = lambda filename: filename
+
+    async def _async_add_executor_job(func, *args):
+        return func(*args)
+
+    hass.async_add_executor_job = AsyncMock(side_effect=_async_add_executor_job)
     return hass
 
 
@@ -91,6 +101,27 @@ def _make_multi_service_hass():
         }
     }
     hass.async_create_task = MagicMock(return_value=MagicMock())
+
+    async def _async_add_executor_job(func, *args):
+        return func(*args)
+
+    hass.async_add_executor_job = AsyncMock(side_effect=_async_add_executor_job)
+    return hass
+
+
+def _make_history_hass(tmp_path, installed_aliases: tuple[str, ...] = ()):
+    """Build a hass mock with filesystem-backed history and automation states."""
+    hass = _make_hass()
+    hass.config.path = lambda filename: str(tmp_path / filename)
+    hass.states.async_all = MagicMock(
+        return_value=[
+            MagicMock(
+                entity_id=f"automation.{alias.lower().replace(' ', '_')}",
+                attributes={"friendly_name": alias},
+            )
+            for alias in installed_aliases
+        ]
+    )
     return hass
 
 
@@ -187,6 +218,156 @@ async def test_get_services_payload_lists_configured_service_options():
     ]
     assert payload["services"][0]["is_default"] is True
     assert "qwen2.5:14b" in payload["services"][0]["label"]
+
+
+@pytest.mark.asyncio
+async def test_history_payload_exposes_entry_ids_statuses_and_delete_flags(tmp_path):
+    """History rows should include stable ids plus server-resolved delete eligibility."""
+    hass = _make_history_hass(tmp_path, installed_aliases=("Installed Automation",))
+    history_path = tmp_path / "automagic_history.json"
+    history_path.write_text(
+        json.dumps(
+            [
+                {
+                    "timestamp": "2026-03-14T09:00:00+00:00",
+                    "prompt": "Create installed automation",
+                    "alias": "Installed Automation",
+                    "summary": "Still present.",
+                    "yaml": "alias: Installed Automation\ntriggers: []\nconditions: []\nactions: []\nmode: single\n",
+                    "filename": "automations.yaml",
+                    "success": True,
+                },
+                {
+                    "timestamp": "2026-03-14T08:00:00+00:00",
+                    "prompt": "Create deleted automation",
+                    "alias": "Deleted Automation",
+                    "summary": "No longer present.",
+                    "yaml": "alias: Deleted Automation\ntriggers: []\nconditions: []\nactions: []\nmode: single\n",
+                    "filename": "automations.yaml",
+                    "success": True,
+                },
+                {
+                    "timestamp": "2026-03-14T07:00:00+00:00",
+                    "prompt": "Create failed automation",
+                    "alias": "Broken Automation",
+                    "summary": "Install failed.",
+                    "yaml": "alias: Broken Automation\n",
+                    "filename": "automations.yaml",
+                    "success": False,
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    payload, status = await async_get_history_payload(hass)
+
+    assert status == 200
+    rows = payload["history"]
+    assert len(rows) == 3
+    assert all(row["entry_id"] for row in rows)
+    assert rows[0]["status"] == "installed"
+    assert rows[0]["can_delete"] is False
+    assert rows[1]["status"] == "deleted"
+    assert rows[1]["can_delete"] is True
+    assert rows[2]["status"] == "failed"
+    assert rows[2]["can_delete"] is True
+
+
+@pytest.mark.asyncio
+async def test_delete_history_entry_allows_only_failed_or_deleted_rows(tmp_path):
+    """Installed rows should be protected while failed/deleted rows can be removed."""
+    hass = _make_history_hass(tmp_path, installed_aliases=("Installed Automation",))
+    history_path = tmp_path / "automagic_history.json"
+    history_path.write_text(
+        json.dumps(
+            [
+                {
+                    "entry_id": "installed-entry",
+                    "timestamp": "2026-03-14T09:00:00+00:00",
+                    "prompt": "Create installed automation",
+                    "alias": "Installed Automation",
+                    "summary": "Still present.",
+                    "yaml": "alias: Installed Automation\ntriggers: []\nconditions: []\nactions: []\nmode: single\n",
+                    "filename": "automations.yaml",
+                    "success": True,
+                },
+                {
+                    "entry_id": "deleted-entry",
+                    "timestamp": "2026-03-14T08:00:00+00:00",
+                    "prompt": "Create deleted automation",
+                    "alias": "Deleted Automation",
+                    "summary": "No longer present.",
+                    "yaml": "alias: Deleted Automation\ntriggers: []\nconditions: []\nactions: []\nmode: single\n",
+                    "filename": "automations.yaml",
+                    "success": True,
+                },
+                {
+                    "entry_id": "failed-entry",
+                    "timestamp": "2026-03-14T07:00:00+00:00",
+                    "prompt": "Create failed automation",
+                    "alias": "Broken Automation",
+                    "summary": "Install failed.",
+                    "yaml": "alias: Broken Automation\n",
+                    "filename": "automations.yaml",
+                    "success": False,
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    deleted_payload, deleted_status = await async_delete_history_entry_request(
+        hass,
+        "deleted-entry",
+    )
+
+    assert deleted_status == 200
+    assert [item["entry_id"] for item in deleted_payload["history"]] == [
+        "installed-entry",
+        "failed-entry",
+    ]
+
+    blocked_payload, blocked_status = await async_delete_history_entry_request(
+        hass,
+        "installed-entry",
+    )
+
+    assert blocked_status == 400
+    assert "Only failed or deleted history entries can be removed" in blocked_payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_history_entry_view_deletes_removable_rows(tmp_path):
+    """The REST history delete view should return the refreshed history payload."""
+    hass = _make_history_hass(tmp_path)
+    history_path = tmp_path / "automagic_history.json"
+    history_path.write_text(
+        json.dumps(
+            [
+                {
+                    "entry_id": "failed-entry",
+                    "timestamp": "2026-03-14T07:00:00+00:00",
+                    "prompt": "Create failed automation",
+                    "alias": "Broken Automation",
+                    "summary": "Install failed.",
+                    "yaml": "alias: Broken Automation\n",
+                    "filename": "automations.yaml",
+                    "success": False,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    request = FakeRequest(hass)
+    view = AutoMagicHistoryEntryView()
+    view.json = lambda data, status_code=200: {"status_code": status_code, **data}
+
+    result = await view.delete(request, "failed-entry")
+
+    assert result["status_code"] == 200
+    assert result["history"] == []
 
 
 @pytest.mark.asyncio
@@ -595,8 +776,8 @@ async def test_run_generation_job_sanitizes_plain_scalar_yaml_values_with_colons
     fake_client.complete = AsyncMock(
         return_value={
             "yaml": (
-                "alias: Janet cleaning: weekday morning\n"
-                "description: Every weekday morning: check if Janet cleaned recently.\n"
+                "alias: Robot vacuum cleaning: weekday morning\n"
+                "description: Every weekday morning: check if the robot vacuum cleaned recently.\n"
                 "triggers:\n"
                 "  - trigger: state\n"
                 "    entity_id: light.kitchen\n"
@@ -605,7 +786,7 @@ async def test_run_generation_job_sanitizes_plain_scalar_yaml_values_with_colons
                 "actions:\n"
                 "  - action: notify.mobile_app_iphone_13\n"
                 "    data:\n"
-                "      message: Warning: Janet might be stuck\n"
+                "      message: Warning: Robot vacuum might be stuck\n"
                 "mode: single\n"
             ),
             "summary": "Sends the warning notification.",
@@ -636,34 +817,34 @@ async def test_run_generation_job_sanitizes_plain_scalar_yaml_values_with_colons
 
     assert job["status"] == "completed"
     assert _validate_generated_yaml(job["yaml"]) is None
-    assert 'alias: "Janet cleaning: weekday morning"' in job["yaml"]
+    assert 'alias: "Robot vacuum cleaning: weekday morning"' in job["yaml"]
     assert (
-        'description: "Every weekday morning: check if Janet cleaned recently."'
+        'description: "Every weekday morning: check if the robot vacuum cleaned recently."'
         in job["yaml"]
     )
-    assert 'message: "Warning: Janet might be stuck"' in job["yaml"]
+    assert 'message: "Warning: Robot vacuum might be stuck"' in job["yaml"]
 
 
 @pytest.mark.asyncio
-async def test_run_generation_job_sanitizes_colon_heavy_yaml_for_reported_janet_prompt():
-    """The reported Janet prompt should not fail when the model leaves plain scalars unquoted."""
+async def test_run_generation_job_sanitizes_colon_heavy_yaml_for_reported_vacuum_prompt():
+    """The reported vacuum prompt should not fail when the model leaves plain scalars unquoted."""
     hass = _make_hass()
     prompt = (
-        "Every weekday morning, check if Janet (the robot vacuum) has done a clean in the last 24 hours. "
-        "If she hasn't, start her cleaning at 8am, but only if everyone has already left home - check this "
+        "Every weekday morning, check if the robot vacuum has done a clean in the last 24 hours. "
+        "If it hasn't, start cleaning at 8am, but only if everyone has already left home - check this "
         'by making sure the iPhone 13 audio output is not "Speaker" (meaning the phone is not actively being '
-        "used at home). While Janet is cleaning, turn the lounge strip lights and bar lamp to a dim warm white "
-        "at 20% brightness so she can see. When she finishes, turn those lights back off. If Janet doesn't "
-        'finish within 90 minutes of starting, send a notification to my iPhone saying "Janet is still cleaning '
-        'after 90 minutes - she might be stuck". Don\'t start her at all if either of the router LED switches '
-        "are already off, as that means the network is down and her cloud connection won't work."
+        "used at home). While it is cleaning, turn the lounge strip lights and bar lamp to a dim warm white "
+        "at 20% brightness so it can see. When cleaning finishes, turn those lights back off. If the robot vacuum doesn't "
+        'finish within 90 minutes of starting, send a notification to my iPhone saying "The robot vacuum is still cleaning '
+        'after 90 minutes - it might be stuck". Don\'t start it at all if either of the router LED switches '
+        "are already off, as that means the network is down and the cloud connection won't work."
     )
     job = _create_generation_job(hass, prompt, None)
 
     entities = [
         {
-            "entity_id": "vacuum.janet",
-            "name": "Janet",
+            "entity_id": "vacuum.robot_vacuum",
+            "name": "Robot Vacuum",
             "state": "docked",
             "domain": "vacuum",
         },
@@ -716,8 +897,8 @@ async def test_run_generation_job_sanitizes_colon_heavy_yaml_for_reported_janet_
     fake_client.complete = AsyncMock(
         return_value={
             "yaml": (
-                "alias: Janet cleaning: weekday morning\n"
-                "description: Every weekday morning: check if Janet has cleaned in the last 24 hours.\n"
+                "alias: Robot vacuum cleaning: weekday morning\n"
+                "description: Every weekday morning: check if the robot vacuum has cleaned in the last 24 hours.\n"
                 "triggers:\n"
                 "  - trigger: time\n"
                 "    at: 08:00:00\n"
@@ -734,13 +915,13 @@ async def test_run_generation_job_sanitizes_colon_heavy_yaml_for_reported_janet_
                 "actions:\n"
                 "  - action: vacuum.start\n"
                 "    target:\n"
-                "      entity_id: vacuum.janet\n"
+                "      entity_id: vacuum.robot_vacuum\n"
                 "  - action: notify.mobile_app_iphone_13\n"
                 "    data:\n"
-                "      message: Janet is still cleaning after 90 minutes: she might be stuck\n"
+                "      message: The robot vacuum is still cleaning after 90 minutes: it might be stuck\n"
                 "mode: single\n"
             ),
-            "summary": "Starts Janet if the conditions are met.",
+            "summary": "Starts the robot vacuum if the conditions are met.",
             "needs_clarification": False,
             "clarifying_questions": [],
         }
@@ -768,14 +949,14 @@ async def test_run_generation_job_sanitizes_colon_heavy_yaml_for_reported_janet_
 
     assert job["status"] == "completed"
     assert _validate_generated_yaml(job["yaml"]) is None
-    assert 'alias: "Janet cleaning: weekday morning"' in job["yaml"]
+    assert 'alias: "Robot vacuum cleaning: weekday morning"' in job["yaml"]
     assert (
-        'description: "Every weekday morning: check if Janet has cleaned in the last 24 hours."'
+        'description: "Every weekday morning: check if the robot vacuum has cleaned in the last 24 hours."'
         in job["yaml"]
     )
     assert 'at: "08:00:00"' in job["yaml"]
     assert (
-        'message: "Janet is still cleaning after 90 minutes: she might be stuck"'
+        'message: "The robot vacuum is still cleaning after 90 minutes: it might be stuck"'
         in job["yaml"]
     )
 

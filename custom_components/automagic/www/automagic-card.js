@@ -343,6 +343,8 @@ class AutoMagicCard extends LitElement {
       _showYaml: { type: Boolean },
       _entityCount: { type: Number },
       _history: { type: Array },
+      _historyError: { type: String },
+      _deletingHistoryEntryId: { type: String },
       _services: { type: Array },
       _selectedServiceId: { type: String },
       _chatMessages: { type: Array },
@@ -374,6 +376,8 @@ class AutoMagicCard extends LitElement {
     this._showYaml = false;
     this._entityCount = 0;
     this._history = [];
+    this._historyError = "";
+    this._deletingHistoryEntryId = "";
     this._services = [];
     this._selectedServiceId = "";
     this._chatMessages = [];
@@ -435,6 +439,7 @@ class AutoMagicCard extends LitElement {
       const resp = await this._requestHistory();
       if (resp && resp.history) {
         this._history = resp.history;
+        this._historyError = "";
       }
     } catch {
       // Silently ignore
@@ -675,6 +680,36 @@ class AutoMagicCard extends LitElement {
     });
   }
 
+  async _apiDelete(path) {
+    const apiPath = this._apiPath(path);
+    if (this.hass?.callApi) {
+      try {
+        return await this.hass.callApi("DELETE", apiPath);
+      } catch (err) {
+        // Fall through to direct fetch for frontend/runtime compatibility issues.
+      }
+    }
+
+    const token = this._authToken();
+    if (token) {
+      try {
+        return await this._fetchJson(path, {
+          method: "DELETE",
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+      } catch (err) {
+        // Fall through to same-origin fetch.
+      }
+    }
+
+    return this._fetchJson(path, {
+      method: "DELETE",
+      credentials: "same-origin",
+    });
+  }
+
   async _requestGenerate(payload) {
     try {
       return await this._wsCommand("automagic/generate", payload);
@@ -752,6 +787,19 @@ class AutoMagicCard extends LitElement {
       return await this._wsCommand("automagic/history");
     } catch (err) {
       return this._apiGet("/api/automagic/history");
+    }
+  }
+
+  async _requestDeleteHistory(entryId) {
+    const normalizedEntryId = this._normalizeText(entryId);
+    try {
+      return await this._wsCommand("automagic/history_delete", {
+        entry_id: normalizedEntryId,
+      });
+    } catch (err) {
+      return this._apiDelete(
+        `/api/automagic/history/${encodeURIComponent(normalizedEntryId)}`
+      );
     }
   }
 
@@ -6306,6 +6354,10 @@ class AutoMagicCard extends LitElement {
   }
 
   _historyStatus(item, installedAliases = null) {
+    const explicitStatus = this._normalizeText(item?.status).toLowerCase();
+    if (["failed", "deleted", "installed"].includes(explicitStatus)) {
+      return explicitStatus;
+    }
     if (!item?.success) return "failed";
 
     const alias = this._normalizeText(item.alias);
@@ -6313,6 +6365,14 @@ class AutoMagicCard extends LitElement {
 
     const aliases = installedAliases || this._installedAutomationAliases();
     return aliases.has(alias) ? "installed" : "deleted";
+  }
+
+  _historyCanDelete(item, installedAliases = null) {
+    if (typeof item?.can_delete === "boolean") {
+      return item.can_delete;
+    }
+    const status = this._historyStatus(item, installedAliases);
+    return status === "failed" || status === "deleted";
   }
 
   _historyStatusBadge(item, installedAliases = null) {
@@ -6324,6 +6384,26 @@ class AutoMagicCard extends LitElement {
       return { label: "Deleted", className: "badge-warning" };
     }
     return { label: "Installed", className: "badge-success" };
+  }
+
+  async _handleDeleteHistory(event, item) {
+    event?.stopPropagation?.();
+    const entryId = this._normalizeText(item?.entry_id);
+    if (!entryId || !this._historyCanDelete(item)) {
+      return;
+    }
+
+    this._historyError = "";
+    this._deletingHistoryEntryId = entryId;
+    try {
+      const response = await this._requestDeleteHistory(entryId);
+      this._history = Array.isArray(response?.history) ? response.history : [];
+      this._expandedHistory = -1;
+    } catch (err) {
+      this._historyError = `Delete failed: ${this._formatError(err)}`;
+    } finally {
+      this._deletingHistoryEntryId = "";
+    }
   }
 
   render() {
@@ -6380,6 +6460,7 @@ class AutoMagicCard extends LitElement {
     const isBusy =
       this._state === STATES.LOADING || this._state === STATES.INSTALLING;
     const isFollowUp = this._chatMessages.length > 0;
+    const isModelLocked = isFollowUp;
 
     return html`
       <div class="chat-layout">
@@ -6390,35 +6471,6 @@ class AutoMagicCard extends LitElement {
               : "Describe the automation you want. AutoMagic keeps the whole exchange in one chat thread."}
           </p>
           <div class="chat-toolbar-actions">
-            ${this._services.length > 0
-              ? html`
-                  <label class="service-picker">
-                    <span class="service-picker-label">Model</span>
-                    <select
-                      class="service-select"
-                      .value=${this._normalizeText(
-                        this._selectedService()?.service_id || ""
-                      )}
-                      ?disabled=${isBusy || this._services.length <= 1}
-                      @change=${(e) => {
-                        this._selectedServiceId = this._normalizeText(
-                          e.target.value
-                        );
-                      }}
-                    >
-                      ${this._services.map(
-                        (service) => html`
-                          <option
-                            value=${this._normalizeText(service?.service_id)}
-                          >
-                            ${this._serviceLabel(service)}
-                          </option>
-                        `
-                      )}
-                    </select>
-                  </label>
-                `
-              : ""}
             ${isFollowUp
               ? html`
                   <button class="btn btn-secondary chat-toolbar-btn" @click=${this._handleReset}>
@@ -6482,6 +6534,36 @@ class AutoMagicCard extends LitElement {
         </div>
 
         <div class="chat-composer">
+          ${this._services.length > 0
+            ? html`
+                <label class="service-picker composer-service-picker">
+                  <span class="service-picker-label">
+                    Model
+                    ${isModelLocked ? html`<span class="service-picker-note">Locked for this thread</span>` : ""}
+                  </span>
+                  <select
+                    class="service-select"
+                    .value=${this._normalizeText(
+                      this._selectedService()?.service_id || ""
+                    )}
+                    ?disabled=${isBusy || isModelLocked || this._services.length <= 1}
+                    @change=${(e) => {
+                      this._selectedServiceId = this._normalizeText(
+                        e.target.value
+                      );
+                    }}
+                  >
+                    ${this._services.map(
+                      (service) => html`
+                        <option value=${this._normalizeText(service?.service_id)}>
+                          ${this._serviceLabel(service)}
+                        </option>
+                      `
+                    )}
+                  </select>
+                </label>
+              `
+            : ""}
           <textarea
             class="prompt-input chat-input"
             rows="3"
@@ -6916,9 +6998,21 @@ class AutoMagicCard extends LitElement {
 
     return html`
       <div class="history-list">
+        ${this._historyError
+          ? html`
+              <div class="history-banner error">
+                <ha-icon icon="mdi:alert-circle-outline"></ha-icon>
+                <span>${this._historyError}</span>
+              </div>
+            `
+          : ""}
         ${this._history.map(
           (item, i) => {
             const badge = this._historyStatusBadge(item, installedAliases);
+            const canDelete = this._historyCanDelete(item, installedAliases);
+            const isDeleting =
+              this._normalizeText(this._deletingHistoryEntryId) ===
+              this._normalizeText(item?.entry_id);
             return html`
             <div
               class="history-item ${this._expandedHistory === i ? "expanded" : ""}"
@@ -6963,6 +7057,20 @@ class AutoMagicCard extends LitElement {
                                 title="Copy YAML"
                               >
                                 <ha-icon icon="mdi:content-copy"></ha-icon>
+                              </button>
+                            </div>
+                          `
+                        : ""}
+                      ${canDelete
+                        ? html`
+                            <div class="history-actions">
+                              <button
+                                class="btn btn-secondary"
+                                @click=${(e) => this._handleDeleteHistory(e, item)}
+                                ?disabled=${isDeleting}
+                              >
+                                <ha-icon icon="mdi:delete-outline"></ha-icon>
+                                ${isDeleting ? "Deleting..." : "Delete History Entry"}
                               </button>
                             </div>
                           `
@@ -7123,11 +7231,22 @@ class AutoMagicCard extends LitElement {
         min-width: min(100%, 280px);
       }
       .service-picker-label {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
         color: var(--secondary-text-color);
         font-size: 0.76em;
         font-weight: 600;
         letter-spacing: 0.04em;
         text-transform: uppercase;
+      }
+      .service-picker-note {
+        color: var(--secondary-text-color);
+        font-size: 0.82em;
+        font-weight: 500;
+        letter-spacing: normal;
+        text-transform: none;
       }
       .service-select {
         border: 1px solid var(--divider-color);
@@ -7149,6 +7268,9 @@ class AutoMagicCard extends LitElement {
       }
       .chat-toolbar-btn {
         flex-shrink: 0;
+      }
+      .composer-service-picker {
+        width: 100%;
       }
       .chat-thread {
         display: flex;
@@ -7713,6 +7835,20 @@ class AutoMagicCard extends LitElement {
         flex-direction: column;
         gap: 8px;
       }
+      .history-banner {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 12px 14px;
+        border-radius: 12px;
+        border: 1px solid var(--divider-color);
+        background: var(--card-background-color);
+      }
+      .history-banner.error {
+        border-color: rgba(244, 67, 54, 0.3);
+        background: rgba(244, 67, 54, 0.08);
+        color: var(--error-color, #f44336);
+      }
       .history-item {
         border: 1px solid var(--divider-color);
         border-radius: 12px;
@@ -7812,6 +7948,10 @@ class AutoMagicCard extends LitElement {
         border-radius: 8px;
         padding: 14px;
         border: 1px solid var(--divider-color);
+      }
+      .history-actions {
+        display: flex;
+        justify-content: flex-end;
       }
     `;
   }

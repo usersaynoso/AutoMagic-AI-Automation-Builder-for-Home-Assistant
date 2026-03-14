@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ from .const import (
     API_PATH_GENERATE,
     API_PATH_GENERATE_STATUS,
     API_PATH_HISTORY,
+    API_PATH_HISTORY_ENTRY,
     API_PATH_INSTALL,
     API_PATH_SERVICES,
     CONF_ENDPOINT_URL,
@@ -136,6 +138,102 @@ def _save_history(hass: HomeAssistant, history: list[dict[str, Any]]) -> None:
         json.dump(history, f, indent=2, ensure_ascii=False)
 
 
+def _history_entry_id(item: dict[str, Any]) -> str:
+    """Return a stable identifier for a history row."""
+    existing = str(item.get("entry_id", "") or "").strip()
+    if existing:
+        return existing
+
+    fingerprint = "\x1f".join(
+        str(item.get(field, "") or "").strip()
+        for field in ("timestamp", "alias", "prompt", "summary", "filename", "yaml")
+    )
+    return hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:16]
+
+
+def _normalize_history_entries(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ensure every history row includes the fields the UI expects."""
+    normalized: list[dict[str, Any]] = []
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        row["entry_id"] = _history_entry_id(row)
+        normalized.append(row)
+    return normalized
+
+
+def _installed_automation_aliases(hass: HomeAssistant) -> set[str]:
+    """Collect installed automation aliases from Home Assistant state."""
+    aliases: set[str] = set()
+    states = getattr(hass, "states", None)
+    async_all = getattr(states, "async_all", None)
+    state_items: list[tuple[str, Any]] = []
+
+    if callable(async_all):
+        try:
+            automation_states = async_all("automation")
+        except TypeError:
+            automation_states = async_all()
+        if isinstance(automation_states, list):
+            state_items = [
+                (str(getattr(state, "entity_id", "") or ""), state)
+                for state in automation_states
+            ]
+    elif isinstance(states, dict):
+        state_items = list(states.items())
+
+    for entity_id, state in state_items:
+        if not str(entity_id or "").startswith("automation."):
+            continue
+        attributes = getattr(state, "attributes", None)
+        if attributes is None and isinstance(state, dict):
+            attributes = state.get("attributes")
+        if not isinstance(attributes, dict):
+            continue
+        friendly_name = str(
+            attributes.get("friendly_name") or attributes.get("alias") or ""
+        ).strip()
+        if friendly_name:
+            aliases.add(friendly_name)
+
+    return aliases
+
+
+def _history_entry_status(
+    hass: HomeAssistant,
+    item: dict[str, Any],
+    installed_aliases: set[str] | None = None,
+) -> str:
+    """Resolve a persisted history row to installed/deleted/failed."""
+    if not item.get("success"):
+        return "failed"
+
+    alias = str(item.get("alias", "") or "").strip()
+    if not alias:
+        return "installed"
+
+    aliases = installed_aliases if installed_aliases is not None else _installed_automation_aliases(hass)
+    return "installed" if alias in aliases else "deleted"
+
+
+def _serialize_history_entries(
+    hass: HomeAssistant,
+    history: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build the history payload returned to the frontend."""
+    normalized = _normalize_history_entries(history)
+    installed_aliases = _installed_automation_aliases(hass)
+    serialized: list[dict[str, Any]] = []
+    for item in normalized:
+        status = _history_entry_status(hass, item, installed_aliases)
+        row = dict(item)
+        row["status"] = status
+        row["can_delete"] = status in {"failed", "deleted"}
+        serialized.append(row)
+    return serialized
+
+
 def _append_history(
     hass: HomeAssistant,
     prompt: str,
@@ -150,6 +248,7 @@ def _append_history(
     history.insert(
         0,
         {
+            "entry_id": uuid.uuid4().hex,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "prompt": prompt,
             "alias": alias,
@@ -1477,7 +1576,36 @@ async def async_get_history_payload(
 ) -> tuple[dict[str, Any], int]:
     """Return the persisted automation history payload."""
     history = await hass.async_add_executor_job(_load_history, hass)
-    return {"history": history}, 200
+    return {"history": _serialize_history_entries(hass, history)}, 200
+
+
+async def async_delete_history_entry_request(
+    hass: HomeAssistant,
+    entry_id: str,
+) -> tuple[dict[str, Any], int]:
+    """Delete a failed or deleted history row."""
+    target_entry_id = str(entry_id or "").strip()
+    if not target_entry_id:
+        return {"error": "Missing history entry id"}, 400
+
+    history = await hass.async_add_executor_job(_load_history, hass)
+    normalized = _normalize_history_entries(history)
+    target = next(
+        (item for item in normalized if item.get("entry_id") == target_entry_id),
+        None,
+    )
+    if target is None:
+        return {"error": "History entry not found"}, 404
+
+    status = _history_entry_status(hass, target)
+    if status not in {"failed", "deleted"}:
+        return {"error": "Only failed or deleted history entries can be removed"}, 400
+
+    remaining = [
+        item for item in normalized if item.get("entry_id") != target_entry_id
+    ]
+    await hass.async_add_executor_job(_save_history, hass, remaining)
+    return {"history": _serialize_history_entries(hass, remaining)}, 200
 
 
 async def async_get_services_payload(
@@ -1586,6 +1714,25 @@ class AutoMagicHistoryView(HomeAssistantView):
         """Return the automation creation history."""
         hass: HomeAssistant = request.app["hass"]
         payload, status_code = await async_get_history_payload(hass)
+        return self.json(payload, status_code=status_code)
+
+
+class AutoMagicHistoryEntryView(HomeAssistantView):
+    """Handle DELETE /api/automagic/history/{entry_id}."""
+
+    url = API_PATH_HISTORY_ENTRY
+    name = "api:automagic:history_entry"
+    requires_auth = True
+
+    async def delete(
+        self, request: web.Request, entry_id: str
+    ) -> web.Response:
+        """Delete a removable history entry."""
+        hass: HomeAssistant = request.app["hass"]
+        payload, status_code = await async_delete_history_entry_request(
+            hass,
+            entry_id,
+        )
         return self.json(payload, status_code=status_code)
 
 

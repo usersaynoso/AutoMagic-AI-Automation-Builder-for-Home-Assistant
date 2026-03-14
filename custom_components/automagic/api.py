@@ -73,6 +73,7 @@ _BACKEND_PROBE_DELAY_SECONDS = 15
 _BACKEND_PROBE_INTERVAL_SECONDS = 10
 _DEFAULT_GENERATION_CONTEXT_LIMIT = 60
 _YAML_REPAIR_ATTEMPTS = 2
+_YAML_REGENERATION_ATTEMPTS = 1
 _TIME_WINDOW_RE = re.compile(
     r"\bbetween\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s+(?:and|to|-)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b",
     re.IGNORECASE,
@@ -111,6 +112,20 @@ Use Home Assistant 2024.10+ syntax only.
 - Put notify text under data: with a message key.
 - Preserve the user's thresholds, guards, delays, entities, and notification text.
 Do not ask for clarification. Return the final corrected JSON now."""
+_YAML_REGENERATION_SYSTEM_PROMPT = """\
+You are an expert Home Assistant automation generation assistant.
+Return only a JSON object with exactly four keys: yaml, summary, needs_clarification, clarifying_questions.
+The yaml value must be a complete Home Assistant automation string that starts directly with alias:.
+Use Home Assistant 2024.10+ syntax only.
+- Include description:, triggers:, conditions:, actions:, and mode:.
+- Use triggers: and actions: at the top level.
+- Use trigger: inside trigger items, not platform:.
+- Use action: inside action items, not service:.
+- Do not wrap the YAML in markdown fences, yaml:, automation:, or a list item.
+- Put notify text under data: with a message key.
+- Preserve the user's thresholds, guards, delays, entities, and notification text.
+If prior drafts were invalid, ignore them and regenerate the automation cleanly from the original request and entity context.
+Do not ask for clarification unless the original request truly lacks a required detail. Return the final automation JSON now."""
 
 
 def _history_path(hass: HomeAssistant) -> str:
@@ -1120,6 +1135,56 @@ def _build_yaml_repair_messages(
     ]
 
 
+def _build_yaml_regeneration_messages(
+    request_messages: list[dict[str, str]],
+    issue: str,
+) -> list[dict[str, str]]:
+    """Build a retry prompt that regenerates YAML from the original request."""
+    base_messages = [
+        dict(message)
+        for message in (request_messages or [])
+        if str(message.get("role", "") or "").strip() in {"system", "user"}
+    ]
+    return [
+        {"role": "system", "content": _YAML_REGENERATION_SYSTEM_PROMPT},
+        *base_messages,
+        {
+            "role": "user",
+            "content": (
+                "The previous response still did not produce valid Home Assistant automation YAML. "
+                "Ignore every prior draft and regenerate the full automation JSON from the original request now. "
+                f"Problems to avoid: {issue} "
+                "Preserve every entity, threshold, guard, delay, and notification message from the request. "
+                "Do not ask for clarification unless the original request truly leaves a required detail unspecified."
+            ),
+        },
+    ]
+
+
+async def _regenerate_generation_result(
+    client: LLMClient,
+    request_messages: list[dict[str, str]],
+    issue: str,
+) -> dict[str, Any]:
+    """Regenerate a clean automation from the original request when repair is exhausted."""
+    last_issue = str(issue or "").strip() or "The model returned invalid automation YAML."
+    for _attempt in range(_YAML_REGENERATION_ATTEMPTS):
+        regenerated = _normalize_generation_result(
+            await client.complete(
+                _build_yaml_regeneration_messages(request_messages, last_issue)
+            )
+        )
+        if regenerated.get("needs_clarification"):
+            return regenerated
+        last_issue = _validate_generated_yaml(regenerated.get("yaml", "")) or ""
+        if not last_issue:
+            return regenerated
+
+    raise LLMResponseError(
+        last_issue or "The model returned invalid automation YAML."
+    )
+
+
 async def _repair_generation_result(
     client: LLMClient,
     request_messages: list[dict[str, str]],
@@ -1152,7 +1217,7 @@ async def _repair_generation_result(
         if issue is None:
             return current
 
-    raise LLMResponseError(issue or "The model returned invalid automation YAML.")
+    return await _regenerate_generation_result(client, request_messages, issue or "")
 
 
 async def _maybe_refresh_backend_status(
@@ -1278,9 +1343,30 @@ async def _run_generation_job(
             _mark_job_error(job, str(err))
             return None
         except LLMResponseError as err:
-            _LOGGER.error("LLM response error: %s", err)
-            _mark_job_error(job, str(err))
-            return None
+            _LOGGER.warning(
+                "LLM response error on initial generation; attempting clean regeneration: %s",
+                err,
+            )
+            try:
+                return await _regenerate_generation_result(
+                    client,
+                    request_messages,
+                    str(err),
+                )
+            except LLMConnectionError as regen_err:
+                _LOGGER.error(
+                    "LLM connection error during regeneration fallback: %s",
+                    regen_err,
+                )
+                _mark_job_error(job, str(regen_err))
+                return None
+            except LLMResponseError as regen_err:
+                _LOGGER.error(
+                    "LLM response error during regeneration fallback: %s",
+                    regen_err,
+                )
+                _mark_job_error(job, str(regen_err))
+                return None
         except Exception as err:  # pragma: no cover - defensive guard
             _LOGGER.exception("Unexpected generation error")
             _mark_job_error(job, f"Unexpected generation error: {err}")

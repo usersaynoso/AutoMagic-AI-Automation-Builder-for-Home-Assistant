@@ -32,7 +32,7 @@ from custom_components.automagic.const import (
     CONF_SERVICES,
     DOMAIN,
 )
-from custom_components.automagic.llm_client import LLMConnectionError
+from custom_components.automagic.llm_client import LLMConnectionError, LLMResponseError
 from custom_components.automagic.service_config import build_service_config
 
 
@@ -748,6 +748,160 @@ async def test_run_generation_job_repairs_invalid_yaml_before_marking_complete()
     repair_messages = fake_client.complete.await_args_list[1].args[0]
     assert repair_messages[-1]["role"] == "user"
     assert "Problems to fix:" in repair_messages[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_run_generation_job_regenerates_after_repair_attempts_stay_invalid():
+    """If repair drafts stay invalid, generation should fall back to a clean regeneration pass."""
+    hass = _make_hass()
+    job = _create_generation_job(
+        hass,
+        "Start the robot vacuum at 8am on weekdays if it has not cleaned in the last 24 hours.",
+        None,
+    )
+
+    entities = [
+        {"entity_id": "vacuum.robot_vacuum", "name": "Robot Vacuum", "state": "docked", "domain": "vacuum"},
+        {"entity_id": "notify.mobile_app_phone", "name": "Phone", "state": "service", "domain": "notify"},
+    ]
+    invalid_yaml = {
+        "yaml": (
+            "alias: Robot Vacuum Check\n"
+            "description: Broken draft.\n"
+            "trigger:\n"
+            "  - platform: time\n"
+            '    at: "08:00:00"\n'
+            "action:\n"
+            "  - service: vacuum.start\n"
+            "    target:\n"
+            "      entity_id: vacuum.robot_vacuum\n"
+        ),
+        "summary": "Broken draft",
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+    valid_yaml = {
+        "yaml": (
+            "alias: Robot Vacuum Check\n"
+            "description: Starts the robot vacuum at 8am on weekdays when it has not cleaned recently.\n"
+            "triggers:\n"
+            "  - trigger: time\n"
+            '    at: "08:00:00"\n'
+            "conditions: []\n"
+            "actions:\n"
+            "  - action: vacuum.start\n"
+            "    target:\n"
+            "      entity_id: vacuum.robot_vacuum\n"
+            "mode: single\n"
+        ),
+        "summary": "Starts the robot vacuum at 8am on weekdays when it has not cleaned recently.",
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
+    fake_client = MagicMock()
+    fake_client._request_timeout = 420
+    fake_client.complete = AsyncMock(
+        side_effect=[invalid_yaml, invalid_yaml, invalid_yaml, valid_yaml]
+    )
+
+    with patch(
+        "custom_components.automagic.api.get_entity_context",
+        AsyncMock(return_value=entities),
+    ), patch(
+        "custom_components.automagic.api.build_prompt",
+        return_value=[
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "prompt"},
+        ],
+    ), patch(
+        "custom_components.automagic.api.async_get_clientsession",
+        return_value=MagicMock(),
+    ), patch(
+        "custom_components.automagic.api.LLMClient.from_config",
+        return_value=fake_client,
+    ):
+        await _run_generation_job(
+            hass,
+            job["job_id"],
+            "Start the robot vacuum at 8am on weekdays if it has not cleaned in the last 24 hours.",
+            None,
+        )
+
+    assert job["status"] == "completed"
+    assert "mode: single" in job["yaml"]
+    assert fake_client.complete.await_count == 4
+    regeneration_messages = fake_client.complete.await_args_list[3].args[0]
+    assert regeneration_messages[-1]["role"] == "user"
+    assert "Ignore every prior draft and regenerate the full automation JSON" in regeneration_messages[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_run_generation_job_regenerates_after_initial_response_error():
+    """Initial response parsing failures should trigger one clean regeneration pass before erroring."""
+    hass = _make_hass()
+    job = _create_generation_job(hass, "Turn on the kitchen lights", ["light"])
+
+    entities = [
+        {"entity_id": "light.kitchen", "name": "Kitchen", "state": "off", "domain": "light"},
+    ]
+    fake_client = MagicMock()
+    fake_client._request_timeout = 420
+    fake_client.complete = AsyncMock(
+        side_effect=[
+            LLMResponseError(
+                "LLM response did not include automation YAML or clarification questions"
+            ),
+            {
+                "yaml": (
+                    "alias: Kitchen Lights\n"
+                    "description: Turns on the kitchen lights.\n"
+                    "triggers:\n"
+                    "  - trigger: state\n"
+                    "    entity_id: light.kitchen\n"
+                    '    to: "on"\n'
+                    "conditions: []\n"
+                    "actions:\n"
+                    "  - action: light.turn_on\n"
+                    "    target:\n"
+                    "      entity_id: light.kitchen\n"
+                    "mode: single\n"
+                ),
+                "summary": "Turns on the kitchen lights.",
+                "needs_clarification": False,
+                "clarifying_questions": [],
+            },
+        ]
+    )
+
+    with patch(
+        "custom_components.automagic.api.get_entity_context",
+        AsyncMock(return_value=entities),
+    ), patch(
+        "custom_components.automagic.api.build_prompt",
+        return_value=[
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "prompt"},
+        ],
+    ), patch(
+        "custom_components.automagic.api.async_get_clientsession",
+        return_value=MagicMock(),
+    ), patch(
+        "custom_components.automagic.api.LLMClient.from_config",
+        return_value=fake_client,
+    ):
+        await _run_generation_job(
+            hass,
+            job["job_id"],
+            "Turn on the kitchen lights",
+            ["light"],
+        )
+
+    assert job["status"] == "completed"
+    assert "description: Turns on the kitchen lights." in job["yaml"]
+    assert fake_client.complete.await_count == 2
+    regeneration_messages = fake_client.complete.await_args_list[1].args[0]
+    assert regeneration_messages[-1]["role"] == "user"
+    assert "regenerate the full automation JSON from the original request" in regeneration_messages[-1]["content"]
 
 
 @pytest.mark.asyncio

@@ -48,6 +48,8 @@ const DIRECT_YAML_ONLY_MAX_TOKENS = 3200;
 const DIRECT_TEMPERATURE = 0.15;
 const DIRECT_CONTEXT_LIMIT = 48;
 const DIRECT_STATUS_POLL_INTERVAL_MS = 1000;
+const DIRECT_REPAIR_ATTEMPTS = 4;
+const DIRECT_REGENERATION_ATTEMPTS = 2;
 const DIRECT_FENCE_RE = /```(?:[a-z0-9_+-]+)?\s*\n?(.*?)\n?\s*```/is;
 const DIRECT_TOKEN_RE = /[a-z0-9]+/g;
 const IMPORTANT_SHORT_TOKENS = new Set(["tv", "ac"]);
@@ -495,6 +497,28 @@ class AutoMagicCard extends LitElement {
       nextMessage,
     ];
     return this._chatMessages.length - 1;
+  }
+
+  _pushRepairStatus(issue) {
+    const normalizedIssue = this._normalizeText(issue);
+    if (!normalizedIssue) return;
+
+    const detail =
+      "The model returned automation YAML with a syntax or logic problem. " +
+      "AutoMagic has automatically sent the latest specific error back to the AI " +
+      `and is requesting another correction. Error: ${normalizedIssue}`;
+
+    if (detail === this._lastRepairDetail) return;
+
+    this._lastRepairDetail = detail;
+    this._loadingMessage = "Fixing a YAML issue…";
+    this._loadingDetail = detail;
+    this._appendChatMessage({
+      role: "assistant",
+      type: "status",
+      tone: "warning",
+      text: detail,
+    });
   }
 
   _updateChatMessage(index, patch) {
@@ -1634,6 +1658,9 @@ class AutoMagicCard extends LitElement {
       };
       currentResult = await this._compilePlanToYaml(prompt, compileContext);
       if (currentResult?.planner_only) {
+        this._pushRepairStatus(
+          "The previous response did not include the required complete automation YAML."
+        );
         currentResult = await this._regenerateAutomationYamlFromScratch(
           prompt,
           {
@@ -1650,6 +1677,9 @@ class AutoMagicCard extends LitElement {
     }
     if (currentResult?.missing_yaml) {
       if (preferYamlOnlyRepair) {
+        this._pushRepairStatus(
+          "The previous response did not include the required complete automation YAML."
+        );
         currentResult = await this._regenerateAutomationYamlFromScratch(
           prompt,
           {
@@ -1665,37 +1695,40 @@ class AutoMagicCard extends LitElement {
           return currentResult;
         }
       } else {
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        const missingYamlMessages = [
-          ...messages,
-          {
-            role: "assistant",
-            content: JSON.stringify({
-              yaml: currentResult?.yaml || null,
-              summary: currentResult?.summary || "",
-              needs_clarification: false,
-              clarifying_questions: [],
-            }),
-          },
-          {
-            role: "user",
-            content:
-              "Your previous response did not include the required automation YAML. " +
-              "Return the complete automation JSON now. " +
-              "The yaml key must be a non-empty string containing the full Home Assistant automation. " +
-              "Do not leave yaml null or empty. " +
-              "Do not say the automation is ready, complete, or being generated. " +
-              "Output only the final JSON object.",
-          },
-        ];
-        currentResult = await this._directChatCompletion(missingYamlMessages);
-        if (currentResult?.needs_clarification) {
-          return currentResult;
+        for (let attempt = 0; attempt < DIRECT_REPAIR_ATTEMPTS; attempt += 1) {
+          this._pushRepairStatus(
+            "The previous response did not include the required complete automation YAML."
+          );
+          const missingYamlMessages = [
+            ...messages,
+            {
+              role: "assistant",
+              content: JSON.stringify({
+                yaml: currentResult?.yaml || null,
+                summary: currentResult?.summary || "",
+                needs_clarification: false,
+                clarifying_questions: [],
+              }),
+            },
+            {
+              role: "user",
+              content:
+                "Your previous response did not include the required automation YAML. " +
+                "Return the complete automation JSON now. " +
+                "The yaml key must be a non-empty string containing the full Home Assistant automation. " +
+                "Do not leave yaml null or empty. " +
+                "Do not say the automation is ready, complete, or being generated. " +
+                "Output only the final JSON object.",
+            },
+          ];
+          currentResult = await this._directChatCompletion(missingYamlMessages);
+          if (currentResult?.needs_clarification) {
+            return currentResult;
+          }
+          if (!currentResult?.missing_yaml && currentResult?.yaml) {
+            break;
+          }
         }
-        if (!currentResult?.missing_yaml && currentResult?.yaml) {
-          break;
-        }
-      }
       }
     }
 
@@ -1722,6 +1755,7 @@ class AutoMagicCard extends LitElement {
       fallbackContext
     );
     if (preferYamlOnlyRepair && remainingIssues.length > 0) {
+      this._pushRepairStatus(remainingIssues.join(" "));
       currentResult = await this._regenerateAutomationYamlFromScratch(
         prompt,
         {
@@ -1741,6 +1775,7 @@ class AutoMagicCard extends LitElement {
       );
     }
     if (preferYamlOnlyRepair && remainingIssues.length > 0 && !currentResult?.needs_clarification) {
+      this._pushRepairStatus(remainingIssues.join(" "));
       currentResult = await this._rewriteInvalidAutomationYaml(
         prompt,
         messages,
@@ -1756,11 +1791,12 @@ class AutoMagicCard extends LitElement {
         fallbackContext
       );
     }
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    for (let attempt = 0; attempt < DIRECT_REPAIR_ATTEMPTS; attempt += 1) {
       if (remainingIssues.length === 0) {
         return currentResult;
       }
       const issues = remainingIssues;
+      this._pushRepairStatus(issues.join(" "));
 
       const repairMessages = [
         ...messages,
@@ -1793,6 +1829,7 @@ class AutoMagicCard extends LitElement {
     }
 
     if (remainingIssues.length > 0 && !currentResult?.needs_clarification) {
+      this._pushRepairStatus(remainingIssues.join(" "));
       try {
         currentResult = await this._rewriteInvalidAutomationYaml(
           prompt,
@@ -1822,26 +1859,32 @@ class AutoMagicCard extends LitElement {
     }
 
     if (remainingIssues.length > 0 && !currentResult?.needs_clarification) {
-      currentResult = await this._regenerateAutomationYamlFromScratch(
-        prompt,
-        {
-          ...fallbackContext,
-          plan: currentResult?.plan_details || fallbackContext.plan || null,
-        },
-        remainingIssues,
-        currentResult?.yaml || ""
-      );
-      remainingIssues = this._collectRepairIssues(
-        prompt,
-        currentResult?.yaml || "",
-        fallbackContext
-      );
+      for (let attempt = 0; attempt < DIRECT_REGENERATION_ATTEMPTS; attempt += 1) {
+        this._pushRepairStatus(remainingIssues.join(" "));
+        currentResult = await this._regenerateAutomationYamlFromScratch(
+          prompt,
+          {
+            ...fallbackContext,
+            plan: currentResult?.plan_details || fallbackContext.plan || null,
+          },
+          remainingIssues,
+          currentResult?.yaml || ""
+        );
+        remainingIssues = this._collectRepairIssues(
+          prompt,
+          currentResult?.yaml || "",
+          fallbackContext
+        );
+        if (remainingIssues.length === 0) {
+          return currentResult;
+        }
+      }
     }
 
     if (remainingIssues.length > 0 && !currentResult?.needs_clarification) {
       throw new Error(
-        currentResult?.summary ||
-          "The model did not return valid automation YAML."
+        "AutoMagic sent each returned YAML error back to the AI, but the model still " +
+          `did not produce valid automation YAML. Last issue: ${remainingIssues.join(" ")}`
       );
     }
 
@@ -6432,6 +6475,81 @@ class AutoMagicCard extends LitElement {
 
   async _copyYaml(yamlText) {
     const text = yamlText || this._yaml;
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+    }
+  }
+
+  _threadAssistantLabel(message) {
+    if (message?.type === "yaml" || message?.type === "clarification") {
+      return (
+        this._normalizeText(this._selectedService()?.model) ||
+        this._normalizeText(this._directModel) ||
+        "AI"
+      );
+    }
+    return "AutoMagic";
+  }
+
+  _threadMessageBody(message) {
+    if (!message) return "";
+    if (message.role === "user") {
+      return this._normalizeText(message.text);
+    }
+
+    if (message.type === "yaml") {
+      const parts = [];
+      if (message.summary) parts.push(this._normalizeText(message.summary));
+      if (message.yaml) parts.push(`YAML:\n${message.yaml}`);
+      if (message.installAlias) parts.push(`Install result: ${message.installAlias}`);
+      if (message.installError) parts.push(`Install error: ${message.installError}`);
+      return parts.filter(Boolean).join("\n\n");
+    }
+
+    if (message.type === "clarification") {
+      const parts = [];
+      if (message.summary) parts.push(this._normalizeText(message.summary));
+      if (Array.isArray(message.questions) && message.questions.length > 0) {
+        parts.push(
+          message.questions
+            .map((question, index) => `${index + 1}. ${this._normalizeText(question)}`)
+            .join("\n")
+        );
+      }
+      return parts.filter(Boolean).join("\n\n");
+    }
+
+    return this._normalizeText(message.text);
+  }
+
+  _formatChatThread() {
+    return this._chatMessages
+      .map((message) => {
+        const body = this._threadMessageBody(message);
+        if (!body) return "";
+        const label =
+          message?.role === "user"
+            ? "User"
+            : this._threadAssistantLabel(message);
+        return `${label} said:\n${body}`;
+      })
+      .filter(Boolean)
+      .join("\n\n");
+  }
+
+  async _copyChatThread() {
+    const text = this._formatChatThread();
+    if (!text) return;
     try {
       await navigator.clipboard.writeText(text);
     } catch {
@@ -6602,6 +6720,10 @@ class AutoMagicCard extends LitElement {
           <div class="chat-toolbar-actions">
             ${isFollowUp
               ? html`
+                  <button class="btn btn-secondary chat-toolbar-btn" @click=${this._copyChatThread}>
+                    <ha-icon icon="mdi:content-copy"></ha-icon>
+                    Copy Thread
+                  </button>
                   <button class="btn btn-secondary chat-toolbar-btn" @click=${this._handleReset}>
                     <ha-icon icon="mdi:refresh"></ha-icon>
                     Start Over

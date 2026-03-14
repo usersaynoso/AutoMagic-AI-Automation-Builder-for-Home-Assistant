@@ -73,9 +73,9 @@ _STATUS_POLL_MS = 2000
 _BACKEND_PROBE_DELAY_SECONDS = 15
 _BACKEND_PROBE_INTERVAL_SECONDS = 10
 _DEFAULT_GENERATION_CONTEXT_LIMIT = 60
-_YAML_REPAIR_ATTEMPTS = 3
-_YAML_REGENERATION_ATTEMPTS = 1
-_ENTITY_REPAIR_ATTEMPTS = 2
+_YAML_REPAIR_ATTEMPTS = 4
+_YAML_REGENERATION_ATTEMPTS = 2
+_ENTITY_REPAIR_ATTEMPTS = 3
 _TIME_WINDOW_RE = re.compile(
     r"\bbetween\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s+(?:and|to|-)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b",
     re.IGNORECASE,
@@ -184,7 +184,7 @@ For example use - delay: "00:05:00", not - action: delay.
 - Put notify text under data: with a message key.
 Preserve the user's thresholds, guards, delays, entities, and notification text.
 Do not ask for clarification. Return the final corrected JSON now."""
-_INSTALL_REPAIR_ATTEMPTS = 3
+_INSTALL_REPAIR_ATTEMPTS = 4
 
 
 def _history_path(hass: HomeAssistant) -> str:
@@ -509,6 +509,51 @@ def _mark_job_running(job: dict[str, Any], message: str, detail: str) -> None:
     job["message"] = message
     job["detail"] = detail
     job["updated_at"] = now_iso
+
+
+def _mark_job_yaml_repair(job: dict[str, Any], issue: str) -> None:
+    """Expose the latest YAML repair issue to the frontend while retries continue."""
+    normalized_issue = str(issue or "").strip()
+    if not normalized_issue:
+        return
+
+    job["repair_in_progress"] = True
+    _mark_job_running(
+        job,
+        "Fixing a YAML issue…",
+        (
+            "The model returned automation YAML with a syntax or logic problem. "
+            "AutoMagic has automatically sent the latest specific error back to the AI "
+            f"and is requesting another correction. Error: {normalized_issue[:300]}"
+        ),
+    )
+
+
+def _mark_job_entity_repair(job: dict[str, Any], issue: str) -> None:
+    """Expose the latest entity-repair issue to the frontend while retries continue."""
+    normalized_issue = str(issue or "").strip()
+    if not normalized_issue:
+        return
+
+    job["repair_in_progress"] = True
+    _mark_job_running(
+        job,
+        "Fixing incorrect entity references…",
+        (
+            "The model returned another entity-reference issue. AutoMagic has "
+            "automatically sent the latest specific error back to the AI and is "
+            f"requesting another correction. Error: {normalized_issue[:300]}"
+        ),
+    )
+
+
+def _yaml_repair_failure_message(issue: str) -> str:
+    """Return a user-facing error after repeated automatic YAML repair attempts."""
+    normalized_issue = str(issue or "").strip() or "The model returned invalid automation YAML."
+    return (
+        "AutoMagic sent each returned YAML error back to the AI, but the model still did not "
+        f"produce valid automation YAML. Last issue: {normalized_issue}"
+    )
 
 
 def _mark_job_complete(
@@ -1706,11 +1751,14 @@ async def _regenerate_generation_result(
     prompt_text: str,
     entities: list[dict[str, Any]],
     issue: str,
+    job: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Regenerate a clean automation from the original request when repair is exhausted."""
     last_issue = str(issue or "").strip() or "The model returned invalid automation YAML."
     last_result: dict[str, Any] | None = None
     for _attempt in range(_YAML_REGENERATION_ATTEMPTS):
+        if job is not None:
+            _mark_job_yaml_repair(job, last_issue)
         try:
             regenerated = _normalize_generation_result(
                 await client.complete(
@@ -1735,6 +1783,8 @@ async def _regenerate_generation_result(
     current = last_result
     if current is not None and last_issue:
         for _attempt in range(_YAML_REPAIR_ATTEMPTS):
+            if job is not None:
+                _mark_job_yaml_repair(job, last_issue)
             try:
                 current = _normalize_generation_result(
                     await client.complete(
@@ -1766,6 +1816,7 @@ async def _repair_generation_result(
     prompt_text: str,
     entities: list[dict[str, Any]],
     result: dict[str, Any],
+    job: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate and, when needed, repair a generated YAML result."""
     current = _normalize_generation_result(result)
@@ -1790,6 +1841,8 @@ async def _repair_generation_result(
 
     for _attempt in range(_YAML_REPAIR_ATTEMPTS):
         issue = " ".join(issues[:6])
+        if job is not None:
+            _mark_job_yaml_repair(job, issue)
         try:
             current = _normalize_generation_result(
                 await client.complete(
@@ -1815,6 +1868,7 @@ async def _repair_generation_result(
         prompt_text,
         entities,
         " ".join(issues[:6]),
+        job,
     )
 
 
@@ -1951,6 +2005,7 @@ async def _run_generation_job(
                     prompt_text,
                     prompt_entities,
                     str(err),
+                    job,
                 )
             except LLMConnectionError as regen_err:
                 _LOGGER.error(
@@ -1964,7 +2019,14 @@ async def _run_generation_job(
                     "LLM response error during regeneration fallback: %s",
                     regen_err,
                 )
-                _mark_job_error(job, str(regen_err))
+                _mark_job_error(
+                    job,
+                    _yaml_repair_failure_message(str(regen_err)),
+                    (
+                        "AutoMagic sent each returned YAML error back to the AI, but the model "
+                        "still did not produce valid automation YAML after multiple correction attempts."
+                    ),
+                )
                 return None
         except Exception as err:  # pragma: no cover - defensive guard
             _LOGGER.exception("Unexpected generation error")
@@ -1990,16 +2052,7 @@ async def _run_generation_job(
             )
             if initial_issues:
                 initial_issue = " ".join(initial_issues[:4])
-                job["repair_in_progress"] = True
-                _mark_job_running(
-                    job,
-                    "Fixing a YAML issue…",
-                    (
-                        "The model returned automation YAML with a syntax or logic problem. "
-                        "AutoMagic has automatically sent the specific error back to the AI "
-                        f"and is requesting a correction. Error: {initial_issue[:300]}"
-                    ),
-                )
+                _mark_job_yaml_repair(job, initial_issue)
 
         try:
             repaired = await _repair_generation_result(
@@ -2008,6 +2061,7 @@ async def _run_generation_job(
                 prompt_text,
                 prompt_entities,
                 result,
+                job,
             )
 
             # ------- entity-id validation after structural YAML repair -------
@@ -2016,16 +2070,9 @@ async def _run_generation_job(
                 known_ids = {e["entity_id"] for e in entities_list}
                 hallucinated = _find_hallucinated_entities(yaml_text, known_ids)
                 if hallucinated:
-                    job["repair_in_progress"] = True
-                    _mark_job_running(
+                    _mark_job_entity_repair(
                         job,
-                        "Fixing incorrect entity references…",
-                        (
-                            "The model used entity IDs that don't exist in your "
-                            "Home Assistant. AutoMagic has sent the invalid "
-                            "references back to the AI for correction. "
-                            f"Unknown entities: {', '.join(hallucinated[:10])}"
-                        ),
+                        f"Unknown entities: {', '.join(hallucinated[:10])}",
                     )
                     full_entity_summary = "\n".join(
                         f"{e['entity_id']} ({e['name']}) [{e['state']}]"
@@ -2033,6 +2080,11 @@ async def _run_generation_job(
                     )
                     entity_repair_issue = ""
                     for _ent_attempt in range(_ENTITY_REPAIR_ATTEMPTS):
+                        _mark_job_entity_repair(
+                            job,
+                            entity_repair_issue
+                            or f"Unknown entities: {', '.join(hallucinated[:10])}",
+                        )
                         try:
                             candidate = _normalize_generation_result(
                                 await client.complete(
@@ -2079,11 +2131,10 @@ async def _run_generation_job(
             _LOGGER.error("LLM response error during YAML repair: %s", err)
             _mark_job_error(
                 job,
-                str(err),
+                _yaml_repair_failure_message(str(err)),
                 (
-                    "AutoMagic detected a YAML formatting issue and automatically sent the "
-                    "error back to the AI, but could not produce a valid automation after "
-                    "multiple correction attempts. Try rephrasing your request."
+                    "AutoMagic sent each returned YAML error back to the AI, but the model "
+                    "still did not produce valid automation YAML after multiple correction attempts."
                 ),
             )
             return None

@@ -202,6 +202,8 @@ function buildMethod(name) {
     "DIRECT_MODEL_PREFERENCES",
     "DIRECT_FINAL_MODEL_PREFERENCES",
     "DIRECT_PLANNER_MODEL_PREFERENCES",
+    "DIRECT_REPAIR_ATTEMPTS",
+    "DIRECT_REGENERATION_ATTEMPTS",
     "DIRECT_FENCE_RE",
     "DIRECT_SYSTEM_PROMPT",
     "DIRECT_RESOLVED_SYSTEM_PROMPT",
@@ -227,6 +229,8 @@ function buildMethod(name) {
     DIRECT_MODEL_PREFERENCES,
     DIRECT_FINAL_MODEL_PREFERENCES,
     DIRECT_PLANNER_MODEL_PREFERENCES,
+    4,
+    2,
     DIRECT_FENCE_RE,
     DIRECT_SYSTEM_PROMPT,
     DIRECT_RESOLVED_SYSTEM_PROMPT,
@@ -252,6 +256,7 @@ function buildHarness() {
     "_buildAutomationContextMessage",
     "_extractTopLevelSectionBlock",
     "_extractActionBlocks",
+    "_pushRepairStatus",
     "_collectYamlIssues",
     "_yamlIncludesAllEntityIds",
     "_collectYamlCoverageIssues",
@@ -343,9 +348,20 @@ function buildHarness() {
     "_parsePlanningResponse",
     "_parseDirectResponse",
     "_buildDirectEndpointCandidates",
+    "_threadAssistantLabel",
+    "_threadMessageBody",
+    "_formatChatThread",
   ].forEach((name) => {
     harness[name] = buildMethod(name);
   });
+  harness._appendChatMessage = () => {};
+  harness._lastRepairDetail = "";
+  harness._loadingMessage = "";
+  harness._loadingDetail = "";
+  harness._chatMessages = [];
+  harness._services = [];
+  harness._selectedServiceId = "";
+  harness._directModel = "";
   return harness;
 }
 
@@ -357,6 +373,65 @@ test("Model picker sits above the prompt composer and locks after the first mess
     /\?disabled=\$\{isBusy \|\| isModelLocked \|\| this\._services\.length <= 1\}/
   );
   assert.match(cardSource, /Locked for this thread/);
+});
+
+test("Create view source exposes the copy thread action once the chat has started", () => {
+  assert.match(cardSource, /Copy Thread/);
+  assert.match(cardSource, /@click=\$\{this\._copyChatThread\}/);
+  assert.match(cardSource, /isFollowUp[\s\S]*Copy Thread/);
+});
+
+test("Formatted chat threads label user, AI, and AutoMagic messages distinctly", () => {
+  const harness = buildHarness();
+  harness._chatMessages = [
+    { role: "user", type: "text", text: "Turn on Janet at 8am." },
+    { role: "assistant", type: "status", text: "Fixing a YAML issue…" },
+    {
+      role: "assistant",
+      type: "yaml",
+      summary: "Ready to review.",
+      yaml: "alias: Test\ntriggers: []\nconditions: []\nactions: []",
+    },
+  ];
+  harness._services = [
+    {
+      service_id: "openai",
+      model: "gpt-4o-mini",
+      endpoint_url: "https://api.openai.com",
+      is_default: true,
+    },
+  ];
+  harness._selectedServiceId = "openai";
+
+  const formatted = harness._formatChatThread.call(harness);
+
+  assert.match(formatted, /^User said:/m);
+  assert.match(formatted, /^AutoMagic said:/m);
+  assert.match(formatted, /^gpt-4o-mini said:/m);
+  assert.match(formatted, /YAML:\nalias: Test/);
+});
+
+test("Direct repair status only appends when the returned issue changes", () => {
+  const harness = buildHarness();
+  const appended = [];
+  harness._lastRepairDetail = "";
+  harness._loadingMessage = "";
+  harness._loadingDetail = "";
+  harness._appendChatMessage = (message) => {
+    appended.push(message);
+  };
+
+  harness._pushRepairStatus.call(harness, "Action 1 is invalid.");
+  harness._pushRepairStatus.call(harness, "Action 1 is invalid.");
+  harness._pushRepairStatus.call(
+    harness,
+    'Preserve the requested guard that sensor.iphone_13_audio_output must not be "Speaker".'
+  );
+
+  assert.equal(appended.length, 2);
+  assert.match(appended[0].text, /Action 1 is invalid/);
+  assert.match(appended[1].text, /must not be "Speaker"/);
+  assert.match(harness._loadingDetail, /must not be "Speaker"/);
 });
 
 test("History delete only runs for failed or deleted entries", async () => {

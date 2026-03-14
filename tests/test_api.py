@@ -805,7 +805,14 @@ async def test_run_generation_job_regenerates_after_repair_attempts_stay_invalid
     fake_client = MagicMock()
     fake_client._request_timeout = 420
     fake_client.complete = AsyncMock(
-        side_effect=[invalid_yaml, invalid_yaml, invalid_yaml, invalid_yaml, valid_yaml]
+        side_effect=[
+            invalid_yaml,
+            invalid_yaml,
+            invalid_yaml,
+            invalid_yaml,
+            invalid_yaml,
+            valid_yaml,
+        ]
     )
 
     with patch(
@@ -833,8 +840,8 @@ async def test_run_generation_job_regenerates_after_repair_attempts_stay_invalid
 
     assert job["status"] == "completed"
     assert "mode: single" in job["yaml"]
-    assert fake_client.complete.await_count == 5
-    regeneration_messages = fake_client.complete.await_args_list[4].args[0]
+    assert fake_client.complete.await_count == 6
+    regeneration_messages = fake_client.complete.await_args_list[5].args[0]
     assert regeneration_messages[-1]["role"] == "user"
     assert "Ignore every prior draft and regenerate the full automation JSON" in regeneration_messages[-1]["content"]
 
@@ -1030,6 +1037,8 @@ async def test_run_generation_job_retries_with_specific_error_after_invalid_rege
             invalid_delay_yaml,
             invalid_delay_yaml,
             invalid_delay_yaml,
+            invalid_delay_yaml,
+            invalid_delay_yaml,
             valid_yaml,
         ]
     )
@@ -1060,9 +1069,9 @@ async def test_run_generation_job_retries_with_specific_error_after_invalid_rege
     assert job["status"] == "completed"
     assert _validate_generated_yaml(job["yaml"]) is None
     assert '  - delay: "00:05:00"' in job["yaml"]
-    assert fake_client.complete.await_count == 6
+    assert fake_client.complete.await_count == 8
 
-    follow_up_repair_messages = fake_client.complete.await_args_list[5].args[0]
+    follow_up_repair_messages = fake_client.complete.await_args_list[7].args[0]
     assert follow_up_repair_messages[-1]["role"] == "user"
     assert "Problems to fix: Action 0: 'delay'" in follow_up_repair_messages[-1]["content"]
     assert "regenerate the full automation JSON" not in follow_up_repair_messages[-1]["content"]
@@ -1961,10 +1970,12 @@ async def test_run_generation_job_keeps_repairing_latest_yaml_before_regeneratio
 
     repair_calls = 0
     regeneration_calls = 0
+    details_seen: list[str] = []
 
     async def _progressive_complete(messages):
         nonlocal repair_calls, regeneration_calls
         last_content = messages[-1]["content"] if messages else ""
+        details_seen.append(str(job.get("detail") or ""))
         if "Ignore every prior draft and regenerate the full automation JSON" in last_content:
             regeneration_calls += 1
             return still_incomplete_yaml
@@ -2010,6 +2021,8 @@ async def test_run_generation_job_keeps_repairing_latest_yaml_before_regeneratio
     final_repair_messages = fake_client.complete.await_args_list[3].args[0]
     assert "switch.router_led_right" in final_repair_messages[-1]["content"]
     assert 'must not be "Speaker"' in final_repair_messages[-1]["content"]
+    assert any("does not match the required <domain>.<service_name> format" in detail for detail in details_seen)
+    assert any('must not be "Speaker"' in detail for detail in details_seen)
 
 
 @pytest.mark.asyncio

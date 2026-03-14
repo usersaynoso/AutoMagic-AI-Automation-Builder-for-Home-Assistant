@@ -12,7 +12,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_PATH = REPO_ROOT / "custom_components" / "automagic" / "manifest.json"
 HACS_CONFIG_PATH = REPO_ROOT / "hacs.json"
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "validate.yml"
-BRAND_DIR = REPO_ROOT / "custom_components" / "automagic" / "brand"
+BRAND_DIRS = (
+    REPO_ROOT / "brand",
+    REPO_ROOT / "custom_components" / "automagic" / "brand",
+)
 AGENTS_PATH = REPO_ROOT / "AGENTS.md"
 STRINGS_PATH = REPO_ROOT / "custom_components" / "automagic" / "strings.json"
 TRANSLATION_PATH = (
@@ -45,7 +48,7 @@ def test_manifest_declares_single_config_entry_service_integration():
     assert manifest["integration_type"] == "service"
     assert manifest["issue_tracker"] == f"{CANONICAL_REPO_URL}/issues"
     assert manifest["single_config_entry"] is True
-    assert manifest["version"] == "0.2.18"
+    assert manifest["version"] == "0.2.19"
 
 
 def test_manifest_keys_follow_home_assistant_ordering_rules():
@@ -86,9 +89,9 @@ def test_repo_agents_file_documents_release_bumps():
 
 
 def test_local_brand_assets_exist_for_hacs_validation():
-    """HACS default repo validation accepts a local brand directory."""
-    assert (BRAND_DIR / "icon.png").is_file()
-    assert (BRAND_DIR / "logo.png").is_file()
+    """Brand assets should exist in at least one supported repo location."""
+    assert any((brand_dir / "icon.png").is_file() for brand_dir in BRAND_DIRS)
+    assert any((brand_dir / "logo.png").is_file() for brand_dir in BRAND_DIRS)
 
 
 def test_subentry_translations_define_initiate_flow_labels():

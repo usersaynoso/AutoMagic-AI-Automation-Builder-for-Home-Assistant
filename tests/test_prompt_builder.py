@@ -75,6 +75,12 @@ class TestBuildPrompt:
         assert "automation MUST include an explicit off sequence" in SYSTEM_PROMPT
         assert "Do not leave lights on indefinitely with no off path." in SYSTEM_PROMPT
 
+    def test_system_prompt_requires_wait_for_trigger_timeout_branching(self):
+        """System prompt should steer timeout branches to wait_for_trigger + wait.completed."""
+        assert "use wait_for_trigger with a timeout" in SYSTEM_PROMPT
+        assert "continue_on_timeout: true" in SYSTEM_PROMPT
+        assert "{{ wait.completed }}" in SYSTEM_PROMPT
+
     def test_empty_entity_summary(self):
         """Should still produce valid messages with empty entity list."""
         result = build_prompt("Turn on lights", "")

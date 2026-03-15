@@ -210,7 +210,8 @@ OUTPUT RULES:
 - For follow-up change requests, revise the current automation and return the full updated YAML, not a partial diff.
 - For follow-up questions about the current automation, answer briefly in "summary" and also return the full current or updated YAML in "yaml".
 - For complex multi-step requests, use variables, choose blocks, delay/wait steps, and template conditions or template values as needed. Return one complete automation unless the user explicitly asks for multiple automations.
-- When the prompt requests a specific colour or brightness for lights, every affected light.turn_on action MUST include a data: block with at least one colour field (color_temp in mireds, color_name, rgb_color, or kelvin) and brightness_pct. Never drop colour or brightness attributes to resolve a different error.
+- When the prompt requires waiting for an event (such as a device finishing) but also specifies a maximum wait time after which a different action should happen, use wait_for_trigger with a timeout: (in HH:MM:SS format) and continue_on_timeout: true. After the wait, use a choose: block that branches on {{ wait.completed }} to distinguish between the event occurring (true) and the timeout expiring (false). Do not use an unconditional delay for this pattern as it ignores whether the event happened.
+- COLOUR PERSISTENCE RULE (mandatory): If any light.turn_on action in the current draft already has color_temp, brightness_pct, color_name, rgb_color, kelvin, or xy_color set correctly, you MUST copy those exact values into the corrected draft. Dropping colour or brightness data to resolve a different error is not permitted. If colour data is missing from a light.turn_on action that targets lights mentioned in the prompt alongside a colour or brightness request, add color_temp: 370 and brightness_pct: <requested_value> under a data: key on that action.
 - Read the entire request as one combined condition/action sequence before deciding anything is missing. Do not ask about a sub-step when the needed threshold, guard, time window, or follow-up action is already stated elsewhere in the same prompt.
 - Interpret wattage/watts/kW as power, amps/amperage as current, and volts as voltage when matching sensor families from the provided entities.
 - Treat time-window guards or exclusions such as "not between 9am and 5pm on a weekday" as conditions, not as the automation's trigger schedule.
@@ -1358,6 +1359,7 @@ class AutoMagicCard extends LitElement {
     if (!text) return ["The response did not include automation YAML."];
 
     const issues = [];
+    const triggerSection = this._extractTopLevelSectionBlock(text, "triggers");
     if (!/^alias\s*:/m.test(text)) {
       issues.push("Include an alias field.");
     }
@@ -1367,13 +1369,12 @@ class AutoMagicCard extends LitElement {
     if (!/^actions\s*:/m.test(text)) {
       issues.push("Use a top-level actions: list.");
     }
-    if (/^\s*(?:-\s*)?platform\s*:/m.test(text)) {
+    if (/^\s*(?:-\s*)?platform\s*:/m.test(triggerSection)) {
       issues.push("Inside each trigger item, use trigger: instead of platform:.");
     }
     if (/^\s*(?:-\s*)?service\s*:/m.test(text)) {
       issues.push("Inside each action item, use action: instead of service:.");
     }
-    const triggerSection = this._extractTopLevelSectionBlock(text, "triggers");
     if (
       /^  -\s*trigger\s*:\s*(?:#.*)?$(?:\r?\n)\s+[a-z_][a-z0-9_]*\s*:/im.test(
         triggerSection
@@ -1497,6 +1498,11 @@ class AutoMagicCard extends LitElement {
     }
 
     const issues = [];
+    const yamlEntityIds = new Set(
+      [...text.matchAll(/\b[a-z0-9_]+\.[a-z0-9_]+\b/gi)].map((match) =>
+        this._normalizeText(match[0])
+      )
+    );
     for (const match of text.matchAll(/\bcolor_temp\s*:\s*(\d+)\b/gi)) {
       const value = Number(match[1]);
       if (!Number.isFinite(value) || value <= 1000) continue;
@@ -1600,27 +1606,26 @@ class AutoMagicCard extends LitElement {
         );
       }
     });
-    if (
-      /\beither\b/i.test(requestText) &&
-      /\b(router\s+led|network\s+is\s+down)\b/i.test(requestText)
-    ) {
-      const resolvedGuardIds = [
-        ...new Set(
-          explicitStateGuards
-            .map((guard) => this._normalizeText(guard?.entity_id))
-            .filter(Boolean)
-        ),
-      ];
-      const missingGuardIds = resolvedGuardIds.filter(
-        (entityId) => !text.includes(entityId)
+    const missingGuards = explicitStateGuards
+      .map((guard) => this._normalizeText(guard?.entity_id))
+      .filter((entityId) => entityId && !yamlEntityIds.has(entityId));
+    if (missingGuards.length > 0) {
+      issues.push(
+        "The following guard entities from the prompt are missing entirely from the automation YAML and must be added as blocking conditions in the top-level conditions: block: " +
+          `${missingGuards.join(", ")}. ` +
+          "Each guard must appear as a condition: state entry requiring the entity to be in its required state before the automation proceeds."
       );
-      if (
-        resolvedGuardIds.length > 1 &&
-        missingGuardIds.length > 0 &&
-        missingGuardIds.length < resolvedGuardIds.length
-      ) {
+    } else if (/\beither\b/i.test(requestText) && explicitStateGuards.length > 1) {
+      const presentGuards = explicitStateGuards
+        .map((guard) => this._normalizeText(guard?.entity_id))
+        .filter((entityId) => entityId && yamlEntityIds.has(entityId));
+      const absentGuards = explicitStateGuards
+        .map((guard) => this._normalizeText(guard?.entity_id))
+        .filter((entityId) => entityId && !yamlEntityIds.has(entityId));
+      if (absentGuards.length > 0 && presentGuards.length > 0) {
         issues.push(
-          `Preserve ALL resolved guard entities: ${missingGuardIds.join(", ")}. The prompt said 'either' meaning both switches must be present as separate conditions.`
+          "The prompt said 'either', meaning ALL of the following guard entities must be present as separate blocking conditions in the top-level conditions: block. " +
+            `Missing: ${absentGuards.join(", ")}.`
         );
       }
     }
@@ -1700,6 +1705,19 @@ class AutoMagicCard extends LitElement {
     ) {
       issues.push(
         "After a delay the prompt requires a conditional notification — notify only if a condition is still true. Wrap the notify action in a choose: block after the delay that re-checks the relevant entity state before sending the notification."
+      );
+    }
+    const timeoutBranchPromptRe =
+      /\b(if.{0,80}(not finished|still running|still active|hasn.t finished|stuck)|still.{0,40}after.{0,20}\d+\s*(hour|minute|min))\b/i;
+    const hasWaitForTrigger = /wait_for_trigger/i.test(text);
+    const hasTimeout = /timeout\s*:/i.test(text);
+    if (
+      timeoutBranchPromptRe.test(requestText) &&
+      hasWaitForTrigger &&
+      !hasTimeout
+    ) {
+      issues.push(
+        "The automation uses wait_for_trigger but no timeout is set. When the prompt requires a different action if the event does not occur within a time limit, add 'timeout: HH:MM:SS' and 'continue_on_timeout: true' to the wait_for_trigger step, then use a choose: block branching on '{{ wait.completed }}' to handle both the event-occurred (true) and timed-out (false) cases."
       );
     }
     if (
@@ -1880,6 +1898,11 @@ class AutoMagicCard extends LitElement {
         "Use valid light color fields such as kelvin, color_temp, rgb_color, or a supported CSS color_name."
       );
     }
+    if (combined.includes("colour or brightness data") || combined.includes("color_temp")) {
+      hints.push(
+        "MANDATORY: Copy colour and brightness data from the previous draft into this corrected version. Do not drop data: blocks from light.turn_on actions. If colour data was present in the last draft, it must appear in this one too."
+      );
+    }
     if (
       combined.includes("conditional notification") ||
       combined.includes("wrap the notify action in a choose")
@@ -1898,6 +1921,27 @@ class AutoMagicCard extends LitElement {
           "          - action: <notify_service>\n" +
           "            data:\n" +
           '              message: "<message>"'
+      );
+    }
+    if (combined.includes("timeout is set") || combined.includes("wait.completed")) {
+      hints.push(
+        "Use wait_for_trigger with timeout and continue_on_timeout: true, then branch on wait.completed. Example structure:\n" +
+          "  - wait_for_trigger:\n" +
+          "      - trigger: state\n" +
+          "        entity_id: <entity>\n" +
+          '        to: "<finished_state>"\n' +
+          '    timeout: "02:00:00"\n' +
+          "    continue_on_timeout: true\n" +
+          "  - choose:\n" +
+          "      - conditions:\n" +
+          "          - condition: template\n" +
+          '            value_template: "{{ not wait.completed }}"\n' +
+          "        sequence:\n" +
+          "          - action: <notify_service>\n" +
+          "            data:\n" +
+          '              message: "<message>"\n' +
+          "    default:\n" +
+          "      - action: <service_for_normal_finish>"
       );
     }
     if (combined.includes("preserve all resolved guard entities")) {

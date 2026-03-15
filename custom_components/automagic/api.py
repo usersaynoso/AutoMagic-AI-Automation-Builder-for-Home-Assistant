@@ -130,14 +130,19 @@ Use Home Assistant 2024.10+ syntax only.
 Never include an entity_id in the action value. Use a separate target: entity_id: field instead.
 - Script steps such as delay, wait_for_trigger, wait_template, choose, if, repeat, variables, stop, event, and scene must use their own YAML keys. \
 For example use - delay: "00:05:00", not - action: delay.
+- When the prompt requires waiting for an event (such as a device finishing) but also specifies a maximum wait time after which a different action should happen, use wait_for_trigger with a timeout: (in HH:MM:SS format) and continue_on_timeout: true. After the wait, use a choose: block that branches on {{ wait.completed }} to distinguish between the event occurring (true) and the timeout expiring (false). Do not use an unconditional delay for this pattern as it ignores whether the event happened.
 - Include description:, triggers:, conditions:, actions:, and mode:.
 - Do not wrap the YAML in markdown fences, yaml:, automation:, or a list item.
 - Put notify text under data: with a message key.
 - Preserve the user's thresholds, guards, delays, entities, and notification text.
-- When the prompt requests a specific colour or brightness for lights, every affected
-  light.turn_on action MUST include a data: block with at least one colour field
-  (color_temp in mireds, color_name, rgb_color, or kelvin) and brightness_pct.
-  Never drop colour or brightness attributes to resolve a different error.
+- COLOUR PERSISTENCE RULE (mandatory): If any light.turn_on action in the
+  current draft already has color_temp, brightness_pct, color_name, rgb_color,
+  kelvin, or xy_color set correctly, you MUST copy those exact values into the
+  corrected draft. Dropping colour or brightness data to resolve a different
+  error is not permitted. If colour data is missing from a light.turn_on action
+  that targets lights mentioned in the prompt alongside a colour or brightness
+  request, add color_temp: 370 and brightness_pct: <requested_value> under a
+  data: key on that action.
 Do not ask for clarification. Return the final corrected JSON now."""
 _YAML_REGENERATION_SYSTEM_PROMPT = """\
 You are an expert Home Assistant automation generation assistant.
@@ -152,13 +157,18 @@ Use Home Assistant 2024.10+ syntax only.
 Never include an entity_id in the action value. Use a separate target: entity_id: field instead.
 - Script steps such as delay, wait_for_trigger, wait_template, choose, if, repeat, variables, stop, event, and scene must use their own YAML keys. \
 For example use - delay: "00:05:00", not - action: delay.
+- When the prompt requires waiting for an event (such as a device finishing) but also specifies a maximum wait time after which a different action should happen, use wait_for_trigger with a timeout: (in HH:MM:SS format) and continue_on_timeout: true. After the wait, use a choose: block that branches on {{ wait.completed }} to distinguish between the event occurring (true) and the timeout expiring (false). Do not use an unconditional delay for this pattern as it ignores whether the event happened.
 - Do not wrap the YAML in markdown fences, yaml:, automation:, or a list item.
 - Put notify text under data: with a message key.
 - Preserve the user's thresholds, guards, delays, entities, and notification text.
-- When the prompt requests a specific colour or brightness for lights, every affected
-  light.turn_on action MUST include a data: block with at least one colour field
-  (color_temp in mireds, color_name, rgb_color, or kelvin) and brightness_pct.
-  Never drop colour or brightness attributes to resolve a different error.
+- COLOUR PERSISTENCE RULE (mandatory): If any light.turn_on action in the
+  current draft already has color_temp, brightness_pct, color_name, rgb_color,
+  kelvin, or xy_color set correctly, you MUST copy those exact values into the
+  corrected draft. Dropping colour or brightness data to resolve a different
+  error is not permitted. If colour data is missing from a light.turn_on action
+  that targets lights mentioned in the prompt alongside a colour or brightness
+  request, add color_temp: 370 and brightness_pct: <requested_value> under a
+  data: key on that action.
 If prior drafts were invalid, ignore them and regenerate the automation cleanly from the original request and entity context.
 Do not ask for clarification unless the original request truly lacks a required detail. Return the final automation JSON now."""
 _ENTITY_REPAIR_SYSTEM_PROMPT = """\
@@ -194,14 +204,19 @@ Use Home Assistant 2024.10+ syntax only.
 Never include an entity_id in the action value. Use a separate target: entity_id: field instead.
 - Script steps such as delay, wait_for_trigger, wait_template, choose, if, repeat, variables, stop, event, and scene must use their own YAML keys. \
 For example use - delay: "00:05:00", not - action: delay.
+- When the prompt requires waiting for an event (such as a device finishing) but also specifies a maximum wait time after which a different action should happen, use wait_for_trigger with a timeout: (in HH:MM:SS format) and continue_on_timeout: true. After the wait, use a choose: block that branches on {{ wait.completed }} to distinguish between the event occurring (true) and the timeout expiring (false). Do not use an unconditional delay for this pattern as it ignores whether the event happened.
 - Include description:, triggers:, conditions:, actions:, and mode:.
 - Do not wrap the YAML in markdown fences, yaml:, automation:, or a list item.
 - Put notify text under data: with a message key.
 Preserve the user's thresholds, guards, delays, entities, and notification text.
-- When the prompt requests a specific colour or brightness for lights, every affected
-  light.turn_on action MUST include a data: block with at least one colour field
-  (color_temp in mireds, color_name, rgb_color, or kelvin) and brightness_pct.
-  Never drop colour or brightness attributes to resolve a different error.
+- COLOUR PERSISTENCE RULE (mandatory): If any light.turn_on action in the
+  current draft already has color_temp, brightness_pct, color_name, rgb_color,
+  kelvin, or xy_color set correctly, you MUST copy those exact values into the
+  corrected draft. Dropping colour or brightness data to resolve a different
+  error is not permitted. If colour data is missing from a light.turn_on action
+  that targets lights mentioned in the prompt alongside a colour or brightness
+  request, add color_temp: 370 and brightness_pct: <requested_value> under a
+  data: key on that action.
 Do not ask for clarification. Return the final corrected JSON now."""
 
 
@@ -739,6 +754,12 @@ def _build_yaml_repair_hints(issues: list[str]) -> list[str]:
         hints.append(
             "Use valid light color fields such as kelvin, color_temp, rgb_color, or a supported CSS color_name."
         )
+    if "colour or brightness data" in combined or "color_temp" in combined:
+        hints.append(
+            "MANDATORY: Copy colour and brightness data from the previous draft into this "
+            "corrected version. Do not drop data: blocks from light.turn_on actions. "
+            "If colour data was present in the last draft, it must appear in this one too."
+        )
     if (
         "conditional notification" in combined
         or "wrap the notify action in a choose" in combined
@@ -757,6 +778,27 @@ def _build_yaml_repair_hints(issues: list[str]) -> list[str]:
             "          - action: <notify_service>\n"
             "            data:\n"
             "              message: \"<message>\""
+        )
+    if "timeout is set" in combined or "wait.completed" in combined:
+        hints.append(
+            "Use wait_for_trigger with timeout and continue_on_timeout: true, then branch "
+            "on wait.completed. Example structure:\n"
+            "  - wait_for_trigger:\n"
+            "      - trigger: state\n"
+            "        entity_id: <entity>\n"
+            "        to: \"<finished_state>\"\n"
+            "    timeout: \"02:00:00\"\n"
+            "    continue_on_timeout: true\n"
+            "  - choose:\n"
+            "      - conditions:\n"
+            "          - condition: template\n"
+            "            value_template: \"{{ not wait.completed }}\"\n"
+            "        sequence:\n"
+            "          - action: <notify_service>\n"
+            "            data:\n"
+            "              message: \"<message>\"\n"
+            "    default:\n"
+            "      - action: <service_for_normal_finish>"
         )
     if "preserve all resolved guard entities" in combined:
         guard_entity_ids = _extract_multi_entity_guard_issue_entity_ids(issues, limit=2)
@@ -1556,30 +1598,37 @@ def _collect_generated_yaml_issues(
             continue
         issues.append(f"Respect the explicit guard {entity_id} before running the actions.")
 
-    if (
+    # Check that every resolved guard entity appears somewhere in the YAML
+    missing_guards = [
+        guard["entity_id"]
+        for guard in explicit_state_guards
+        if guard["entity_id"] not in yaml_entity_ids
+    ]
+    if missing_guards:
+        issues.append(
+            "The following guard entities from the prompt are missing entirely from the "
+            "automation YAML and must be added as blocking conditions in the top-level "
+            f"conditions: block: {', '.join(missing_guards)}. "
+            "Each guard must appear as a condition: state entry requiring the entity to be "
+            "in its required state before the automation proceeds."
+        )
+    elif (
         re.search(r"\beither\b", prompt_text, re.IGNORECASE)
-        and re.search(r"\b(router\s+led|network\s+is\s+down)\b", prompt_text, re.IGNORECASE)
+        and len(explicit_state_guards) > 1
     ):
-        resolved_guard_ids = [
-            entity_id
-            for entity_id in dict.fromkeys(
-                guard["entity_id"] for guard in explicit_state_guards if guard.get("entity_id")
-            )
-            if entity_id
+        present_guards = [
+            g["entity_id"] for g in explicit_state_guards
+            if g["entity_id"] in yaml_entity_ids
         ]
-        present_guard_ids = [entity_id for entity_id in resolved_guard_ids if entity_id in yaml_entity_ids]
-        missing_guard_ids = [
-            entity_id for entity_id in resolved_guard_ids if entity_id not in yaml_entity_ids
+        absent_guards = [
+            g["entity_id"] for g in explicit_state_guards
+            if g["entity_id"] not in yaml_entity_ids
         ]
-        if (
-            len(resolved_guard_ids) > 1
-            and present_guard_ids
-            and missing_guard_ids
-        ):
+        if absent_guards and present_guards:
             issues.append(
-                "Preserve ALL resolved guard entities: "
-                f"{', '.join(missing_guard_ids)}. "
-                "The prompt said 'either' meaning both switches must be present as separate conditions."
+                "The prompt said 'either', meaning ALL of the following guard entities must "
+                "be present as separate blocking conditions in the top-level conditions: block. "
+                f"Missing: {', '.join(absent_guards)}."
             )
 
     if re.search(
@@ -1632,6 +1681,29 @@ def _collect_generated_yaml_issues(
             "After a delay the prompt requires a conditional notification — notify only if a "
             "condition is still true. Wrap the notify action in a choose: block after the delay "
             "that re-checks the relevant entity state before sending the notification."
+        )
+    timeout_branch_prompt_re = re.compile(
+        r"\b(if.{0,80}(not finished|still running|still active|hasn.t finished|stuck)"
+        r"|still.{0,40}after.{0,20}\d+\s*(hour|minute|min))\b",
+        re.IGNORECASE,
+    )
+    has_wait_for_trigger = re.search(
+        r"wait_for_trigger", normalized_yaml, re.IGNORECASE
+    )
+    has_timeout = re.search(
+        r"timeout\s*:", normalized_yaml, re.IGNORECASE
+    )
+    if (
+        timeout_branch_prompt_re.search(prompt_text)
+        and has_wait_for_trigger
+        and not has_timeout
+    ):
+        issues.append(
+            "The automation uses wait_for_trigger but no timeout is set. When the prompt "
+            "requires a different action if the event does not occur within a time limit, "
+            "add 'timeout: HH:MM:SS' and 'continue_on_timeout: true' to the wait_for_trigger "
+            "step, then use a choose: block branching on '{{ wait.completed }}' to handle "
+            "both the event-occurred (true) and timed-out (false) cases."
         )
 
     return list(dict.fromkeys(issue for issue in issues if issue))

@@ -105,6 +105,29 @@ class TestValidateAutomation:
         with pytest.raises(AutomationValidationError, match="service.*legacy"):
             validate_automation(parsed)
 
+    def test_wait_for_trigger_subtrigger_platform_is_allowed(self):
+        """Nested wait_for_trigger sub-triggers may still use platform:."""
+        parsed = {
+            "alias": "Test",
+            "triggers": [{"trigger": "time", "at": "08:00:00"}],
+            "actions": [
+                {
+                    "wait_for_trigger": [
+                        {
+                            "platform": "state",
+                            "entity_id": "vacuum.robot_vacuum",
+                            "to": "docked",
+                        }
+                    ],
+                    "timeout": "02:00:00",
+                    "continue_on_timeout": True,
+                },
+                {"action": "notify.mobile_app_iphone_13"},
+            ],
+        }
+
+        validate_automation(parsed)  # Should not raise
+
     def test_empty_triggers_list_rejected(self):
         parsed = {
             "alias": "Test",

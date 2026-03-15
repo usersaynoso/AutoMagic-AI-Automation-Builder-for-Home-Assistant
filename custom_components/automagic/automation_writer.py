@@ -111,6 +111,8 @@ def validate_automation(parsed: dict[str, Any]) -> None:
             continue
         if "condition" in act:
             raise AutomationValidationError(_bare_action_condition_error(i))
+        # Only inspect top-level keys on action items. Nested wait_for_trigger
+        # sub-triggers legitimately use platform: in Home Assistant.
         if _LEGACY_ACTION_KEY in act and "action" not in act:
             raise AutomationValidationError(
                 f"Action {i}: use 'action:' instead of 'service:' (legacy syntax rejected)"

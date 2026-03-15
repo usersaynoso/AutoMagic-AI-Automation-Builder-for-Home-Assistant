@@ -93,6 +93,13 @@ also return the full current or updated YAML in "yaml".
 - For complex multi-step requests, use variables, choose blocks, delay/wait steps, and \
 template conditions or template values as needed. Return one complete automation unless \
 the user explicitly asks for multiple automations.
+- When the prompt requires waiting for an event (such as a device finishing) but \
+also specifies a maximum wait time after which a different action should happen, \
+use wait_for_trigger with a timeout: (in HH:MM:SS format) and \
+continue_on_timeout: true. After the wait, use a choose: block that branches on \
+{{ wait.completed }} to distinguish between the event occurring (true) and the \
+timeout expiring (false). Do not use an unconditional delay for this pattern as \
+it ignores whether the event happened.
 - When the prompt requests a specific colour or brightness for lights, every affected \
 light.turn_on action MUST include a data: block with at least one colour field \
 (color_temp in mireds, color_name, rgb_color, or kelvin) and brightness_pct. \

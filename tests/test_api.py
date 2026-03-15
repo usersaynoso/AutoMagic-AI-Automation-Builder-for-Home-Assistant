@@ -1671,7 +1671,9 @@ def test_collect_generated_yaml_issues_flags_semantic_mismatches_for_vacuum_prom
     assert any("Include the resolved entity light.bar_lamp." in issue for issue in issues)
     assert any("Respect the explicit guard switch.router_led_right" in issue for issue in issues)
     assert any(
-        "Preserve ALL resolved guard entities: switch.router_led_right. The prompt said 'either' meaning both switches must be present as separate conditions."
+        "The following guard entities from the prompt are missing entirely from the "
+        "automation YAML and must be added as blocking conditions in the top-level "
+        "conditions: block: switch.router_led_right."
         in issue
         for issue in issues
     )
@@ -2099,6 +2101,58 @@ def test_collect_generated_yaml_issues_flags_unconditional_notify_after_delay():
     ) in issues
 
 
+def test_collect_generated_yaml_issues_flags_wait_for_trigger_without_timeout():
+    """Prompt-aware validation should require timeout + wait.completed branching."""
+    prompt = (
+        "Start Janet cleaning now. Wait for her to finish, but if she hasn't finished "
+        "after 2 hours, send a notification to my iPhone."
+    )
+    entities = [
+        {
+            "entity_id": "vacuum.robot_vacuum",
+            "name": "Janet",
+            "state": "cleaning",
+            "domain": "vacuum",
+        },
+        {
+            "entity_id": "notify.mobile_app_iphone_13",
+            "name": "Notify Iphone 13",
+            "state": "service",
+            "domain": "notify",
+        },
+    ]
+    yaml_text = (
+        "alias: Janet Wait Without Timeout\n"
+        "description: Wait for Janet to finish.\n"
+        "triggers:\n"
+        "  - trigger: time\n"
+        '    at: "08:00:00"\n'
+        "conditions: []\n"
+        "actions:\n"
+        "  - action: vacuum.start\n"
+        "    target:\n"
+        "      entity_id: vacuum.robot_vacuum\n"
+        "  - wait_for_trigger:\n"
+        "      - trigger: state\n"
+        "        entity_id: vacuum.robot_vacuum\n"
+        '        to: "docked"\n'
+        "  - action: notify.mobile_app_iphone_13\n"
+        "    data:\n"
+        '      message: "Janet is still cleaning after 2 hours"\n'
+        "mode: single\n"
+    )
+
+    issues = _collect_generated_yaml_issues(prompt, entities, yaml_text)
+
+    assert (
+        "The automation uses wait_for_trigger but no timeout is set. When the prompt "
+        "requires a different action if the event does not occur within a time limit, "
+        "add 'timeout: HH:MM:SS' and 'continue_on_timeout: true' to the wait_for_trigger "
+        "step, then use a choose: block branching on '{{ wait.completed }}' to handle "
+        "both the event-occurred (true) and timed-out (false) cases."
+    ) in issues
+
+
 def test_yaml_repair_hints_include_conditional_notification_example():
     """Repair hints should explain the choose block shape for delayed notify checks."""
     hints = _build_yaml_repair_hints(
@@ -2116,6 +2170,39 @@ def test_yaml_repair_hints_include_conditional_notification_example():
     )
     assert any("entity_id: <relevant_entity>" in hint for hint in hints)
     assert any("action: <notify_service>" in hint for hint in hints)
+
+
+def test_yaml_repair_hints_include_wait_for_trigger_timeout_example():
+    """Repair hints should explain the wait_for_trigger timeout shape."""
+    hints = _build_yaml_repair_hints(
+        [
+            "The automation uses wait_for_trigger but no timeout is set. When the prompt "
+            "requires a different action if the event does not occur within a time limit, "
+            "add 'timeout: HH:MM:SS' and 'continue_on_timeout: true' to the wait_for_trigger "
+            "step, then use a choose: block branching on '{{ wait.completed }}' to handle "
+            "both the event-occurred (true) and timed-out (false) cases."
+        ]
+    )
+
+    assert any("continue_on_timeout: true" in hint for hint in hints)
+    assert any("{{ not wait.completed }}" in hint for hint in hints)
+    assert any("action: <service_for_normal_finish>" in hint for hint in hints)
+
+
+def test_yaml_repair_hints_require_colour_persistence_across_repairs():
+    """Repair hints should explicitly require copying prior light colour data forward."""
+    hints = _build_yaml_repair_hints(
+        [
+            "The prompt requests a specific colour or brightness for lights, but no "
+            "light.turn_on action includes colour or brightness data."
+        ]
+    )
+
+    assert any(
+        "MANDATORY: Copy colour and brightness data from the previous draft" in hint
+        for hint in hints
+    )
+    assert any("Do not drop data: blocks from light.turn_on actions." in hint for hint in hints)
 
 
 def test_yaml_regeneration_messages_discard_prior_assistant_turns():
@@ -2146,15 +2233,19 @@ def test_yaml_regeneration_messages_discard_prior_assistant_turns():
 
 
 def test_repair_prompts_require_light_colour_and_brightness_data():
-    """Repair-oriented backend prompts should preserve requested light colour and brightness fields."""
+    """Repair-oriented backend prompts should preserve colour data and timeout branching guidance."""
     for prompt in (
         _YAML_REPAIR_SYSTEM_PROMPT,
         _YAML_REGENERATION_SYSTEM_PROMPT,
         _INSTALL_REPAIR_SYSTEM_PROMPT,
     ):
-        assert "every affected" in prompt
-        assert "light.turn_on action MUST include a data: block" in prompt
-        assert "brightness_pct" in prompt
+        assert "COLOUR PERSISTENCE RULE (mandatory)" in prompt
+        assert "you MUST copy those exact values into the" in prompt
+        assert "corrected draft" in prompt
+        assert "color_temp: 370" in prompt
+        assert "use wait_for_trigger with a timeout" in prompt
+        assert "continue_on_timeout: true" in prompt
+        assert "{{ wait.completed }}" in prompt
 
 
 @pytest.mark.asyncio

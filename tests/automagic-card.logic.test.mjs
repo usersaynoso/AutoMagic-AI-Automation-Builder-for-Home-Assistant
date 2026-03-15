@@ -2500,6 +2500,33 @@ actions:
   );
 });
 
+test("YAML issue detection ignores platform nested under wait_for_trigger", () => {
+  const harness = buildHarness();
+  const issues = harness._collectYamlIssues.call(
+    harness,
+    `alias: Wait Example
+description: Example
+triggers:
+  - trigger: time
+    at: "08:00:00"
+conditions: []
+actions:
+  - wait_for_trigger:
+      - platform: state
+        entity_id: vacuum.robot_vacuum
+        to: "docked"
+    timeout: "02:00:00"
+    continue_on_timeout: true
+  - action: notify.mobile_app_iphone_13
+    data:
+      message: "Finished"`
+  );
+
+  assert.ok(
+    !issues.includes("Inside each trigger item, use trigger: instead of platform:.")
+  );
+});
+
 test("YAML issue detection catches duplicated sections, pseudo fields, and invalid trigger items", () => {
   const harness = buildHarness();
   const issues = harness._collectYamlIssues.call(
@@ -2868,7 +2895,7 @@ mode: single`,
   );
   assert.ok(
     issues.includes(
-      "Preserve ALL resolved guard entities: switch.mesh_mesh_led. The prompt said 'either' meaning both switches must be present as separate conditions."
+      "The following guard entities from the prompt are missing entirely from the automation YAML and must be added as blocking conditions in the top-level conditions: block: switch.mesh_mesh_led. Each guard must appear as a condition: state entry requiring the entity to be in its required state before the automation proceeds."
     )
   );
 });
@@ -2956,6 +2983,52 @@ mode: single`,
   );
 });
 
+test("Prompt-aware coverage issues catch wait_for_trigger steps with no timeout", () => {
+  const harness = buildHarness();
+  const issues = harness._collectYamlCoverageIssues.call(
+    harness,
+    "Start Janet cleaning now. Wait for her to finish, but if she hasn't finished after 2 hours, send a notification to my iPhone.",
+    `alias: Janet Wait Without Timeout
+description: Example
+triggers:
+  - trigger: time
+    at: "08:00:00"
+conditions: []
+actions:
+  - action: vacuum.start
+    target:
+      entity_id: vacuum.robot_vacuum
+  - wait_for_trigger:
+      - trigger: state
+        entity_id: vacuum.robot_vacuum
+        to: "docked"
+  - action: notify.mobile_app_iphone_13
+    data:
+      message: "Janet is still cleaning after 2 hours"
+mode: single`,
+    {
+      entities: [
+        {
+          entity_id: "vacuum.robot_vacuum",
+          name: "Janet",
+          domain: "vacuum",
+        },
+        {
+          entity_id: "notify.mobile_app_iphone_13",
+          name: "Notify Iphone 13",
+          domain: "notify",
+        },
+      ],
+    }
+  );
+
+  assert.ok(
+    issues.includes(
+      "The automation uses wait_for_trigger but no timeout is set. When the prompt requires a different action if the event does not occur within a time limit, add 'timeout: HH:MM:SS' and 'continue_on_timeout: true' to the wait_for_trigger step, then use a choose: block branching on '{{ wait.completed }}' to handle both the event-occurred (true) and timed-out (false) cases."
+    )
+  );
+});
+
 test("Guard placement only counts inside the top-level conditions block", () => {
   const harness = buildHarness();
 
@@ -3014,6 +3087,26 @@ test("Repair hints explain delayed conditional notifications with a choose block
   );
   assert.ok(hints.some((hint) => hint.includes("entity_id: <relevant_entity>")));
   assert.ok(hints.some((hint) => hint.includes("action: <notify_service>")));
+});
+
+test("Repair hints explain wait_for_trigger timeouts and colour persistence", () => {
+  const harness = buildHarness();
+  const hints = harness._buildRepairHints.call(harness, [
+    "The automation uses wait_for_trigger but no timeout is set. When the prompt requires a different action if the event does not occur within a time limit, add 'timeout: HH:MM:SS' and 'continue_on_timeout: true' to the wait_for_trigger step, then use a choose: block branching on '{{ wait.completed }}' to handle both the event-occurred (true) and timed-out (false) cases.",
+    "The prompt requests a specific colour or brightness for lights, but no light.turn_on action includes colour or brightness data.",
+  ]);
+
+  assert.ok(
+    hints.some((hint) => hint.includes("continue_on_timeout: true"))
+  );
+  assert.ok(
+    hints.some((hint) => hint.includes("{{ not wait.completed }}"))
+  );
+  assert.ok(
+    hints.some((hint) =>
+      hint.includes("MANDATORY: Copy colour and brightness data from the previous draft")
+    )
+  );
 });
 
 test("Prompt-aware coverage issues reject guards nested only inside choose branches", () => {
@@ -3712,11 +3805,15 @@ test("Source encodes do-not-run guards as top-level conditions", () => {
 });
 
 test("Source encodes light colour coverage and explicit light-off rules", () => {
-  assert.match(
-    cardSource,
-    /every affected light\.turn_on action MUST include a data: block/i
-  );
-  assert.match(cardSource, /brightness_pct/i);
+  assert.match(cardSource, /COLOUR PERSISTENCE RULE \(mandatory\)/i);
+  assert.match(cardSource, /MUST copy those exact values into the corrected draft/i);
+  assert.match(cardSource, /color_temp: 370/i);
   assert.match(cardSource, /automation MUST include an explicit off sequence/i);
   assert.match(cardSource, /Do not leave lights on indefinitely with no off path/i);
+});
+
+test("Source encodes wait_for_trigger timeout branching guidance", () => {
+  assert.match(cardSource, /use wait_for_trigger with a timeout/i);
+  assert.match(cardSource, /continue_on_timeout:\s*true/i);
+  assert.match(cardSource, /\{\{ wait\.completed \}\}/i);
 });

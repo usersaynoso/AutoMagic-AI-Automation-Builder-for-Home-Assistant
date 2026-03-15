@@ -6497,6 +6497,19 @@ class AutoMagicCard extends LitElement {
       needs_clarification: false,
       clarifying_questions: [],
     };
+    if (!this._normalizeAutomationYamlText(result.yaml)) {
+      this._appendChatMessage({
+        role: "assistant",
+        type: "error",
+        text: result.summary
+          ? `${result.summary} (No automation YAML was generated.)`
+          : "The model did not return automation YAML.",
+      });
+      this._clearGenerationPolling();
+      this._state = STATES.ERROR;
+      this._error = "The model did not return automation YAML.";
+      return;
+    }
     this._conversationMessages = null;
     this._appendChatMessage({
       role: "assistant",
@@ -7908,16 +7921,20 @@ class AutoMagicCard extends LitElement {
               </details>
             `
           : ""}
-        <div class="action-buttons chat-actions">
-          <button
-            class="btn btn-primary"
-            @click=${() => this._handleInstall(index)}
-            ?disabled=${message.installStatus === "installing" || message.installStatus === "installed" || this._state === STATES.INSTALLING}
-          >
-            <ha-icon icon="mdi:download"></ha-icon>
-            ${installLabel}
-          </button>
-        </div>
+        ${message.yaml
+          ? html`
+              <div class="action-buttons chat-actions">
+                <button
+                  class="btn btn-primary"
+                  @click=${() => this._handleInstall(index)}
+                  ?disabled=${message.installStatus === "installing" || message.installStatus === "installed" || this._state === STATES.INSTALLING}
+                >
+                  <ha-icon icon="mdi:download"></ha-icon>
+                  ${installLabel}
+                </button>
+              </div>
+            `
+          : ""}
         ${message.installAlias
           ? html`<p class="chat-meta success">${message.installAlias}</p>`
           : ""}

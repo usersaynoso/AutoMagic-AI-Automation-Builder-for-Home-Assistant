@@ -3774,6 +3774,20 @@ test("Source encodes the simplified intent-first repair pipeline", () => {
   assert.match(cardSource, /warnings:\s*remainingIssues/);
 });
 
+test("Source treats empty backend YAML as an error instead of rendering a broken preview", () => {
+  assert.match(cardSource, /if \(!this\._normalizeAutomationYamlText\(result\.yaml\)\) \{/);
+  assert.match(cardSource, /No automation YAML was generated\./);
+  assert.match(cardSource, /this\._state = STATES\.ERROR;/);
+  assert.match(cardSource, /this\._error = "The model did not return automation YAML\."/);
+});
+
+test("Source only renders the chat install button when YAML exists", () => {
+  assert.match(
+    cardSource,
+    /\$\{message\.yaml\s*\?\s*html`[\s\S]*<div class="action-buttons chat-actions">[\s\S]*_handleInstall\(index\)[\s\S]*`\s*:\s*""\}/
+  );
+});
+
 test("Source encodes do-not-run guards as top-level conditions", () => {
   assert.match(cardSource, /top-level conditions: block/);
   assert.match(cardSource, /not as a choose: branch inside actions:/);

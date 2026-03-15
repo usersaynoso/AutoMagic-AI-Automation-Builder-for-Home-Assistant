@@ -27,6 +27,8 @@ from custom_components.automagic.api import (
     _extract_entity_ids_from_yaml,
     _find_hallucinated_entities,
     _get_config_data,
+    _materialize_generation_result,
+    _repair_generation_result,
     _regenerate_generation_result,
     _run_generation_job,
     _validate_generated_yaml,
@@ -48,6 +50,7 @@ from custom_components.automagic.const import (
 )
 from custom_components.automagic.llm_client import LLMConnectionError, LLMResponseError
 from custom_components.automagic.service_config import build_service_config
+from custom_components.automagic.validation import ValidationReport
 
 
 class FakeRequest:
@@ -2188,6 +2191,123 @@ async def test_regenerate_generation_result_caps_rounds_and_marks_job_error():
         )
 
     assert fake_client.complete.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_materialize_generation_result_best_effort_assembles_yaml_for_invalid_intent():
+    """Intent validation issues should not block deterministic YAML assembly."""
+    fake_client = MagicMock()
+    fake_client.complete = AsyncMock()
+    intent = {
+        "alias": "Kitchen Lights",
+        "description": "Turns on the kitchen lights.",
+        "triggers": [],
+        "conditions": [],
+        "actions": [],
+        "mode": "single",
+    }
+
+    with patch(
+        "custom_components.automagic.api.build_entity_resolution_map",
+        return_value={},
+    ), patch(
+        "custom_components.automagic.api.validate_intent",
+        return_value=(False, ["Mode should be reviewed."]),
+    ), patch(
+        "custom_components.automagic.api._intent_entity_issues",
+        return_value=["Entity resolution was partial."],
+    ), patch(
+        "custom_components.automagic.api.assemble_yaml",
+        return_value=(
+            "alias: Kitchen Lights\n"
+            "description: Turns on the kitchen lights.\n"
+            "triggers: []\n"
+            "conditions: []\n"
+            "actions: []\n"
+            "mode: single\n"
+        ),
+    ):
+        result = await _materialize_generation_result(
+            fake_client,
+            [],
+            "Turn on the kitchen lights",
+            [],
+            {"intent": intent, "summary": "Turns on the kitchen lights."},
+            allow_intent_repair=False,
+        )
+
+    assert result["intent"] == intent
+    assert result["yaml"].startswith("alias: Kitchen Lights")
+    assert result["warnings"] == [
+        "Mode should be reviewed.",
+        "Entity resolution was partial.",
+    ]
+    assert fake_client.complete.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_repair_generation_result_regenerates_when_used_llm_repair_has_empty_yaml():
+    """An empty YAML draft should still trigger clean regeneration even after intent repair."""
+    fake_client = MagicMock()
+    request_messages = [{"role": "user", "content": "Turn on the kitchen lights"}]
+    regenerated = {
+        "yaml": (
+            "alias: Kitchen Lights\n"
+            "description: Turns on the kitchen lights.\n"
+            "triggers: []\n"
+            "conditions: []\n"
+            "actions: []\n"
+            "mode: single\n"
+        ),
+        "summary": "Turns on the kitchen lights.",
+        "warnings": [],
+    }
+    blocking_report = ValidationReport(
+        syntax_errors=["The response did not include automation YAML."]
+    )
+    clean_report = ValidationReport()
+
+    with patch(
+        "custom_components.automagic.api._materialize_generation_result",
+        AsyncMock(
+            side_effect=[
+                {
+                    "yaml": "",
+                    "summary": "Intent repair failed to assemble YAML.",
+                    "warnings": [],
+                    "used_llm_repair": True,
+                },
+                regenerated,
+            ]
+        ),
+    ) as materialize_mock, patch(
+        "custom_components.automagic.api.build_entity_resolution_map",
+        return_value={},
+    ), patch(
+        "custom_components.automagic.api.validate_generated_yaml",
+        side_effect=[blocking_report, blocking_report, clean_report],
+    ), patch(
+        "custom_components.automagic.api._build_deterministic_generation_result",
+        return_value=None,
+    ), patch(
+        "custom_components.automagic.api.autofix_yaml",
+        side_effect=[("", []), (regenerated["yaml"], [])],
+    ), patch(
+        "custom_components.automagic.api._single_clean_regeneration",
+        AsyncMock(return_value={"intent": {"alias": "Kitchen Lights"}}),
+    ) as regeneration_mock:
+        result = await _repair_generation_result(
+            fake_client,
+            request_messages,
+            "Turn on the kitchen lights",
+            [],
+            {"intent": {"alias": "Kitchen Lights"}},
+        )
+
+    assert regeneration_mock.await_count == 1
+    assert materialize_mock.await_count == 2
+    assert result["yaml"].startswith("alias: Kitchen Lights")
+    assert result["summary"] == "Turns on the kitchen lights."
 
 
 @pytest.mark.asyncio

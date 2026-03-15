@@ -1655,11 +1655,23 @@ async def _materialize_generation_result(
         semantic_issues = _intent_entity_issues(intent, entities, entity_map)
         combined_issues = [*intent_issues, *semantic_issues]
 
-    if not isinstance(intent, dict) or combined_issues:
+    if not isinstance(intent, dict):
         current.setdefault("warnings", [])
         current["warnings"] = list(
             dict.fromkeys([*current.get("warnings", []), *combined_issues])
         )
+        return current
+
+    if combined_issues:
+        current.setdefault("warnings", [])
+        current["warnings"] = list(
+            dict.fromkeys([*current.get("warnings", []), *combined_issues])
+        )
+        try:
+            current["yaml"] = assemble_yaml(intent)
+            current["intent"] = intent
+        except Exception:  # pragma: no cover - explicit best-effort fallback
+            pass
         return current
 
     assembled_yaml = assemble_yaml(intent)
@@ -2467,7 +2479,7 @@ async def _repair_generation_result(
         )
         return current
 
-    if current.get("used_llm_repair"):
+    if current.get("used_llm_repair") and current.get("yaml", "").strip():
         current["warnings"] = list(
             dict.fromkeys(
                 [

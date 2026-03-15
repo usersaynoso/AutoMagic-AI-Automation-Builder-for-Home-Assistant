@@ -672,6 +672,55 @@ def _ensure_guard_conditions(
             )
 
 
+def _remove_duplicate_wait_for_trigger(
+    actions: list[Any],
+    fixes: list[str],
+) -> list[Any]:
+    """Remove duplicate wait_for_trigger steps that watch the same entity set.
+
+    When the LLM generates two sequential wait_for_trigger blocks targeting
+    the same entity (one with a timeout and one without), the second blocks
+    forever if the timeout path fires. This removes the redundant duplicate.
+    """
+    if not isinstance(actions, list) or len(actions) < 2:
+        return actions
+
+    def _wait_entity_key(action_item: dict[str, Any]) -> str | None:
+        triggers = action_item.get("wait_for_trigger")
+        if not isinstance(triggers, list) or not triggers:
+            return None
+        parts: list[str] = []
+        for trigger in triggers:
+            if not isinstance(trigger, dict):
+                continue
+            entity_id = str(trigger.get("entity_id") or "").strip()
+            to_state = str(trigger.get("to") or "").strip()
+            parts.append(f"{entity_id}:{to_state}")
+        return "|".join(sorted(parts)) if parts else None
+
+    seen_wait_keys: dict[str, int] = {}
+    filtered: list[Any] = []
+
+    for index, item in enumerate(actions):
+        if not isinstance(item, dict):
+            filtered.append(item)
+            continue
+
+        wait_key = _wait_entity_key(item)
+        if wait_key is not None:
+            if wait_key in seen_wait_keys:
+                fixes.append(
+                    "Removed duplicate wait_for_trigger watching the same entity"
+                    f" (duplicate of action step {seen_wait_keys[wait_key]})"
+                )
+                continue
+            seen_wait_keys[wait_key] = index
+
+        filtered.append(item)
+
+    return filtered
+
+
 def _ensure_entity_map_guard_conditions(
     parsed: dict[str, Any],
     prompt_text: str,
@@ -865,6 +914,9 @@ def autofix_yaml(
             entity_map,
             fixes,
             fallback_conditions=parsed["conditions"],
+        )
+        parsed["actions"] = _remove_duplicate_wait_for_trigger(
+            parsed["actions"], fixes
         )
 
     _ensure_guard_conditions(parsed, prompt_text, entities, fixes)

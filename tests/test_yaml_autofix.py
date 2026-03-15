@@ -133,6 +133,69 @@ mode: single
     assert any("Converted action: delay" in fix for fix in fixes)
 
 
+def test_autofix_removes_duplicate_wait_for_trigger_steps_for_same_entity():
+    """Duplicate waits for the same entity should collapse to the first step."""
+    prompt = (
+        "When the washing machine starts, wait up to two hours for it to finish. "
+        "If it is still stuck, notify me, then turn the light off when it finishes."
+    )
+    entities = [
+        {
+            "entity_id": "binary_sensor.washing_machine_finished",
+            "name": "Washing Machine Finished",
+            "domain": "binary_sensor",
+        },
+        {
+            "entity_id": "light.utility_room",
+            "name": "Utility Room",
+            "domain": "light",
+        },
+    ]
+    yaml_text = """alias: Washing Machine
+description: Example
+triggers: []
+conditions: []
+actions:
+  - wait_for_trigger:
+      - trigger: state
+        entity_id: binary_sensor.washing_machine_finished
+        to: "on"
+    timeout: "02:00:00"
+    continue_on_timeout: true
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ not wait.completed }}"
+        sequence:
+          - action: light.turn_on
+            target:
+              entity_id: light.utility_room
+  - wait_for_trigger:
+      - trigger: state
+        entity_id: binary_sensor.washing_machine_finished
+        to: "on"
+  - action: light.turn_off
+    target:
+      entity_id: light.utility_room
+mode: single
+"""
+
+    fixed_yaml, fixes = autofix_yaml(yaml_text, prompt, entities)
+    parsed = yaml.safe_load(fixed_yaml)
+
+    wait_steps = [
+        action for action in parsed["actions"] if "wait_for_trigger" in action
+    ]
+    assert len(wait_steps) == 1
+    assert wait_steps[0]["timeout"] == "02:00:00"
+    assert wait_steps[0]["continue_on_timeout"] is True
+    assert parsed["actions"][-1]["action"] == "light.turn_off"
+    assert any(
+        "Removed duplicate wait_for_trigger watching the same entity" in fix
+        for fix in fixes
+    )
+
+
 def test_autofix_injects_entity_map_guards_without_duplication():
     """Entity-map guard roles should become top-level conditions exactly once."""
     prompt = "Don't run if either router LED switch is off."

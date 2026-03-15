@@ -17,6 +17,7 @@ from custom_components.automagic.api import (
     _INSTALL_REPAIR_SYSTEM_PROMPT,
     _YAML_REGENERATION_SYSTEM_PROMPT,
     _YAML_REPAIR_SYSTEM_PROMPT,
+    _mark_job_complete,
     _extract_explicit_state_guards,
     _build_yaml_regeneration_messages,
     _build_yaml_repair_hints,
@@ -31,6 +32,7 @@ from custom_components.automagic.api import (
     _repair_generation_result,
     _regenerate_generation_result,
     _run_generation_job,
+    _serialize_generation_job,
     _validate_generated_yaml,
     _yaml_guard_is_in_conditions_block,
     async_delete_history_entry_request,
@@ -385,6 +387,48 @@ async def test_history_entry_view_deletes_removable_rows(tmp_path):
 
     assert result["status_code"] == 200
     assert result["history"] == []
+
+
+def test_mark_job_complete_sets_installable_flag_from_yaml_validation():
+    """Completed jobs should persist whether the YAML is installable."""
+    hass = _make_hass()
+    job = _create_generation_job(hass, "Turn on the kitchen lights", None)
+
+    _mark_job_complete(
+        job,
+        {
+            "yaml": "alias: Broken\ndescription: bad: value: again\n",
+            "summary": "Broken draft",
+            "warnings": ["Invalid YAML: mapping values are not allowed here"],
+        },
+        [],
+    )
+
+    assert job["status"] == "completed"
+    assert job["installable"] is False
+
+
+def test_serialize_generation_job_includes_installable_for_completed_jobs():
+    """Polling payloads should expose installability to the frontend."""
+    hass = _make_hass()
+    job = _create_generation_job(hass, "Turn on the kitchen lights", None)
+    job["status"] = "completed"
+    job["message"] = "Automation ready."
+    job["detail"] = "Review the preview, then install when it looks correct."
+    job["yaml"] = "alias: Example\ntriggers: []\nconditions: []\nactions: []\n"
+    job["summary"] = "Example"
+    job["warnings"] = []
+    job["entities_used"] = []
+    job["installable"] = False
+    job["started_at"] = job["created_at"]
+    job["started_monotonic"] = time.monotonic()
+    job["finished_at"] = job["created_at"]
+    job["finished_monotonic"] = job["started_monotonic"]
+
+    payload = _serialize_generation_job(job)
+
+    assert payload["status"] == "completed"
+    assert payload["installable"] is False
 
 
 @pytest.mark.asyncio
@@ -2308,6 +2352,51 @@ async def test_repair_generation_result_regenerates_when_used_llm_repair_has_emp
     assert materialize_mock.await_count == 2
     assert result["yaml"].startswith("alias: Kitchen Lights")
     assert result["summary"] == "Turns on the kitchen lights."
+
+
+@pytest.mark.asyncio
+async def test_repair_generation_result_marks_invalid_yaml_as_not_installable():
+    """Unrepairable YAML should still return with installable=False for the UI gate."""
+    fake_client = MagicMock()
+    blocking_report = ValidationReport(
+        syntax_errors=["Invalid YAML: mapping values are not allowed here"]
+    )
+    invalid_yaml = "alias: Broken\ndescription: bad: value: again\n"
+
+    with patch(
+        "custom_components.automagic.api._materialize_generation_result",
+        AsyncMock(
+            return_value={
+                "yaml": invalid_yaml,
+                "summary": "Broken draft",
+                "warnings": [],
+                "used_llm_repair": True,
+            }
+        ),
+    ), patch(
+        "custom_components.automagic.api.build_entity_resolution_map",
+        return_value={},
+    ), patch(
+        "custom_components.automagic.api.validate_generated_yaml",
+        side_effect=[blocking_report, blocking_report],
+    ), patch(
+        "custom_components.automagic.api._build_deterministic_generation_result",
+        return_value=None,
+    ), patch(
+        "custom_components.automagic.api.autofix_yaml",
+        return_value=(invalid_yaml, []),
+    ):
+        result = await _repair_generation_result(
+            fake_client,
+            [{"role": "user", "content": "Turn on the kitchen lights"}],
+            "Turn on the kitchen lights",
+            [],
+            {"yaml": invalid_yaml},
+        )
+
+    assert result["yaml"] == invalid_yaml
+    assert result["installable"] is False
+    assert "Invalid YAML" in result["warnings"][0]
 
 
 @pytest.mark.asyncio

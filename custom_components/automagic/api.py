@@ -965,6 +965,7 @@ def _mark_job_complete(
     job["assistant_message"] = assistant_message or None
     _append_assistant_turn(job, assistant_message)
     job["error"] = None
+    job["installable"] = _validate_generated_yaml(result.get("yaml", "")) is None
 
 
 def _mark_job_needs_clarification(
@@ -1069,6 +1070,7 @@ def _serialize_generation_job(job: dict[str, Any]) -> dict[str, Any]:
         payload["summary"] = job.get("summary", "")
         payload["entities_used"] = job.get("entities_used", [])
         payload["warnings"] = job.get("warnings", [])
+        payload["installable"] = job.get("installable", True)
     elif job["status"] == "needs_clarification":
         payload["summary"] = job.get("summary", "")
         payload["clarifying_questions"] = job.get("clarifying_questions", [])
@@ -2436,6 +2438,7 @@ async def _repair_generation_result(
     )
     if not report.has_blocking_issues and not report.has_autofixable_issues:
         current["warnings"] = report.warnings
+        current["installable"] = _validate_generated_yaml(current.get("yaml", "")) is None
         return current
 
     deterministic = _build_deterministic_generation_result(prompt_text, entities)
@@ -2448,6 +2451,9 @@ async def _repair_generation_result(
         )
         if not deterministic_report.has_blocking_issues and not deterministic_report.has_autofixable_issues:
             deterministic["warnings"] = deterministic_report.warnings
+            deterministic["installable"] = (
+                _validate_generated_yaml(deterministic.get("yaml", "")) is None
+            )
             return deterministic
 
     fixed_yaml, fixes = autofix_yaml(
@@ -2477,6 +2483,7 @@ async def _repair_generation_result(
                 ]
             )
         )
+        current["installable"] = _validate_generated_yaml(current.get("yaml", "")) is None
         return current
 
     if current.get("used_llm_repair") and current.get("yaml", "").strip():
@@ -2494,6 +2501,7 @@ async def _repair_generation_result(
                 ]
             )
         )
+        current["installable"] = _validate_generated_yaml(current.get("yaml", "")) is None
         return current
 
     if job is not None:
@@ -2551,6 +2559,7 @@ async def _repair_generation_result(
             ]
         )
     )
+    regenerated["installable"] = _validate_generated_yaml(regenerated.get("yaml", "")) is None
     return regenerated
 
 

@@ -3784,7 +3784,26 @@ test("Source treats empty backend YAML as an error instead of rendering a broken
 test("Source only renders the chat install button when YAML exists", () => {
   assert.match(
     cardSource,
-    /\$\{message\.yaml\s*\?\s*html`[\s\S]*<div class="action-buttons chat-actions">[\s\S]*_handleInstall\(index\)[\s\S]*`\s*:\s*""\}/
+    /\$\{message\.yaml && message\.installStatus !== "blocked"\s*\?\s*html`[\s\S]*<div class="action-buttons chat-actions">[\s\S]*_handleInstall\(index\)[\s\S]*`\s*:\s*""\}/
+  );
+});
+
+test("Source blocks install when backend or warning-based validation marks YAML invalid", () => {
+  assert.match(
+    cardSource,
+    /installStatus:\s*finalJob\.installable === false \? "blocked" : "ready"/
+  );
+  assert.match(
+    cardSource,
+    /installStatus:\s*\(resolvedResult\.warnings \|\| \[\]\)\.some\(\(w\) =>[\s\S]*w\.toLowerCase\(\)\.includes\("invalid yaml"\)[\s\S]*\)\s*\?\s*"blocked"\s*:\s*"ready"/
+  );
+  assert.match(
+    cardSource,
+    /installStatus:\s*\(result\.warnings \|\| \[\]\)\.some\(\(w\) =>[\s\S]*w\.toLowerCase\(\)\.includes\("invalid yaml"\)[\s\S]*\)\s*\?\s*"blocked"\s*:\s*"ready"/
+  );
+  assert.match(
+    cardSource,
+    /This automation has syntax issues that need to be resolved before it can be installed\./
   );
 });
 

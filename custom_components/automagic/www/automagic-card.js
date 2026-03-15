@@ -6518,7 +6518,7 @@ class AutoMagicCard extends LitElement {
       yaml: result.yaml || "",
       parsedAutomation: this._parseYaml(result.yaml || ""),
       requestText: this._normalizeText(requestText || prompt),
-      installStatus: "ready",
+      installStatus: finalJob.installable === false ? "blocked" : "ready",
       installAlias: "",
       installError: "",
       warnings: result.warnings || [],
@@ -6857,7 +6857,11 @@ class AutoMagicCard extends LitElement {
               warnings: resolvedResult.warnings || [],
               parsedAutomation: this._parseYaml(resolvedResult.yaml || ""),
               requestText: this._normalizeText(requestText || prompt),
-              installStatus: "ready",
+              installStatus: (resolvedResult.warnings || []).some((w) =>
+                w.toLowerCase().includes("invalid yaml")
+              )
+                ? "blocked"
+                : "ready",
               installAlias: "",
               installError: "",
             });
@@ -6948,7 +6952,11 @@ class AutoMagicCard extends LitElement {
       warnings: result.warnings || [],
       parsedAutomation: this._parseYaml(result.yaml || ""),
       requestText: this._normalizeText(requestText || prompt),
-      installStatus: "ready",
+      installStatus: (result.warnings || []).some((w) =>
+        w.toLowerCase().includes("invalid yaml")
+      )
+        ? "blocked"
+        : "ready",
       installAlias: "",
       installError: "",
     });
@@ -7921,7 +7929,7 @@ class AutoMagicCard extends LitElement {
               </details>
             `
           : ""}
-        ${message.yaml
+        ${message.yaml && message.installStatus !== "blocked"
           ? html`
               <div class="action-buttons chat-actions">
                 <button
@@ -7934,6 +7942,9 @@ class AutoMagicCard extends LitElement {
                 </button>
               </div>
             `
+          : ""}
+        ${message.installStatus === "blocked"
+          ? html`<p class="chat-meta warning">This automation has syntax issues that need to be resolved before it can be installed. Try rephrasing your request or starting over.</p>`
           : ""}
         ${message.installAlias
           ? html`<p class="chat-meta success">${message.installAlias}</p>`

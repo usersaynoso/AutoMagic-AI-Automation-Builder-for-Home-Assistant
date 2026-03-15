@@ -48,8 +48,8 @@ const DIRECT_YAML_ONLY_MAX_TOKENS = 3200;
 const DIRECT_TEMPERATURE = 0.15;
 const DIRECT_CONTEXT_LIMIT = 48;
 const DIRECT_STATUS_POLL_INTERVAL_MS = 1000;
-const DIRECT_REPAIR_ATTEMPTS = 4;
-const DIRECT_REGENERATION_ATTEMPTS = 2;
+const DIRECT_REPAIR_ATTEMPTS = 1;
+const DIRECT_REGENERATION_ATTEMPTS = 1;
 const DIRECT_FENCE_RE = /```(?:[a-z0-9_+-]+)?\s*\n?(.*?)\n?\s*```/is;
 const DIRECT_TOKEN_RE = /[a-z0-9]+/g;
 const IMPORTANT_SHORT_TOKENS = new Set(["tv", "ac"]);
@@ -169,6 +169,37 @@ const INVALID_SCENE_SERVICES = new Set([
 ]);
 const DIRECT_COMPLEX_PROMPT_RE =
   /\b(if|then|else|otherwise|instead|wait|delay|unless|while|after|before|between|weekday|weekdays|weekend|weekends|above|below|exceeds|drops|greater than|less than|notification|notify|flash|brightness|whichever|triggered)\b/i;
+const DIRECT_INTENT_SYSTEM_PROMPT = `You are an expert Home Assistant automation engineer.
+Return structured automation intent JSON, not YAML.
+Output only one JSON object with:
+- intent: the structured automation intent
+- summary: a 1-2 sentence description
+- needs_clarification: true or false when required
+- clarifying_questions: an array of 0-3 short questions when required
+Do NOT return YAML. The YAML will be assembled automatically from the intent.
+Use Home Assistant 2024.10+ semantics in the intent.
+Use the ENTITY MAP as the primary entity reference and the full entity list as fallback. Do not invent entity_ids.
+
+Intent shape:
+- alias: string
+- description: string
+- mode: single | restart | queued | parallel
+- triggers: array of trigger objects with type plus fields like entity_id, to, from_state, for_duration, above, below, at, event, offset, value_template, id
+- conditions: array of condition objects with type plus fields like entity_id, state, above, below, after, before, weekday, value_template, conditions
+- action_sequence: array of action steps with step_type plus service_call, delay, wait_for_trigger, wait_template, choose, if_then, repeat, variables, event, stop, or scene fields
+
+Rules:
+- Preserve guards, thresholds, weekdays, timeouts, choose branches, notifications, colors, brightness, and explicit off paths.
+- Put blocking "don't run if..." rules in top-level conditions, not inside choose branches.
+- When a timeout branch is requested, represent it with wait_for_trigger plus timeout and a choose branch based on wait.completed.
+- When the prompt refers to all/both/every members of a sibling set, include the whole resolved set.
+- Ask for clarification only if the request still cannot be implemented without guessing after using the entity map and entity list.`;
+const DIRECT_INTENT_REPAIR_SYSTEM_PROMPT = `You repair AutoMagic intent JSON.
+Return only one JSON object with intent, summary, needs_clarification, and clarifying_questions.
+Do not return YAML.
+Keep the user's original behavior, guards, thresholds, delays, colors, brightness, and notifications.
+Replace invalid entity_ids with exact entity_ids from the ENTITY MAP or full entity list.
+Do not ask for clarification unless the original request still cannot be implemented without guessing.`;
 const DIRECT_SYSTEM_PROMPT = `You are an expert Home Assistant automation engineer.
 You will be given a plain-English description of a desired automation and a list of available entities in the user's Home Assistant installation.
 The conversation may continue with follow-up questions, clarifications, corrections, or requested changes to the current automation.
@@ -339,6 +370,7 @@ class AutoMagicCard extends LitElement {
       _prompt: { type: String },
       _yaml: { type: String },
       _summary: { type: String },
+      _warnings: { type: Array },
       _clarificationSummary: { type: String },
       _clarifyingQuestions: { type: Array },
       _clarificationCandidates: { type: Array },
@@ -372,6 +404,7 @@ class AutoMagicCard extends LitElement {
     this._prompt = "";
     this._yaml = "";
     this._summary = "";
+    this._warnings = [];
     this._clarificationSummary = "";
     this._clarifyingQuestions = [];
     this._clarificationCandidates = [];
@@ -2076,113 +2109,242 @@ class AutoMagicCard extends LitElement {
     return sections.join("\n\n");
   }
 
+  _insertTopLevelConditions(yamlText, conditionLines = []) {
+    const lines = String(yamlText || "").split("\n");
+    const actionsIndex = lines.findIndex((line) => /^actions:\s*$/.test(line));
+    if (actionsIndex === -1 || conditionLines.length === 0) {
+      return yamlText;
+    }
+    const conditionsIndex = lines.findIndex((line) => /^conditions:\s*$/.test(line));
+    if (conditionsIndex === -1) {
+      lines.splice(actionsIndex, 0, "conditions:", ...conditionLines);
+      return lines.join("\n");
+    }
+    lines.splice(actionsIndex, 0, ...conditionLines);
+    return lines.join("\n");
+  }
+
+  _autofixYaml(yaml, prompt, entities = []) {
+    let text = this._normalizeAutomationYamlText(yaml);
+    if (!text) {
+      return { yaml: yaml || "", fixes: [] };
+    }
+
+    const fixes = [];
+    const replaceOnce = (pattern, replacement, message) => {
+      const updated = text.replace(pattern, replacement);
+      if (updated !== text) {
+        text = updated;
+        fixes.push(message);
+      }
+    };
+
+    replaceOnce(/^trigger:\s*$/m, "triggers:", "Renamed top-level trigger: to triggers:");
+    replaceOnce(/^action:\s*$/m, "actions:", "Renamed top-level action: to actions:");
+    replaceOnce(/^condition:\s*$/m, "conditions:", "Renamed top-level condition: to conditions:");
+    replaceOnce(/^(\s*-\s*)service:/gm, "$1action:", "Renamed service: to action:");
+    replaceOnce(/^(\s+)platform:/gm, "$1trigger:", "Renamed platform: to trigger:");
+    replaceOnce(
+      /^(\s*-\s*)trigger:\s*\n(\s+)(?:platform|trigger):\s*([a-z_]+)\s*\n/gm,
+      "$1trigger: $3\n",
+      "Flattened a nested trigger mapping"
+    );
+
+    const weekdayMatch = text.match(/^weekday:\s*\n((?:\s*-\s*[a-z]{3}\s*\n?)*)/im);
+    if (weekdayMatch) {
+      const weekdayLines = weekdayMatch[1]
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+      text = text.replace(weekdayMatch[0], "").trimEnd();
+      if (weekdayLines.length > 0) {
+        text = this._insertTopLevelConditions(text, [
+          "  - condition: time",
+          "    weekday:",
+          ...weekdayLines.map((line) => `      ${line}`),
+        ]);
+        fixes.push("Moved top-level weekday: into a time condition block");
+      }
+    }
+
+    text = text.replace(/\bcolor_temp\s*:\s*(\d+)\b/gi, (full, raw) => {
+      const value = Number(raw);
+      if (!Number.isFinite(value) || value <= 1000) return full;
+      const converted = Math.round(1000000 / value);
+      fixes.push(`Converted color_temp from ${value}K to ${converted} mireds`);
+      return full.replace(raw, String(converted));
+    });
+
+    if (/color_name:\s*["']?warm_white["']?/i.test(text)) {
+      text = text.replace(/^\s*color_name:\s*["']?warm_white["']?\s*$/gim, "      color_temp: 370");
+      fixes.push("Replaced warm_white with color_temp: 370");
+    }
+
+    const brightnessPct = this._extractPromptBrightness(prompt);
+    const colorTemp = this._extractPromptColorTemp(prompt);
+    if (
+      /\b(warm white|warm light|colour|color|\d{4}\s*k)\b/i.test(String(prompt || "")) &&
+      /action:\s*light\.turn_on/i.test(text)
+    ) {
+      const lines = text.split("\n");
+      for (let index = 0; index < lines.length; index += 1) {
+        if (!/^\s*-\s*action:\s*light\.turn_on\s*$/i.test(lines[index])) continue;
+        const baseIndent = lines[index].match(/^(\s*)/)?.[1] || "";
+        let end = index + 1;
+        while (
+          end < lines.length &&
+          !new RegExp(`^${baseIndent}-\\s`).test(lines[end]) &&
+          !/^[a-z_]+\s*:/i.test(lines[end])
+        ) {
+          end += 1;
+        }
+        const block = lines.slice(index, end).join("\n");
+        if (/\bdata:\s*$/im.test(block) && /\b(color_temp|brightness_pct|color_name|rgb_color|xy_color)\b/i.test(block)) {
+          continue;
+        }
+        const insertLines = [`${baseIndent}  data:`];
+        if (colorTemp !== null) insertLines.push(`${baseIndent}    color_temp: ${colorTemp}`);
+        if (brightnessPct !== null) insertLines.push(`${baseIndent}    brightness_pct: ${brightnessPct}`);
+        if (insertLines.length > 1) {
+          lines.splice(end, 0, ...insertLines);
+          fixes.push("Injected missing colour/brightness data into a light.turn_on action");
+          index = end + insertLines.length - 1;
+        }
+      }
+      text = lines.join("\n");
+    }
+
+    const guardSpecs = this._extractExplicitStateGuardSpecs(prompt, entities);
+    guardSpecs.forEach((guard) => {
+      if (this._yamlGuardIsInConditionsBlock(text, guard.entity_id)) return;
+      text = this._insertTopLevelConditions(text, [
+        "  - condition: state",
+        `    entity_id: ${guard.entity_id}`,
+        `    state: "${guard.requiredState || guard.blockedState}"`,
+      ]);
+      fixes.push(`Moved guard ${guard.entity_id} to the top-level conditions block`);
+    });
+
+    const timeoutMatch = String(prompt || "").match(
+      /\b(?:after|within|for)\s+(\d+)\s*(hour|hours|hr|hrs|minute|minutes|min|mins)\b/i
+    );
+    if (timeoutMatch && /wait_for_trigger/i.test(text) && !/timeout\s*:/i.test(text)) {
+      const amount = Number.parseInt(timeoutMatch[1], 10);
+      const unit = timeoutMatch[2].toLowerCase();
+      const hours = unit.startsWith("hour") || unit.startsWith("hr") ? amount : Math.floor(amount / 60);
+      const minutes =
+        unit.startsWith("hour") || unit.startsWith("hr") ? 0 : amount % 60;
+      const timeoutValue = `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:00`;
+      text = text.replace(
+        /(wait_for_trigger:[\s\S]{0,240}?)(\n\s*-\s|\n[a-z_]+\s*:|$)/i,
+        (match, block, suffix) => {
+          if (/timeout\s*:/i.test(block)) return match;
+          return `${block}\n    timeout: "${timeoutValue}"\n    continue_on_timeout: true${suffix}`;
+        }
+      );
+      fixes.push(`Injected wait_for_trigger timeout ${timeoutValue}`);
+    }
+
+    return {
+      yaml: this._normalizeAutomationYamlText(text),
+      fixes: [...new Set(fixes)],
+    };
+  }
+
+  async _regenerateAutomationFromConstraints(prompt, context = {}, issues = []) {
+    const baseMessages = this._buildDirectMessages(
+      prompt,
+      Array.isArray(context?.entities) ? context.entities : [],
+      context?.plan || null
+    );
+    const repairIssueText = this._buildRepairIssueText(issues);
+    const messages = [
+      ...baseMessages,
+      {
+        role: "user",
+        content:
+          "Regenerate the automation from scratch. Ignore previous drafts.\n\n" +
+          `${repairIssueText}\n\n` +
+          "Return the best structured intent JSON you can. If you cannot follow the intent schema cleanly, return backward-compatible automation YAML instead.",
+      },
+    ];
+    return this._directChatCompletion(
+      messages,
+      this._parseDirectResponse.bind(this),
+      DIRECT_COMPLEX_MAX_TOKENS,
+      DIRECT_FINAL_MODEL_PREFERENCES
+    );
+  }
+
   async _repairGeneratedYamlIfNeeded(prompt, messages, result, repairContext = null) {
     let currentResult = result;
-    const preferYamlOnlyRepair = this._isComplexAutomationPrompt(prompt);
     const fallbackContext = {
       messages,
       entities: repairContext?.entities || [],
       resolvedPrompt: repairContext?.resolvedPrompt || "",
       plan: repairContext?.plan || null,
     };
-    let issueHistory = [];
-    if (currentResult?.planner_only) {
-      const compileContext = {
-        ...fallbackContext,
-        plan: currentResult?.plan_details || repairContext?.plan || null,
-      };
-      currentResult = await this._compilePlanToYaml(prompt, compileContext);
-      if (currentResult?.planner_only) {
-        this._pushRepairStatus(
-          "The previous response did not include the required complete automation YAML."
-        );
-        currentResult = await this._regenerateAutomationYamlFromScratch(
-          prompt,
-          {
-            ...compileContext,
-            plan: currentResult?.plan_details || compileContext.plan || null,
-          },
-          ["The previous response returned planning keys instead of automation YAML."],
-          currentResult?.yaml || ""
-        );
+    const deterministicResult =
+      typeof this._buildDeterministicComplexAutomationResult === "function"
+        ? this._buildDeterministicComplexAutomationResult(prompt, fallbackContext)
+        : null;
+    const autofixYaml =
+      typeof this._autofixYaml === "function"
+        ? this._autofixYaml.bind(this)
+        : (yamlText) => ({ yaml: yamlText || "", fixes: [] });
+    const regenerateFromConstraints =
+      typeof this._regenerateAutomationFromConstraints === "function"
+        ? this._regenerateAutomationFromConstraints.bind(this)
+        : async (regenPrompt, regenContext, regenIssues) =>
+            this._regenerateAutomationYamlFromScratch(
+              regenPrompt,
+              regenContext,
+              regenIssues,
+              currentResult?.yaml || ""
+            );
+    if (currentResult?.needs_clarification) {
+      return currentResult;
+    }
+
+    if (deterministicResult?.yaml) {
+      const deterministicIssues = this._collectRepairIssues(
+        prompt,
+        deterministicResult.yaml,
+        fallbackContext
+      );
+      if (deterministicIssues.length === 0) {
+        return {
+          ...deterministicResult,
+          warnings: [],
+        };
       }
+    }
+
+    if (!this._normalizeAutomationYamlText(currentResult?.yaml)) {
+      this._pushRepairStatus(
+        "The previous response did not include installable automation YAML."
+      );
+      currentResult = await regenerateFromConstraints(
+        prompt,
+        fallbackContext,
+        ["Return installable automation YAML or intent JSON."]
+      );
       if (currentResult?.needs_clarification) {
         return currentResult;
       }
     }
-    if (currentResult?.missing_yaml) {
-      if (preferYamlOnlyRepair) {
-        this._pushRepairStatus(
-          "The previous response did not include the required complete automation YAML."
-        );
-        currentResult = await this._regenerateAutomationYamlFromScratch(
-          prompt,
-          {
-            ...fallbackContext,
-            plan: currentResult?.plan_details || fallbackContext.plan || null,
-          },
-          [
-            "The previous response did not include the required complete automation YAML.",
-          ],
-          currentResult?.yaml || ""
-        );
-        if (currentResult?.needs_clarification) {
-          return currentResult;
-        }
-      } else {
-        let missingYamlAttempt = 0;
-        while (currentResult?.missing_yaml || !currentResult?.yaml) {
-          missingYamlAttempt += 1;
-          this._pushRepairStatus(
-            "The previous response did not include the required complete automation YAML."
-          );
-          const missingYamlMessages = [
-            ...messages,
-            {
-              role: "assistant",
-              content: JSON.stringify({
-                yaml: currentResult?.yaml || null,
-                summary: currentResult?.summary || "",
-                needs_clarification: false,
-                clarifying_questions: [],
-              }),
-            },
-            {
-              role: "user",
-              content:
-                `Correction attempt ${missingYamlAttempt}. ` +
-                "Your previous response did not include the required automation YAML. " +
-                "Return the complete automation JSON now. " +
-                "The yaml key must be a non-empty string containing the full Home Assistant automation. " +
-                "Do not leave yaml null or empty. " +
-                "Do not say the automation is ready, complete, or being generated. " +
-                "Output only the final JSON object.",
-            },
-          ];
-          currentResult = await this._directChatCompletion(missingYamlMessages);
-          if (currentResult?.needs_clarification) {
-            return currentResult;
-          }
-          if (!currentResult?.missing_yaml && currentResult?.yaml) break;
-        }
-      }
-    }
 
-    if (preferYamlOnlyRepair) {
-      const deterministicFallback = this._buildDeterministicComplexAutomationResult(
-        prompt,
-        fallbackContext
-      );
-      if (deterministicFallback?.yaml) {
-        const deterministicIssues = this._collectRepairIssues(
-          prompt,
-          deterministicFallback.yaml,
-          fallbackContext
-        );
-        if (deterministicIssues.length === 0) {
-          return deterministicFallback;
-        }
-      }
+    const initialAutofix = autofixYaml(
+      currentResult?.yaml || "",
+      prompt,
+      fallbackContext.entities
+    );
+    if (initialAutofix.fixes.length > 0) {
+      this._pushRepairStatus(`Auto-corrected ${initialAutofix.fixes.length} issue(s).`);
+      currentResult = {
+        ...currentResult,
+        yaml: initialAutofix.yaml,
+      };
     }
 
     let remainingIssues = this._collectRepairIssues(
@@ -2190,155 +2352,41 @@ class AutoMagicCard extends LitElement {
       currentResult?.yaml || "",
       fallbackContext
     );
-    issueHistory = this._normalizeRepairIssues(remainingIssues, 12);
-    if (preferYamlOnlyRepair && remainingIssues.length > 0) {
-      this._pushRepairStatus(remainingIssues.join(" "));
-      currentResult = await this._regenerateAutomationYamlFromScratch(
-        prompt,
-        {
-          ...fallbackContext,
-          plan: currentResult?.plan_details || fallbackContext.plan || null,
-        },
-        remainingIssues,
-        currentResult?.yaml || ""
-      );
-      if (currentResult?.needs_clarification) {
-        return currentResult;
-      }
-      remainingIssues = this._collectRepairIssues(
-        prompt,
-        currentResult?.yaml || "",
-        fallbackContext
-      );
-      issueHistory = this._normalizeRepairIssues(
-        [...issueHistory, ...remainingIssues],
-        12
-      );
-    }
-    if (preferYamlOnlyRepair && remainingIssues.length > 0 && !currentResult?.needs_clarification) {
-      this._pushRepairStatus(remainingIssues.join(" "));
-      currentResult = await this._rewriteInvalidAutomationYaml(
-        prompt,
-        messages,
-        currentResult,
-        remainingIssues
-      );
-      if (currentResult?.needs_clarification) {
-        return currentResult;
-      }
-      remainingIssues = this._collectRepairIssues(
-        prompt,
-        currentResult?.yaml || "",
-        fallbackContext
-      );
-      issueHistory = this._normalizeRepairIssues(
-        [...issueHistory, ...remainingIssues],
-        12
-      );
-    }
-    for (let attempt = 0; attempt < DIRECT_REPAIR_ATTEMPTS; attempt += 1) {
-      if (remainingIssues.length === 0) {
-        return currentResult;
-      }
-      const issues = remainingIssues;
-      issueHistory = this._normalizeRepairIssues([...issueHistory, ...issues], 12);
-      this._pushRepairStatus(issues.join(" "));
-
-      const repairMessages = [
-        ...messages,
-        {
-          role: "assistant",
-          content: this._buildAutomationContextMessage(
-            currentResult?.summary,
-            currentResult?.yaml
-          ),
-        },
-        {
-          role: "user",
-          content:
-            `Correction attempt ${attempt + 1}. ` +
-            "The automation YAML above is invalid or does not follow the required Home Assistant 2024.10+ syntax. " +
-            "Fix it and return the complete corrected automation JSON only.\n\n" +
-            `${this._buildRepairIssueText(issues, issueHistory)}\n\n` +
-            "Preserve every entity, threshold, weekday restriction, guard, branch, delay, and notification message from the original request. " +
-            "Do not ask new clarification questions unless the original prompt truly leaves a required detail unspecified.",
-        },
-      ];
-
-      currentResult = await this._directChatCompletion(repairMessages);
-      if (currentResult?.needs_clarification) {
-        return currentResult;
-      }
-      remainingIssues = this._collectRepairIssues(
-        prompt,
-        currentResult?.yaml || "",
-        fallbackContext
-      );
-      issueHistory = this._normalizeRepairIssues(
-        [...issueHistory, ...remainingIssues],
-        12
-      );
+    if (remainingIssues.length === 0) {
+      return {
+        ...currentResult,
+        warnings: [],
+      };
     }
 
-    while (remainingIssues.length > 0 && !currentResult?.needs_clarification) {
-      issueHistory = this._normalizeRepairIssues(
-        [...issueHistory, ...remainingIssues],
-        12
-      );
-      this._pushRepairStatus(remainingIssues.join(" "));
-      try {
-        currentResult = await this._rewriteInvalidAutomationYaml(
-          prompt,
-          messages,
-          currentResult,
-          remainingIssues
-        );
-      } catch (err) {
-        currentResult = await this._regenerateAutomationYamlFromScratch(
-          prompt,
-          {
-            ...fallbackContext,
-            plan: currentResult?.plan_details || fallbackContext.plan || null,
-          },
-          remainingIssues,
-          currentResult?.yaml || ""
-        );
-      }
-      if (currentResult?.needs_clarification) {
-        return currentResult;
-      }
-      remainingIssues = this._collectRepairIssues(
-        prompt,
-        currentResult?.yaml || "",
-        fallbackContext
-      );
-      for (let attempt = 0; attempt < DIRECT_REGENERATION_ATTEMPTS; attempt += 1) {
-        this._pushRepairStatus(remainingIssues.join(" "));
-        currentResult = await this._regenerateAutomationYamlFromScratch(
-          prompt,
-          {
-            ...fallbackContext,
-            plan: currentResult?.plan_details || fallbackContext.plan || null,
-          },
-          remainingIssues,
-          currentResult?.yaml || ""
-        );
-        remainingIssues = this._collectRepairIssues(
-          prompt,
-          currentResult?.yaml || "",
-          fallbackContext
-        );
-        issueHistory = this._normalizeRepairIssues(
-          [...issueHistory, ...remainingIssues],
-          12
-        );
-        if (remainingIssues.length === 0) {
-          return currentResult;
-        }
-      }
+    this._pushRepairStatus(remainingIssues.join(" "));
+    const regenerated = await regenerateFromConstraints(
+      prompt,
+      fallbackContext,
+      remainingIssues
+    );
+    if (regenerated?.needs_clarification) {
+      return regenerated;
     }
 
-    return currentResult;
+    const regenAutofix = autofixYaml(
+      regenerated?.yaml || "",
+      prompt,
+      fallbackContext.entities
+    );
+    const finalYaml =
+      regenAutofix.yaml || regenerated?.yaml || currentResult?.yaml || "";
+    remainingIssues = this._collectRepairIssues(
+      prompt,
+      finalYaml,
+      fallbackContext
+    );
+
+    return {
+      ...regenerated,
+      yaml: finalYaml,
+      warnings: remainingIssues,
+    };
   }
 
   _humanizeIdentifier(value) {
@@ -3914,6 +3962,7 @@ class AutoMagicCard extends LitElement {
     this._clearClarificationState();
     this._yaml = this._normalizeAutomationYamlText(result?.yaml);
     this._summary = result?.summary || "";
+    this._warnings = Array.isArray(result?.warnings) ? result.warnings : [];
     this._parsedAutomation = this._parseYaml(this._yaml);
     this._clearGenerationPolling();
     this._state = STATES.PREVIEW;
@@ -5109,6 +5158,100 @@ class AutoMagicCard extends LitElement {
     return selected.slice(0, fallbackTarget);
   }
 
+  _extractPromptBrightness(prompt) {
+    const match = String(prompt || "").match(
+      /\b(?:brightness\s*(?:of|at)?\s*|at\s*)(\d{1,3})\s*%?\s*brightness\b|\bbrightness\s*(\d{1,3})\s*%?\b/i
+    );
+    if (!match) return null;
+    const raw = match[1] || match[2];
+    const value = Number.parseInt(raw, 10);
+    if (!Number.isFinite(value)) return null;
+    return Math.max(1, Math.min(100, value));
+  }
+
+  _extractPromptColorTemp(prompt) {
+    const kelvinMatch = String(prompt || "").match(/\b(\d{4})\s*k\b/i);
+    if (kelvinMatch) {
+      const kelvin = Number.parseInt(kelvinMatch[1], 10);
+      if (Number.isFinite(kelvin) && kelvin > 0) {
+        return Math.round(1000000 / kelvin);
+      }
+    }
+    if (/\bwarm white\b|\bwarm light\b/i.test(String(prompt || ""))) {
+      return 370;
+    }
+    return null;
+  }
+
+  _buildEntityResolutionMap(prompt, entities) {
+    const resolutionMap = {};
+    const colorTemp = this._extractPromptColorTemp(prompt);
+    const brightnessPct = this._extractPromptBrightness(prompt);
+    const addEntry = (label, matchedEntities, role) => {
+      const cleanedLabel = this._normalizePhrase(label);
+      if (!cleanedLabel || !Array.isArray(matchedEntities) || matchedEntities.length === 0) {
+        return;
+      }
+      const entityIds = matchedEntities
+        .map((entity) => this._normalizeText(entity?.entity_id))
+        .filter(Boolean);
+      if (entityIds.length === 0) return;
+      const existing = resolutionMap[cleanedLabel] || {
+        entity_ids: [],
+        role,
+      };
+      existing.entity_ids = [...new Set([...existing.entity_ids, ...entityIds])];
+      if (
+        role === "action_target" &&
+        matchedEntities.some((entity) => this._normalizeText(entity?.domain) === "light") &&
+        (colorTemp !== null || brightnessPct !== null)
+      ) {
+        existing.colour_request = {};
+        if (colorTemp !== null) existing.colour_request.color_temp = colorTemp;
+        if (brightnessPct !== null) existing.colour_request.brightness_pct = brightnessPct;
+      }
+      resolutionMap[cleanedLabel] = existing;
+    };
+
+    const obviousEntities = this._findObviousNamedEntities(prompt, entities);
+    obviousEntities.forEach((entity) => {
+      const domain = this._normalizeText(entity?.domain);
+      const role =
+        domain === "notify"
+          ? "notify_target"
+          : ["light", "switch", "fan", "cover", "lock", "media_player", "vacuum"].includes(domain)
+            ? "action_target"
+            : domain === "automation"
+              ? "guard"
+              : "trigger";
+      addEntry(entity?.name || entity?.entity_id, [entity], role);
+    });
+
+    this._collectSiblingGroups(prompt, entities).forEach((group) => {
+      if (!Array.isArray(group) || group.length === 0) return;
+      const role =
+        this._normalizeText(group[0]?.domain) === "light"
+          ? "action_target"
+          : "trigger";
+      const label = String(group[0]?.name || group[0]?.entity_id || "").replace(
+        /\s+(L\d+|\d+|Left|Right|Rear|Front|North|South|East|West|Upstairs|Downstairs)$/i,
+        ""
+      );
+      addEntry(label, group, role);
+    });
+
+    this._collectSemanticPromptMatches(prompt, entities).forEach((match) => {
+      if (!Array.isArray(match?.entities) || match.entities.length === 0) return;
+      addEntry(match.label || "match", match.entities, "trigger");
+    });
+
+    this._relevantDomainMatches(prompt, entities, "notify", 1, 4).forEach((entity) => {
+      addEntry(entity?.name || entity?.entity_id, [entity], "notify_target");
+    });
+
+    return resolutionMap;
+  }
+
   _buildDirectMessages(prompt, entities, plan = null) {
     const explicitEntities = this._findExplicitEntities(prompt, entities);
     const obviousEntities = this._findObviousNamedEntities(prompt, entities);
@@ -5132,7 +5275,32 @@ class AutoMagicCard extends LitElement {
       1,
       4
     );
+    const entityResolutionMap =
+      typeof this._buildEntityResolutionMap === "function"
+        ? this._buildEntityResolutionMap(prompt, entities)
+        : {};
     const extraGuidance = [];
+
+    if (Object.keys(entityResolutionMap).length > 0) {
+      extraGuidance.push(
+        "ENTITY MAP (use these exact IDs, do not invent others):\n" +
+          Object.entries(entityResolutionMap)
+            .map(([label, payload]) => {
+              const notes = [];
+              if (payload.role) notes.push(String(payload.role).replace(/_/g, " "));
+              if (payload?.colour_request?.color_temp) {
+                notes.push(`color_temp ${payload.colour_request.color_temp}`);
+              }
+              if (payload?.colour_request?.brightness_pct) {
+                notes.push(`brightness ${payload.colour_request.brightness_pct}%`);
+              }
+              return `- "${label}" -> ${payload.entity_ids.join(", ")}${
+                notes.length > 0 ? ` [${notes.join("; ")}]` : ""
+              }`;
+            })
+            .join("\n")
+      );
+    }
 
     if (explicitEntities.length > 0) {
       extraGuidance.push(
@@ -5263,8 +5431,13 @@ class AutoMagicCard extends LitElement {
       );
     }
 
+    const systemPrompt =
+      typeof DIRECT_INTENT_SYSTEM_PROMPT !== "undefined"
+        ? DIRECT_INTENT_SYSTEM_PROMPT
+        : DIRECT_SYSTEM_PROMPT;
+
     return [
-      { role: "system", content: DIRECT_SYSTEM_PROMPT },
+      { role: "system", content: systemPrompt },
       {
         role: "user",
         content:
@@ -5810,6 +5983,290 @@ class AutoMagicCard extends LitElement {
     return responseParser(payload);
   }
 
+  _yamlScalar(value) {
+    if (value === null || value === undefined) return "null";
+    if (typeof value === "number" || typeof value === "boolean") {
+      return String(value);
+    }
+    const text = String(value);
+    if (/^\d+$/.test(text)) return text;
+    if (/^[A-Za-z0-9_.-]+$/.test(text) && !text.includes(":")) {
+      return text;
+    }
+    return JSON.stringify(text);
+  }
+
+  _dumpYamlValue(value, indent = 0) {
+    const prefix = " ".repeat(indent);
+    if (Array.isArray(value)) {
+      if (value.length === 0) return `${prefix}[]`;
+      return value
+        .map((item) => {
+          if (item && typeof item === "object" && !Array.isArray(item)) {
+            const dumped = this._dumpYamlValue(item, indent + 2).split("\n");
+            const [first, ...rest] = dumped;
+            return [`${prefix}- ${first.trimStart()}`, ...rest].join("\n");
+          }
+          return `${prefix}- ${this._yamlScalar(item)}`;
+        })
+        .join("\n");
+    }
+    if (value && typeof value === "object") {
+      const entries = Object.entries(value).filter(
+        ([, entryValue]) =>
+          entryValue !== null &&
+          entryValue !== undefined &&
+          !(Array.isArray(entryValue) && entryValue.length === 0) &&
+          !(typeof entryValue === "object" && !Array.isArray(entryValue) && Object.keys(entryValue).length === 0)
+      );
+      if (entries.length === 0) return `${prefix}{}`;
+      return entries
+        .map(([key, entryValue]) => {
+          if (
+            Array.isArray(entryValue) ||
+            (entryValue && typeof entryValue === "object")
+          ) {
+            return `${prefix}${key}:\n${this._dumpYamlValue(entryValue, indent + 2)}`;
+          }
+          return `${prefix}${key}: ${this._yamlScalar(entryValue)}`;
+        })
+        .join("\n");
+    }
+    return `${prefix}${this._yamlScalar(value)}`;
+  }
+
+  _normalizeIntentColorData(data) {
+    if (!data || typeof data !== "object" || Array.isArray(data)) return data;
+    const normalized = { ...data };
+    const colorTemp = Number(normalized.color_temp);
+    if (Number.isFinite(colorTemp) && colorTemp > 1000) {
+      normalized.color_temp = Math.round(1000000 / colorTemp);
+    }
+    if (
+      typeof normalized.color_name === "string" &&
+      normalized.color_name.toLowerCase() === "warm_white"
+    ) {
+      delete normalized.color_name;
+      normalized.color_temp = normalized.color_temp || 370;
+    }
+    if (normalized.kelvin && !normalized.color_temp) {
+      const kelvin = Number(normalized.kelvin);
+      if (Number.isFinite(kelvin) && kelvin > 0) {
+        normalized.color_temp = Math.round(1000000 / kelvin);
+      }
+      delete normalized.kelvin;
+    }
+    return normalized;
+  }
+
+  _buildTargetObject(step) {
+    const target = {};
+    if (Array.isArray(step?.target_entity_ids) && step.target_entity_ids.length > 0) {
+      target.entity_id =
+        step.target_entity_ids.length === 1
+          ? step.target_entity_ids[0]
+          : step.target_entity_ids;
+    }
+    if (Array.isArray(step?.target_area_ids) && step.target_area_ids.length > 0) {
+      target.area_id =
+        step.target_area_ids.length === 1
+          ? step.target_area_ids[0]
+          : step.target_area_ids;
+    }
+    return Object.keys(target).length > 0 ? target : null;
+  }
+
+  _assembleTriggerFromIntent(trigger) {
+    if (!trigger || typeof trigger !== "object") return {};
+    const assembled = {
+      trigger: trigger.type,
+      entity_id: trigger.entity_id,
+      to: trigger.to,
+      from: trigger.from_state,
+      for: trigger.for_duration,
+      above: trigger.above,
+      below: trigger.below,
+      at: trigger.at,
+      event: trigger.event,
+      event_type: trigger.event_type,
+      event_data: trigger.event_data,
+      offset: trigger.offset,
+      value_template: trigger.value_template,
+      id: trigger.id,
+      topic: trigger.topic,
+      payload: trigger.payload,
+      webhook_id: trigger.webhook_id,
+      zone: trigger.zone,
+      tag_id: trigger.tag_id,
+      device_id: trigger.device_id,
+      domain: trigger.domain,
+      type: trigger.platform_type,
+    };
+    return Object.fromEntries(
+      Object.entries(assembled).filter(([, value]) => value !== null && value !== undefined)
+    );
+  }
+
+  _assembleConditionFromIntent(condition) {
+    if (!condition || typeof condition !== "object") return {};
+    if (["and", "or", "not"].includes(String(condition.type || ""))) {
+      return {
+        condition: condition.type,
+        conditions: Array.isArray(condition.conditions)
+          ? condition.conditions.map((item) => this._assembleConditionFromIntent(item))
+          : [],
+      };
+    }
+    const assembled = {
+      condition: condition.type,
+      entity_id: condition.entity_id,
+      state: condition.state,
+      above: condition.above,
+      below: condition.below,
+      after: condition.after,
+      before: condition.before,
+      weekday: condition.weekday,
+      value_template: condition.value_template,
+      event: condition.event,
+      offset: condition.offset,
+      zone: condition.zone,
+    };
+    return Object.fromEntries(
+      Object.entries(assembled).filter(([, value]) => value !== null && value !== undefined)
+    );
+  }
+
+  _assembleActionFromIntent(step) {
+    if (!step || typeof step !== "object") return {};
+    switch (step.step_type) {
+      case "service_call": {
+        const actionStep = {
+          action: step.action,
+          target: this._buildTargetObject(step),
+          data: this._normalizeIntentColorData(step.data),
+        };
+        return Object.fromEntries(
+          Object.entries(actionStep).filter(([, value]) => value !== null && value !== undefined)
+        );
+      }
+      case "delay":
+        return { delay: step.delay };
+      case "wait_for_trigger": {
+        const actionStep = {
+          wait_for_trigger: Array.isArray(step.wait_triggers)
+            ? step.wait_triggers.map((trigger) => this._assembleTriggerFromIntent(trigger))
+            : [],
+          timeout: step.timeout,
+          continue_on_timeout: step.timeout ? true : step.continue_on_timeout,
+        };
+        return Object.fromEntries(
+          Object.entries(actionStep).filter(([, value]) => value !== null && value !== undefined)
+        );
+      }
+      case "wait_template": {
+        const actionStep = {
+          wait_template: step.wait_template,
+          timeout: step.wait_timeout,
+          continue_on_timeout: step.wait_timeout ? true : step.continue_on_timeout,
+        };
+        return Object.fromEntries(
+          Object.entries(actionStep).filter(([, value]) => value !== null && value !== undefined)
+        );
+      }
+      case "choose":
+        return {
+          choose: Array.isArray(step.choose_options)
+            ? step.choose_options.map((option) => ({
+                conditions: Array.isArray(option?.conditions)
+                  ? option.conditions.map((condition) =>
+                      this._assembleConditionFromIntent(condition)
+                    )
+                  : [],
+                sequence: Array.isArray(option?.sequence)
+                  ? option.sequence.map((item) => this._assembleActionFromIntent(item))
+                  : [],
+              }))
+            : [],
+          default: Array.isArray(step.choose_default)
+            ? step.choose_default.map((item) => this._assembleActionFromIntent(item))
+            : [],
+        };
+      case "if_then":
+        return {
+          if: Array.isArray(step.if_conditions)
+            ? step.if_conditions.map((condition) => this._assembleConditionFromIntent(condition))
+            : [],
+          then: Array.isArray(step.then_sequence)
+            ? step.then_sequence.map((item) => this._assembleActionFromIntent(item))
+            : [],
+          else: Array.isArray(step.else_sequence)
+            ? step.else_sequence.map((item) => this._assembleActionFromIntent(item))
+            : [],
+        };
+      case "repeat": {
+        const repeat = {
+          count: step.repeat_count,
+          while: Array.isArray(step.repeat_while)
+            ? step.repeat_while.map((condition) => this._assembleConditionFromIntent(condition))
+            : undefined,
+          until: Array.isArray(step.repeat_until)
+            ? step.repeat_until.map((condition) => this._assembleConditionFromIntent(condition))
+            : undefined,
+          sequence: Array.isArray(step.repeat_sequence)
+            ? step.repeat_sequence.map((item) => this._assembleActionFromIntent(item))
+            : [],
+        };
+        return {
+          repeat: Object.fromEntries(
+            Object.entries(repeat).filter(([, value]) => value !== null && value !== undefined)
+          ),
+        };
+      }
+      case "variables":
+        return { variables: step.variables || {} };
+      case "event":
+        return {
+          event: step.event_type || step.event,
+          event_data: step.event_data,
+        };
+      case "stop":
+        return Object.fromEntries(
+          Object.entries({
+            stop: step.stop_message,
+            response_variable: step.response_variable,
+          }).filter(([, value]) => value !== null && value !== undefined)
+        );
+      case "scene":
+        return {
+          action: "scene.turn_on",
+          target: { entity_id: step.scene_entity_id },
+        };
+      default:
+        return { action: step.action };
+    }
+  }
+
+  _assembleYamlFromIntent(intent) {
+    if (!intent || typeof intent !== "object" || Array.isArray(intent)) {
+      throw new Error("Intent payload is not a JSON object.");
+    }
+    const automation = {
+      alias: this._normalizeText(intent.alias),
+      description: this._normalizeText(intent.description),
+      triggers: Array.isArray(intent.triggers)
+        ? intent.triggers.map((trigger) => this._assembleTriggerFromIntent(trigger))
+        : [],
+      conditions: Array.isArray(intent.conditions)
+        ? intent.conditions.map((condition) => this._assembleConditionFromIntent(condition))
+        : [],
+      actions: Array.isArray(intent.action_sequence)
+        ? intent.action_sequence.map((step) => this._assembleActionFromIntent(step))
+        : [],
+      mode: this._normalizeText(intent.mode) || "single",
+    };
+    return this._dumpYamlValue(automation).trim();
+  }
+
   _parseDirectResponse(payload) {
     const choices = payload?.choices;
     if (!Array.isArray(choices) || choices.length === 0) {
@@ -5838,6 +6295,10 @@ class AutoMagicCard extends LitElement {
     }
 
     const yaml = this._normalizeAutomationYamlText(parsed.yaml);
+    const intent =
+      parsed?.intent && typeof parsed.intent === "object" && !Array.isArray(parsed.intent)
+        ? parsed.intent
+        : null;
     let summary = this._normalizeText(parsed.summary);
     let needsClarification = Boolean(parsed.needs_clarification);
     let clarifyingQuestions = this._normalizeQuestions(
@@ -5851,17 +6312,18 @@ class AutoMagicCard extends LitElement {
     const plannerEntities = this._normalizePlanItems(parsed.resolved_entities);
     const plannerOnlyResponse = Boolean(
       !yaml &&
+      !intent &&
       (this._normalizeText(parsed.resolved_request) ||
         plannerRequirements.length > 0 ||
         plannerEntities.length > 0)
     );
 
-    if (!yaml) {
+    if (!yaml && !intent) {
       if (plannerOnlyResponse) {
         const planDetails = [
           this._normalizeText(parsed.resolved_request),
           ...plannerRequirements.slice(0, 6),
-          plannerEntities.length > 0
+        plannerEntities.length > 0
             ? `Resolved entities: ${plannerEntities.slice(0, 8).join("; ")}`
             : "",
         ].filter(Boolean);
@@ -5879,6 +6341,13 @@ class AutoMagicCard extends LitElement {
       }
     }
 
+    let assembledYaml = yaml;
+    if (!assembledYaml && intent) {
+      assembledYaml = this._normalizeAutomationYamlText(
+        this._assembleYamlFromIntent(intent)
+      );
+    }
+
     if (needsClarification) {
       if (!summary) {
         summary = "I need a bit more detail before I can generate the automation.";
@@ -5894,7 +6363,7 @@ class AutoMagicCard extends LitElement {
       };
     }
 
-    if (!yaml) {
+    if (!assembledYaml) {
       if (summary) {
         return {
           yaml: "",
@@ -5918,10 +6387,12 @@ class AutoMagicCard extends LitElement {
     }
 
     return {
-      yaml,
+      yaml: assembledYaml,
+      intent,
       summary,
       needs_clarification: false,
       clarifying_questions: [],
+      warnings: Array.isArray(parsed?.warnings) ? parsed.warnings : [],
     };
   }
 
@@ -6022,6 +6493,7 @@ class AutoMagicCard extends LitElement {
     const result = {
       yaml: finalJob.yaml || "",
       summary: finalJob.summary || "",
+      warnings: Array.isArray(finalJob.warnings) ? finalJob.warnings : [],
       needs_clarification: false,
       clarifying_questions: [],
     };
@@ -6036,6 +6508,7 @@ class AutoMagicCard extends LitElement {
       installStatus: "ready",
       installAlias: "",
       installError: "",
+      warnings: result.warnings || [],
     });
     this._setPreviewResult(result);
   }
@@ -6368,6 +6841,7 @@ class AutoMagicCard extends LitElement {
               type: "yaml",
               summary: resolvedResult.summary || "",
               yaml: resolvedResult.yaml || "",
+              warnings: resolvedResult.warnings || [],
               parsedAutomation: this._parseYaml(resolvedResult.yaml || ""),
               requestText: this._normalizeText(requestText || prompt),
               installStatus: "ready",
@@ -6458,6 +6932,7 @@ class AutoMagicCard extends LitElement {
       type: "yaml",
       summary: result.summary || "",
       yaml: result.yaml || "",
+      warnings: result.warnings || [],
       parsedAutomation: this._parseYaml(result.yaml || ""),
       requestText: this._normalizeText(requestText || prompt),
       installStatus: "ready",
@@ -6754,6 +7229,7 @@ class AutoMagicCard extends LitElement {
     this._prompt = "";
     this._yaml = "";
     this._summary = "";
+    this._warnings = [];
     this._clearClarificationState();
     this._parsedAutomation = null;
     this._error = "";
@@ -6849,6 +7325,7 @@ class AutoMagicCard extends LitElement {
         }
         this._yaml = this._normalizeAutomationYamlText(result.yaml);
         this._summary = result.summary || "";
+        this._warnings = Array.isArray(result.warnings) ? result.warnings : [];
         this._parsedAutomation = this._parseYaml(this._yaml);
         this._generationJobId = "";
         this._state = STATES.PREVIEW;
@@ -7015,6 +7492,13 @@ class AutoMagicCard extends LitElement {
     if (message.type === "yaml") {
       const parts = [];
       if (message.summary) parts.push(this._normalizeText(message.summary));
+      if (Array.isArray(message.warnings) && message.warnings.length > 0) {
+        parts.push(
+          `Warnings:\n${message.warnings
+            .map((warning) => this._normalizeText(warning))
+            .join("\n")}`
+        );
+      }
       if (message.yaml) parts.push(`YAML:\n${message.yaml}`);
       if (message.installAlias) parts.push(`Install result: ${message.installAlias}`);
       if (message.installError) parts.push(`Install error: ${message.installError}`);
@@ -7393,6 +7877,15 @@ class AutoMagicCard extends LitElement {
         ${message.summary
           ? html`<p class="chat-text">${message.summary}</p>`
           : ""}
+        ${Array.isArray(message.warnings) && message.warnings.length > 0
+          ? html`
+              <div class="clarify-list">
+                ${message.warnings.map(
+                  (warning) => html`<p class="chat-meta warning">${warning}</p>`
+                )}
+              </div>
+            `
+          : ""}
         ${auto ? this._renderAutomationBreakdown(auto) : ""}
         ${message.yaml
           ? html`
@@ -7626,6 +8119,15 @@ class AutoMagicCard extends LitElement {
           <ha-icon icon="mdi:check-circle-outline" class="summary-icon"></ha-icon>
           <span class="summary-text">${this._summary}</span>
         </div>
+
+        ${Array.isArray(this._warnings) && this._warnings.length > 0
+          ? html`
+              <div class="summary-card warning-card">
+                <ha-icon icon="mdi:alert-outline" class="summary-icon"></ha-icon>
+                <span class="summary-text">${this._warnings.join(" ")}</span>
+              </div>
+            `
+          : ""}
 
         ${auto ? this._renderAutomationBreakdown(auto) : ""}
 

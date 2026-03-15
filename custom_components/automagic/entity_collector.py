@@ -132,6 +132,29 @@ _DOMAIN_PHRASE_IGNORE_TOKENS: dict[str, set[str]] = {
         "with",
     },
 }
+_PLURAL_ENTITY_HINT_RE = re.compile(
+    r"\b(all|both|three|every|each|either|switch(?:es)?|lights?|phases?|outputs?|inputs?|sensors?)\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_GUARD_RE = re.compile(
+    r"(?:don't|do not)\s+run(?: any of this| this)?\s+if\s+(.+?)\s+is\s+already\s+(on|off|open|closed|locked|unlocked|active|inactive)\b",
+    re.IGNORECASE,
+)
+_NEGATED_STATE_GUARD_PATTERNS = (
+    re.compile(
+        r"(?:making sure|make sure|ensure(?: that)?|checking(?: this)? by making sure|only if|provided that)\s+(.+?)\s+(?:is|are)\s+not\s+['\"]([^'\"]+)['\"]",
+        re.IGNORECASE,
+    ),
+)
+_BRIGHTNESS_RE = re.compile(
+    r"\b(?:brightness\s*(?:of|at)?\s*|at\s*)(\d{1,3})\s*%?\s*brightness\b|\bbrightness\s*(\d{1,3})\s*%?\b",
+    re.IGNORECASE,
+)
+_KELVIN_RE = re.compile(r"\b(\d{4})\s*k\b", re.IGNORECASE)
+_NAMED_COLOR_RE = re.compile(
+    r"\b(red|blue|green|amber|orange|purple|white|warm white|cool white)\b",
+    re.IGNORECASE,
+)
 _SEMANTIC_PROMPT_HINTS: tuple[dict[str, Any], ...] = (
     {
         "label": "power",
@@ -634,6 +657,400 @@ def _notification_service_entries(hass: HomeAssistant) -> list[dict[str, Any]]:
         )
 
     return entries
+
+
+def _invert_entity_state(state: str) -> str:
+    """Return a common opposite state for explicit guard conditions."""
+    opposites = {
+        "active": "inactive",
+        "closed": "open",
+        "home": "not_home",
+        "inactive": "active",
+        "locked": "unlocked",
+        "not_home": "home",
+        "off": "on",
+        "on": "off",
+        "open": "closed",
+        "unlocked": "locked",
+    }
+    return opposites.get(str(state or "").strip().lower(), "")
+
+
+def _resolve_prompt_entities(
+    phrase: str,
+    prompt_text: str,
+    entities: list[dict[str, Any]],
+    *,
+    max_matches: int = 8,
+) -> list[dict[str, Any]]:
+    """Resolve prompt phrasing to one or more Home Assistant entities."""
+    if not phrase or not entities:
+        return []
+
+    phrase_candidates = [
+        phrase,
+        re.sub(
+            r"\b(?:either|both|all|each|every)\s+of\s+the\b",
+            " ",
+            phrase,
+            flags=re.IGNORECASE,
+        ),
+        re.sub(
+            r"\b(?:either|both|all|each|every|of|the)\b",
+            " ",
+            phrase,
+            flags=re.IGNORECASE,
+        ),
+    ]
+    singularized = phrase
+    for plural, singular in (
+        ("switches", "switch"),
+        ("lights", "light"),
+        ("phases", "phase"),
+        ("sensors", "sensor"),
+        ("outputs", "output"),
+        ("inputs", "input"),
+    ):
+        singularized = re.sub(rf"\b{plural}\b", singular, singularized, flags=re.IGNORECASE)
+    phrase_candidates.append(singularized)
+
+    seed_entities: list[dict[str, Any]] = []
+    resolved_phrase = phrase
+    for candidate_phrase in phrase_candidates:
+        normalized_phrase = " ".join(str(candidate_phrase or "").split())
+        if not normalized_phrase:
+            continue
+        seed_entities = _find_obvious_named_entities(
+            normalized_phrase, entities, max_matches
+        )
+        if seed_entities:
+            resolved_phrase = normalized_phrase
+            break
+
+    if not seed_entities:
+        return []
+
+    expansion_prompt = resolved_phrase
+    if _PLURAL_ENTITY_HINT_RE.search(resolved_phrase) or _PLURAL_ENTITY_HINT_RE.search(prompt_text):
+        expansion_prompt = f"all {resolved_phrase}"
+    expanded = _expand_variant_entities(expansion_prompt, entities, seed_entities)
+    matched = expanded or seed_entities
+
+    deduped: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for entity in matched:
+        entity_id = str(entity.get("entity_id") or "").strip()
+        if not entity_id or entity_id in seen_ids:
+            continue
+        deduped.append(entity)
+        seen_ids.add(entity_id)
+    return deduped
+
+
+def extract_explicit_state_guards(
+    prompt_text: str,
+    entities: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """Extract explicit do-not-run state guards implied by the prompt."""
+    text = str(prompt_text or "").strip()
+    if not text or not entities:
+        return []
+
+    patterns = (
+        _EXPLICIT_GUARD_RE,
+        re.compile(
+            r"(?:don't|do not)\s+(?:run(?: any of this| this)?|start(?: any of this| this| it| her| him| them)?)"
+            r"(?:\s+at all)?\s+if\s+(.+?)\s+(?:is|are)\s+already\s+"
+            r"(on|off|open|closed|locked|unlocked|active|inactive)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\bunless\s+(.+?)\s+(?:is|are)\s+"
+            r"(on|off|open|closed|locked|unlocked|active|inactive)\b",
+            re.IGNORECASE,
+        ),
+    )
+    guards: list[dict[str, str]] = []
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            phrase = str(match.group(1) or "").strip()
+            blocked_state = str(match.group(2) or "").strip().lower()
+            if not phrase or not blocked_state:
+                continue
+            required_state = _invert_entity_state(blocked_state)
+            for entity in _resolve_prompt_entities(phrase, prompt_text, entities):
+                entity_id = str(entity.get("entity_id") or "").strip()
+                if not entity_id:
+                    continue
+                guards.append(
+                    {
+                        "entity_id": entity_id,
+                        "blocked_state": blocked_state,
+                        "required_state": required_state,
+                        "phrase": phrase,
+                    }
+                )
+
+    deduped: list[dict[str, str]] = []
+    seen_keys: set[tuple[str, str, str]] = set()
+    for guard in guards:
+        key = (
+            guard["entity_id"],
+            guard["blocked_state"],
+            guard["required_state"],
+        )
+        if key in seen_keys:
+            continue
+        deduped.append(guard)
+        seen_keys.add(key)
+    return deduped
+
+
+def extract_negated_state_guards(
+    prompt_text: str,
+    entities: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """Extract state requirements phrased as entity != value in the prompt."""
+    text = str(prompt_text or "").strip()
+    if not text or not entities:
+        return []
+
+    guards: list[dict[str, str]] = []
+    for pattern in _NEGATED_STATE_GUARD_PATTERNS:
+        for match in pattern.finditer(text):
+            phrase = str(match.group(1) or "").strip().strip(" ,(")
+            state = str(match.group(2) or "").strip()
+            if not phrase or not state:
+                continue
+            for entity in _resolve_prompt_entities(
+                phrase, prompt_text, entities, max_matches=4
+            ):
+                entity_id = str(entity.get("entity_id") or "").strip()
+                if not entity_id:
+                    continue
+                guards.append({"entity_id": entity_id, "state": state, "phrase": phrase})
+
+    deduped: list[dict[str, str]] = []
+    seen_keys: set[tuple[str, str]] = set()
+    for guard in guards:
+        key = (guard["entity_id"], guard["state"])
+        if key in seen_keys:
+            continue
+        deduped.append(guard)
+        seen_keys.add(key)
+    return deduped
+
+
+def _normalize_resolution_label(text: str) -> str:
+    """Normalize a user-facing label for the entity resolution map."""
+    normalized = _normalize_phrase(text)
+    normalized = _NAME_VARIANT_SUFFIX_RE.sub("", normalized).strip()
+    return normalized
+
+
+def _extract_colour_request(prompt_text: str) -> dict[str, Any]:
+    """Extract colour and brightness preferences from the prompt."""
+    prompt = str(prompt_text or "")
+    request: dict[str, Any] = {}
+    brightness_match = _BRIGHTNESS_RE.search(prompt)
+    if brightness_match:
+        raw_value = brightness_match.group(1) or brightness_match.group(2)
+        if raw_value is not None:
+            request["brightness_pct"] = max(1, min(100, int(raw_value)))
+
+    kelvin_match = _KELVIN_RE.search(prompt)
+    if kelvin_match:
+        kelvin = int(kelvin_match.group(1))
+        if kelvin > 0:
+            request["color_temp"] = round(1_000_000 / kelvin)
+    elif re.search(r"\bwarm white\b|\bwarm light\b", prompt, re.IGNORECASE):
+        request["color_temp"] = 370
+
+    named_color = _NAMED_COLOR_RE.search(prompt)
+    if named_color:
+        color_name = named_color.group(1).lower().replace(" ", "_")
+        if color_name not in {"warm_white", "cool_white"}:
+            request["color_name"] = color_name
+    return request
+
+
+def _infer_resolution_role(entity: dict[str, Any]) -> str:
+    """Infer the most likely role for an entity in prompt context."""
+    domain = str(entity.get("domain") or "").strip()
+    if domain == "notify":
+        return "notify_target"
+    if domain in {"automation", "input_boolean"}:
+        return "guard"
+    if domain in {"light", "switch", "fan", "cover", "lock", "scene", "media_player", "vacuum"}:
+        return "action_target"
+    return "trigger"
+
+
+def build_entity_resolution_map(
+    prompt_text: str,
+    entities: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Pre-resolve prompt entity references into a compact authoritative map."""
+    if not prompt_text or not entities:
+        return {}
+
+    colour_request = _extract_colour_request(prompt_text)
+    resolution_map: dict[str, dict[str, Any]] = {}
+
+    def add_mapping(
+        label: str,
+        matched_entities: list[dict[str, Any]],
+        role: str,
+        **extra: Any,
+    ) -> None:
+        cleaned_label = _normalize_resolution_label(label)
+        if not cleaned_label or not matched_entities:
+            return
+        entity_ids = [
+            str(entity.get("entity_id") or "").strip()
+            for entity in matched_entities
+            if str(entity.get("entity_id") or "").strip()
+        ]
+        if not entity_ids:
+            return
+        existing = resolution_map.setdefault(
+            cleaned_label,
+            {"entity_ids": [], "role": role},
+        )
+        if not existing.get("role"):
+            existing["role"] = role
+        if role == "guard":
+            existing["role"] = "guard"
+        elif existing["role"] == "trigger" and role in {"action_target", "notify_target"}:
+            existing["role"] = role
+        existing_ids = [
+            str(entity_id).strip()
+            for entity_id in existing.get("entity_ids", []) or []
+            if str(entity_id).strip()
+        ]
+        existing["entity_ids"] = list(dict.fromkeys([*existing_ids, *entity_ids]))
+        for key, value in extra.items():
+            if value not in (None, "", [], {}):
+                existing[key] = value
+        if (
+            colour_request
+            and existing["role"] == "action_target"
+            and any(str(entity.get("domain") or "") == "light" for entity in matched_entities)
+        ):
+            existing.setdefault("colour_request", dict(colour_request))
+
+    obvious_entities = _find_obvious_named_entities(prompt_text, entities, 12)
+    semantic_matches = _collect_semantic_prompt_matches(prompt_text, entities, 6)
+    expanded_entities = _expand_variant_entities(
+        prompt_text,
+        entities,
+        [
+            *obvious_entities,
+            *[
+                entity
+                for match in semantic_matches
+                for entity in match.get("entities", [])
+            ],
+        ],
+    )
+    notify_matches = (
+        _relevant_domain_matches(prompt_text, entities, "notify", 1, 4)
+        if re.search(r"\b(notify|notification|iphone|phone|mobile)\b", _normalize_phrase(prompt_text))
+        else []
+    )
+    automation_matches = (
+        _relevant_domain_matches(prompt_text, entities, "automation", 2, 6)
+        if "automation" in _normalize_phrase(prompt_text)
+        else []
+    )
+
+    grouped_by_stem: dict[str, list[dict[str, Any]]] = {}
+    for entity in expanded_entities:
+        entity_id = str(entity.get("entity_id") or "").strip()
+        if not entity_id:
+            continue
+        grouped_by_stem.setdefault(_variant_stem(entity_id), []).append(entity)
+
+    for stem_group in grouped_by_stem.values():
+        first_name = str(stem_group[0].get("name") or "").strip()
+        add_mapping(
+            first_name,
+            stem_group,
+            _infer_resolution_role(stem_group[0]),
+        )
+
+    for entity in obvious_entities:
+        add_mapping(
+            str(entity.get("name") or entity.get("entity_id") or ""),
+            [entity],
+            _infer_resolution_role(entity),
+        )
+
+    for match in semantic_matches:
+        match_entities = match.get("entities", []) or []
+        if not match_entities:
+            continue
+        add_mapping(
+            str(match.get("label") or ""),
+            match_entities,
+            _infer_resolution_role(match_entities[0]),
+        )
+
+    for entity in notify_matches:
+        notify_labels = _extract_domain_phrases(prompt_text, "notify")
+        add_mapping(
+            notify_labels[0] if notify_labels else str(entity.get("name") or ""),
+            [entity],
+            "notify_target",
+        )
+
+    for entity in automation_matches:
+        add_mapping(
+            str(entity.get("name") or ""),
+            [entity],
+            "guard",
+        )
+
+    guard_groups: dict[str, dict[str, Any]] = {}
+    for guard in extract_explicit_state_guards(prompt_text, entities):
+        label = _normalize_resolution_label(str(guard.get("phrase") or guard.get("entity_id") or ""))
+        group = guard_groups.setdefault(
+            label,
+            {
+                "entity_ids": [],
+                "blocked_state": guard.get("blocked_state"),
+                "required_state": guard.get("required_state"),
+            },
+        )
+        group["entity_ids"].append(guard["entity_id"])
+    for label, payload in guard_groups.items():
+        matched_entities = [
+            entity
+            for entity in entities
+            if str(entity.get("entity_id") or "").strip() in payload["entity_ids"]
+        ]
+        add_mapping(
+            label,
+            matched_entities,
+            "guard",
+            blocked_state=payload.get("blocked_state"),
+            required_state=payload.get("required_state"),
+        )
+
+    for guard in extract_negated_state_guards(prompt_text, entities):
+        matched_entities = [
+            entity
+            for entity in entities
+            if str(entity.get("entity_id") or "").strip() == guard["entity_id"]
+        ]
+        add_mapping(
+            str(guard.get("phrase") or guard.get("entity_id") or ""),
+            matched_entities,
+            "guard",
+            blocked_state=guard.get("state"),
+        )
+
+    return resolution_map
 
 
 async def get_entity_context(

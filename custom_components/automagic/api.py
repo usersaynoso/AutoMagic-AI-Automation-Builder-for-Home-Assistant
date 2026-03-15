@@ -47,9 +47,13 @@ from .entity_collector import (
     _expand_variant_entities,
     _find_obvious_named_entities,
     _relevant_domain_matches,
+    build_entity_resolution_map,
+    extract_explicit_state_guards,
+    extract_negated_state_guards,
     get_entity_context,
     select_relevant_entities,
 )
+from .intent_schema import collect_intent_entity_ids, validate_intent
 from .llm_client import (
     LLMClient,
     LLMConnectionError,
@@ -57,6 +61,7 @@ from .llm_client import (
     _normalize_automation_yaml_text,
 )
 from .prompt_builder import (
+    INTENT_REPAIR_SYSTEM_PROMPT,
     build_auto_clarification_answer,
     build_prompt,
 )
@@ -67,6 +72,9 @@ from .service_config import (
     get_service_config,
     normalize_config_data,
 )
+from .validation import ValidationReport, validate_generated_yaml
+from .yaml_assembler import assemble_yaml
+from .yaml_autofix import autofix_yaml
 
 _LOGGER = logging.getLogger(__name__)
 _HISTORY_FILE = "automagic_history.json"
@@ -76,9 +84,9 @@ _STATUS_POLL_MS = 2000
 _BACKEND_PROBE_DELAY_SECONDS = 15
 _BACKEND_PROBE_INTERVAL_SECONDS = 10
 _DEFAULT_GENERATION_CONTEXT_LIMIT = 60
-_YAML_REPAIR_ATTEMPTS = 4
-_YAML_REGENERATION_ATTEMPTS = 2
-_MAX_REGENERATION_ROUNDS = 3
+_YAML_REPAIR_ATTEMPTS = 1
+_YAML_REGENERATION_ATTEMPTS = 1
+_MAX_REGENERATION_ROUNDS = 1
 _TIME_WINDOW_RE = re.compile(
     r"\bbetween\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s+(?:and|to|-)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b",
     re.IGNORECASE,
@@ -445,6 +453,7 @@ def _create_generation_job(
         "service_label": build_service_label(selected_service),
         "service_config": selected_service,
         "error": None,
+        "warnings": [],
         "task": None,
         "repair_in_progress": False,
     }
@@ -946,6 +955,7 @@ def _mark_job_complete(
     job["finished_monotonic"] = now_monotonic
     job["yaml"] = result.get("yaml", "")
     job["summary"] = result.get("summary", "")
+    job["warnings"] = list(result.get("warnings", []) or [])
     job["clarifying_questions"] = []
     job["entities_used"] = entities_used
     assistant_message = _build_automation_context_message(
@@ -1058,6 +1068,7 @@ def _serialize_generation_job(job: dict[str, Any]) -> dict[str, Any]:
         payload["yaml"] = job.get("yaml", "")
         payload["summary"] = job.get("summary", "")
         payload["entities_used"] = job.get("entities_used", [])
+        payload["warnings"] = job.get("warnings", [])
     elif job["status"] == "needs_clarification":
         payload["summary"] = job.get("summary", "")
         payload["clarifying_questions"] = job.get("clarifying_questions", [])
@@ -1073,6 +1084,11 @@ def _normalize_generation_result(result: dict[str, Any]) -> dict[str, Any]:
     """Normalize a model result so downstream steps always see clean YAML."""
     normalized = dict(result or {})
     normalized["yaml"] = _normalize_automation_yaml_text(normalized.get("yaml"))
+    normalized["intent"] = (
+        dict(normalized.get("intent") or {})
+        if isinstance(normalized.get("intent"), dict)
+        else None
+    )
     normalized["summary"] = str(normalized.get("summary", "") or "").strip()
     normalized["needs_clarification"] = bool(
         normalized.get("needs_clarification")
@@ -1080,6 +1096,8 @@ def _normalize_generation_result(result: dict[str, Any]) -> dict[str, Any]:
     normalized["clarifying_questions"] = list(
         normalized.get("clarifying_questions", []) or []
     )
+    normalized["warnings"] = list(normalized.get("warnings", []) or [])
+    normalized["used_llm_repair"] = bool(normalized.get("used_llm_repair"))
     return normalized
 
 
@@ -1494,219 +1512,208 @@ def _collect_generated_yaml_issues(
     entities: list[dict[str, Any]],
     yaml_text: str,
 ) -> list[str]:
-    """Collect structural and prompt-coverage issues that require another repair pass."""
-    issues: list[str] = []
-    syntax_issue = _validate_generated_yaml(yaml_text)
-    if syntax_issue:
-        issues.append(syntax_issue)
+    """Collect human-readable issues from the structured validation report."""
+    entity_map = build_entity_resolution_map(prompt_text, entities)
+    report = validate_generated_yaml(prompt_text, entities, yaml_text, entity_map)
+    return report.issue_strings()
 
-    normalized_yaml = _normalize_automation_yaml_text(yaml_text)
-    parsed_yaml: Any = None
-    if normalized_yaml:
-        try:
-            parsed_yaml = yaml.safe_load(normalized_yaml)
-        except yaml.YAMLError:
-            parsed_yaml = None
-    issues.extend(_collect_static_generated_yaml_issues(normalized_yaml, parsed_yaml))
 
-    if not normalized_yaml or not prompt_text or not entities:
-        return list(dict.fromkeys(issue for issue in issues if issue))
-
-    yaml_entity_ids = _extract_entity_ids_from_yaml(normalized_yaml)
-    known_prompt_entity_ids = {
+def _intent_entity_issues(
+    intent: dict[str, Any],
+    entities: list[dict[str, Any]],
+    entity_map: dict[str, dict[str, Any]],
+) -> list[str]:
+    """Return semantic issues for entity usage inside an intent."""
+    known_entity_ids = {
         str(entity.get("entity_id") or "").strip()
         for entity in entities
         if str(entity.get("entity_id") or "").strip()
     }
-    has_unknown_entity_ids = any(
-        entity_id not in known_prompt_entity_ids for entity_id in yaml_entity_ids
-    )
-
-    if re.search(r"\b(notify|notification|iphone|phone|mobile)\b", prompt_text, re.IGNORECASE):
-        notify_matches = _relevant_domain_matches(prompt_text, entities, "notify", 1, 4)
-        if notify_matches:
-            notify_entity_id = str(notify_matches[0].get("entity_id") or "").strip()
-            if notify_entity_id and notify_entity_id not in yaml_entity_ids:
-                issues.append(f"Use the resolved notification target {notify_entity_id}.")
-
-    weekdays = _extract_weekdays(prompt_text)
-    if weekdays and not _yaml_has_weekdays(normalized_yaml, weekdays):
+    referenced = collect_intent_entity_ids(intent)
+    unknown = sorted(entity_id for entity_id in referenced if entity_id not in known_entity_ids)
+    issues: list[str] = []
+    if unknown:
         issues.append(
-            "Preserve the requested weekday schedule in the automation trigger or guard."
+            "Use only entity_ids from the supplied entity map or entity list. Unknown entity_ids: "
+            + ", ".join(unknown[:10])
+            + "."
         )
 
-    explicit_state_guards = _extract_explicit_state_guards(prompt_text, entities)
-    guarded_entity_ids = {
-        str(guard.get("entity_id") or "").strip()
-        for guard in explicit_state_guards
-        if str(guard.get("entity_id") or "").strip()
-    }
-
-    for guard in _extract_negated_state_guards(prompt_text, entities):
-        if _yaml_has_negated_state_guard(
-            normalized_yaml, guard["entity_id"], guard["state"]
-        ):
+    for label, payload in entity_map.items():
+        role = str(payload.get("role") or "").strip().lower()
+        if role != "notify_target":
             continue
-        issues.append(
-            _build_negated_state_guard_issue_text(
-                guard["entity_id"], guard["state"]
-            )
-        )
-
-    if not has_unknown_entity_ids:
-        for entity in _find_obvious_named_entities(prompt_text, entities, 20):
-            entity_id = str(entity.get("entity_id") or "").strip()
-            domain = str(entity.get("domain") or "").strip()
-            if (
-                not entity_id
-                or entity_id in guarded_entity_ids
-                or domain
-                not in {
-                    "climate",
-                    "cover",
-                    "fan",
-                    "input_boolean",
-                    "light",
-                    "lock",
-                    "media_player",
-                    "switch",
-                    "vacuum",
-                }
-            ):
-                continue
-            if entity_id not in yaml_entity_ids:
-                issues.append(f"Include the resolved entity {entity_id}.")
-
-    for guard in explicit_state_guards:
-        entity_id = guard["entity_id"]
-        blocked_state = guard["blocked_state"]
-        required_state = guard["required_state"]
-        has_guard = False
-        if required_state and _yaml_has_positive_state_guard(
-            normalized_yaml, entity_id, required_state
-        ):
-            has_guard = True
-        elif _yaml_has_negated_state_guard(normalized_yaml, entity_id, blocked_state):
-            has_guard = True
-        if has_guard:
-            if not _yaml_guard_is_in_conditions_block(normalized_yaml, entity_id):
-                issues.append(
-                    f"Guard {entity_id} must be in the top-level conditions: block, not inside a "
-                    f"choose: branch. Automations that must not start when {entity_id} is "
-                    f"{blocked_state} need this as an upfront blocking condition."
-                )
-            continue
-        issues.append(f"Respect the explicit guard {entity_id} before running the actions.")
-
-    # Check that every resolved guard entity appears somewhere in the YAML
-    missing_guards = [
-        guard["entity_id"]
-        for guard in explicit_state_guards
-        if guard["entity_id"] not in yaml_entity_ids
-    ]
-    if missing_guards:
-        issues.append(
-            "The following guard entities from the prompt are missing entirely from the "
-            "automation YAML and must be added as blocking conditions in the top-level "
-            f"conditions: block: {', '.join(missing_guards)}. "
-            "Each guard must appear as a condition: state entry requiring the entity to be "
-            "in its required state before the automation proceeds."
-        )
-    elif (
-        re.search(r"\beither\b", prompt_text, re.IGNORECASE)
-        and len(explicit_state_guards) > 1
-    ):
-        present_guards = [
-            g["entity_id"] for g in explicit_state_guards
-            if g["entity_id"] in yaml_entity_ids
-        ]
-        absent_guards = [
-            g["entity_id"] for g in explicit_state_guards
-            if g["entity_id"] not in yaml_entity_ids
-        ]
-        if absent_guards and present_guards:
-            issues.append(
-                "The prompt said 'either', meaning ALL of the following guard entities must "
-                "be present as separate blocking conditions in the top-level conditions: block. "
-                f"Missing: {', '.join(absent_guards)}."
-            )
-
-    if re.search(
-        r"\bcolor_name:\s*['\"]?[a-z0-9]+_[a-z0-9_]+['\"]?",
-        normalized_yaml,
-        re.IGNORECASE,
-    ):
-        issues.append(
-            "Use a valid Home Assistant light color. color_name values should not use underscore-separated names such as warm_white; prefer kelvin, color_temp, or a valid CSS color name."
-        )
-    colour_prompt_re = re.compile(
-        r"\b(warm white|warm light|colour|color|\d{4}k)\b", re.IGNORECASE
-    )
-    colour_data_re = re.compile(
-        r"\b(color_temp|kelvin|color_name|rgb_color|xy_color|brightness_pct|brightness)\b",
-        re.IGNORECASE,
-    )
-    if colour_prompt_re.search(prompt_text):
-        light_action_blocks = re.findall(
-            r"action:\s*light\.turn_on[\s\S]{0,400}?(?=\n\s*-\s|\Z)",
-            normalized_yaml,
+        entity_ids = {
+            str(entity_id).strip()
+            for entity_id in payload.get("entity_ids", []) or []
+            if str(entity_id).strip()
+        }
+        if entity_ids and not referenced & entity_ids and re.search(
+            r"\b(notify|notification|iphone|phone|mobile)\b",
+            label,
             re.IGNORECASE,
-        )
-        if light_action_blocks and not any(
-            colour_data_re.search(block) for block in light_action_blocks
         ):
             issues.append(
-                "The prompt requests a specific colour or brightness for lights, but no "
-                "light.turn_on action includes colour or brightness data. Add a data: block "
-                "with color_temp (in mireds, e.g. 370 for 2700K warm white), brightness_pct, "
-                "or another valid colour field to every affected light.turn_on action."
+                f"Use the resolved notification target for {label}: "
+                + ", ".join(sorted(entity_ids))
+                + "."
             )
-    delay_notify_re = re.compile(
-        r"delay:[\s\S]{0,400}?action:\s*notify\.", re.IGNORECASE
-    )
-    delay_choose_re = re.compile(
-        r"delay:[\s\S]{0,400}?choose:", re.IGNORECASE
-    )
-    conditional_notify_prompt_re = re.compile(
-        r"\b(if.{0,60}(not finished|still|stuck|hasn.t|hasn't)|"
-        r"(notify|notification|message).{0,60}(if|only if|when))\b",
-        re.IGNORECASE,
-    )
-    if (
-        delay_notify_re.search(normalized_yaml)
-        and not delay_choose_re.search(normalized_yaml)
-        and conditional_notify_prompt_re.search(prompt_text)
-    ):
-        issues.append(
-            "After a delay the prompt requires a conditional notification — notify only if a "
-            "condition is still true. Wrap the notify action in a choose: block after the delay "
-            "that re-checks the relevant entity state before sending the notification."
-        )
-    timeout_branch_prompt_re = re.compile(
-        r"\b(if.{0,80}(not finished|still running|still active|hasn.t finished|stuck)"
-        r"|still.{0,40}after.{0,20}\d+\s*(hour|minute|min))\b",
-        re.IGNORECASE,
-    )
-    has_wait_for_trigger = re.search(
-        r"wait_for_trigger", normalized_yaml, re.IGNORECASE
-    )
-    has_timeout = re.search(
-        r"timeout\s*:", normalized_yaml, re.IGNORECASE
-    )
-    if (
-        timeout_branch_prompt_re.search(prompt_text)
-        and has_wait_for_trigger
-        and not has_timeout
-    ):
-        issues.append(
-            "The automation uses wait_for_trigger but no timeout is set. When the prompt "
-            "requires a different action if the event does not occur within a time limit, "
-            "add 'timeout: HH:MM:SS' and 'continue_on_timeout: true' to the wait_for_trigger "
-            "step, then use a choose: block branching on '{{ wait.completed }}' to handle "
-            "both the event-occurred (true) and timed-out (false) cases."
-        )
-
     return list(dict.fromkeys(issue for issue in issues if issue))
+
+
+def _build_entity_list_summary(entities: list[dict[str, Any]]) -> str:
+    """Build a compact entity summary string."""
+    return "\n".join(
+        f"{entity['entity_id']} ({entity['name']}) [{entity['state']}]"
+        for entity in entities
+        if entity.get("entity_id") and entity.get("name")
+    )
+
+
+def _build_intent_repair_messages(
+    prompt_text: str,
+    entities: list[dict[str, Any]],
+    entity_map: dict[str, dict[str, Any]],
+    issues: list[str],
+    draft_result: dict[str, Any],
+) -> list[dict[str, str]]:
+    """Build a one-shot intent repair prompt."""
+    entity_summary = _build_entity_list_summary(entities)
+    map_lines = [
+        f'- "{label}" -> {", ".join(payload.get("entity_ids", []) or [])}'
+        for label, payload in entity_map.items()
+    ]
+    issue_block = "Issues to fix:\n- " + "\n- ".join(_normalize_issue_list(issues, limit=8))
+    return [
+        {"role": "system", "content": INTENT_REPAIR_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                "Original request:\n"
+                f"{prompt_text}\n\n"
+                "ENTITY MAP:\n"
+                + ("\n".join(map_lines) if map_lines else "(none)")
+                + "\n\nAvailable entities:\n"
+                + entity_summary
+                + "\n\nCurrent invalid response:\n"
+                + json.dumps(
+                    {
+                        "intent": draft_result.get("intent"),
+                        "summary": draft_result.get("summary", ""),
+                    }
+                )
+                + "\n\n"
+                + issue_block
+            ),
+        },
+    ]
+
+
+async def _materialize_generation_result(
+    client: LLMClient,
+    request_messages: list[dict[str, str]],
+    prompt_text: str,
+    entities: list[dict[str, Any]],
+    result: dict[str, Any],
+    *,
+    allow_intent_repair: bool = True,
+) -> dict[str, Any]:
+    """Turn intent-first model output into a YAML result when possible."""
+    current = _normalize_generation_result(result)
+    if current.get("needs_clarification"):
+        return current
+
+    intent = current.get("intent")
+    if not isinstance(intent, dict):
+        return current
+
+    entity_map = build_entity_resolution_map(prompt_text, entities)
+    valid_intent, intent_issues = validate_intent(intent)
+    semantic_issues = _intent_entity_issues(intent, entities, entity_map)
+    combined_issues = [*intent_issues, *semantic_issues]
+
+    if combined_issues and allow_intent_repair:
+        repaired = _normalize_generation_result(
+            await client.complete(
+                _build_intent_repair_messages(
+                    prompt_text,
+                    entities,
+                    entity_map,
+                    combined_issues,
+                    current,
+                )
+            )
+        )
+        repaired["used_llm_repair"] = True
+        if repaired.get("needs_clarification"):
+            return repaired
+        current = repaired
+        intent = current.get("intent")
+        if not isinstance(intent, dict):
+            return current
+        valid_intent, intent_issues = validate_intent(intent)
+        semantic_issues = _intent_entity_issues(intent, entities, entity_map)
+        combined_issues = [*intent_issues, *semantic_issues]
+
+    if not isinstance(intent, dict) or combined_issues:
+        current.setdefault("warnings", [])
+        current["warnings"] = list(
+            dict.fromkeys([*current.get("warnings", []), *combined_issues])
+        )
+        return current
+
+    assembled_yaml = assemble_yaml(intent)
+    current["yaml"] = assembled_yaml
+    current["intent"] = intent
+    syntax_issue = _validate_generated_yaml(assembled_yaml)
+    if syntax_issue:
+        current.setdefault("warnings", [])
+        current["warnings"] = list(
+            dict.fromkeys([*current.get("warnings", []), syntax_issue])
+        )
+    return current
+
+
+def _build_clean_regeneration_messages(
+    prompt_text: str,
+    entities: list[dict[str, Any]],
+    constraint_text: str,
+) -> list[dict[str, str]]:
+    """Build a fresh regeneration request with only the original prompt and constraints."""
+    entity_summary = _build_entity_list_summary(entities)
+    messages = build_prompt(prompt_text, entity_summary, entities)
+    if constraint_text:
+        messages = [
+            *messages,
+            {
+                "role": "user",
+                "content": (
+                    "Regenerate the automation from scratch. Ignore all previous drafts.\n\n"
+                    f"{constraint_text}\n\n"
+                    "Return the best valid structured intent JSON you can. "
+                    "If you cannot satisfy the intent schema cleanly, you may return backward-compatible automation YAML instead."
+                ),
+            },
+        ]
+    return messages
+
+
+async def _single_clean_regeneration(
+    client: LLMClient,
+    prompt_text: str,
+    entities: list[dict[str, Any]],
+    constraint_text: str,
+) -> dict[str, Any]:
+    """Run one fresh regeneration pass with a clean prompt."""
+    return _normalize_generation_result(
+        await client.complete(
+            _build_clean_regeneration_messages(
+                prompt_text,
+                entities,
+                constraint_text,
+            )
+        )
+    )
 
 
 def _build_entity_target_lines(entity_ids: list[str], indent: str = "      ") -> list[str]:
@@ -2359,103 +2366,33 @@ async def _regenerate_generation_result(
     job: dict[str, Any] | None = None,
     issue_history: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Regenerate a clean automation from the original request until it validates."""
-    last_issue = _summarize_issue_list(issue)
-    combined_history = _normalize_issue_list(
-        [*(issue_history or []), *_normalize_issue_list(issue, limit=12)],
-        limit=12,
+    """Regenerate a clean automation once from the original request."""
+    constraint_text = (
+        ValidationReport(
+            syntax_errors=_normalize_issue_list(issue, limit=8),
+            warnings=_normalize_issue_list(issue_history or [], limit=8),
+        ).as_constraint_text()
+        if not isinstance(issue, ValidationReport)
+        else issue.as_constraint_text()
     )
-    last_result: dict[str, Any] | None = None
-    regeneration_attempt = 0
-    repair_attempt = 0
-    regeneration_round = 0
+    if job is not None:
+        _mark_job_yaml_repair(job, _summarize_issue_list(issue))
 
-    while True:
-        regeneration_round += 1
-        if regeneration_round > _MAX_REGENERATION_ROUNDS:
-            if job is not None:
-                _mark_job_error(
-                    job,
-                    "AutoMagic could not produce valid automation YAML after multiple correction attempts. "
-                    "Try rephrasing your request or switch to a larger model. More capable models handle "
-                    "complex multi-step automations significantly better than smaller local models.",
-                )
-            return last_result or {}
-        for _attempt in range(_YAML_REGENERATION_ATTEMPTS):
-            regeneration_attempt += 1
-            if job is not None:
-                _mark_job_yaml_repair(job, last_issue)
-            try:
-                regenerated = _normalize_generation_result(
-                    await client.complete(
-                        _build_yaml_regeneration_messages(
-                            request_messages,
-                            last_issue,
-                            combined_history,
-                            regeneration_attempt,
-                        )
-                    )
-                )
-            except LLMResponseError as err:
-                last_issue = _build_model_response_issue(err)
-                combined_history = _normalize_issue_list(
-                    [*combined_history, last_issue], limit=12
-                )
-                continue
-            if regenerated.get("needs_clarification"):
-                return regenerated
-            last_result = regenerated
-            regenerated_issues = _collect_generated_yaml_issues(
-                prompt_text,
-                entities,
-                regenerated.get("yaml", ""),
-            )
-            if not regenerated_issues:
-                return regenerated
-            last_issue = _summarize_issue_list(regenerated_issues)
-            combined_history = _normalize_issue_list(
-                [*combined_history, *regenerated_issues], limit=12
-            )
-
-        current = last_result
-        if current is None:
-            continue
-
-        for _attempt in range(_YAML_REPAIR_ATTEMPTS):
-            repair_attempt += 1
-            if job is not None:
-                _mark_job_yaml_repair(job, last_issue)
-            try:
-                current = _normalize_generation_result(
-                    await client.complete(
-                        _build_yaml_repair_messages(
-                            request_messages,
-                            current,
-                            last_issue,
-                            combined_history,
-                            repair_attempt,
-                        )
-                    )
-                )
-            except LLMResponseError as err:
-                last_issue = _build_model_response_issue(err)
-                combined_history = _normalize_issue_list(
-                    [*combined_history, last_issue], limit=12
-                )
-                continue
-            if current.get("needs_clarification"):
-                return current
-            repaired_issues = _collect_generated_yaml_issues(
-                prompt_text,
-                entities,
-                current.get("yaml", ""),
-            )
-            if not repaired_issues:
-                return current
-            last_issue = _summarize_issue_list(repaired_issues)
-            combined_history = _normalize_issue_list(
-                [*combined_history, *repaired_issues], limit=12
-            )
+    regenerated = await _single_clean_regeneration(
+        client,
+        prompt_text,
+        entities,
+        constraint_text,
+    )
+    regenerated["used_llm_repair"] = True
+    return await _materialize_generation_result(
+        client,
+        request_messages,
+        prompt_text,
+        entities,
+        regenerated,
+        allow_intent_repair=False,
+    )
 
 
 async def _repair_generation_result(
@@ -2466,68 +2403,143 @@ async def _repair_generation_result(
     result: dict[str, Any],
     job: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Validate and, when needed, repair a generated YAML result."""
-    current = _normalize_generation_result(result)
-    if current.get("needs_clarification"):
-        return current
-
-    issues = _collect_generated_yaml_issues(
-        prompt_text,
-        entities,
-        current.get("yaml", ""),
-    )
-    if not issues:
-        return current
-
-    deterministic = _build_deterministic_generation_result(prompt_text, entities)
-    if deterministic is not None and not _collect_generated_yaml_issues(
-        prompt_text,
-        entities,
-        deterministic.get("yaml", ""),
-    ):
-        return deterministic
-
-    issue_history = _normalize_issue_list(issues, limit=12)
-    for _attempt in range(_YAML_REPAIR_ATTEMPTS):
-        issue = _summarize_issue_list(issues)
-        if job is not None:
-            _mark_job_yaml_repair(job, issue)
-        try:
-            current = _normalize_generation_result(
-                await client.complete(
-                    _build_yaml_repair_messages(
-                        request_messages,
-                        current,
-                        issues,
-                        issue_history,
-                        _attempt + 1,
-                    )
-                )
-            )
-        except LLMResponseError as err:
-            issues = [_build_model_response_issue(err)]
-            issue_history = _normalize_issue_list([*issue_history, *issues], limit=12)
-            continue
-        if current.get("needs_clarification"):
-            return current
-        issues = _collect_generated_yaml_issues(
-            prompt_text,
-            entities,
-            current.get("yaml", ""),
-        )
-        if not issues:
-            return current
-        issue_history = _normalize_issue_list([*issue_history, *issues], limit=12)
-
-    return await _regenerate_generation_result(
+    """Validate, autofix, and at most once regenerate a generated result."""
+    current = await _materialize_generation_result(
         client,
         request_messages,
         prompt_text,
         entities,
-        issues,
-        job,
-        issue_history,
+        result,
+        allow_intent_repair=True,
     )
+    if current.get("needs_clarification"):
+        return current
+
+    entity_map = build_entity_resolution_map(prompt_text, entities)
+    report = validate_generated_yaml(
+        prompt_text,
+        entities,
+        current.get("yaml", ""),
+        entity_map,
+    )
+    if not report.has_blocking_issues and not report.has_autofixable_issues:
+        current["warnings"] = report.warnings
+        return current
+
+    deterministic = _build_deterministic_generation_result(prompt_text, entities)
+    if deterministic is not None:
+        deterministic_report = validate_generated_yaml(
+            prompt_text,
+            entities,
+            deterministic.get("yaml", ""),
+            entity_map,
+        )
+        if not deterministic_report.has_blocking_issues and not deterministic_report.has_autofixable_issues:
+            deterministic["warnings"] = deterministic_report.warnings
+            return deterministic
+
+    fixed_yaml, fixes = autofix_yaml(
+        current.get("yaml", ""),
+        prompt_text,
+        entities,
+        entity_map,
+    )
+    if fixes:
+        _LOGGER.info("Autofix applied %d fixes: %s", len(fixes), "; ".join(fixes))
+        if job is not None:
+            _mark_job_yaml_repair(job, f"Auto-corrected {len(fixes)} issue(s)")
+        current["yaml"] = fixed_yaml
+
+    report = validate_generated_yaml(
+        prompt_text,
+        entities,
+        current.get("yaml", ""),
+        entity_map,
+    )
+    if not report.has_blocking_issues:
+        current["warnings"] = list(
+            dict.fromkeys(
+                [
+                    *report.warnings,
+                    *report.issue_strings(),
+                ]
+            )
+        )
+        return current
+
+    if current.get("used_llm_repair"):
+        current["warnings"] = list(
+            dict.fromkeys(
+                [
+                    *report.warnings,
+                    *report.syntax_errors,
+                    *report.missing_entities,
+                    *report.structural_issues,
+                    *[
+                        payload.get("message", key)
+                        for key, payload in report.missing_data.items()
+                    ],
+                ]
+            )
+        )
+        return current
+
+    if job is not None:
+        _mark_job_yaml_repair(job, _summarize_issue_list(report.issue_strings()))
+
+    regenerated = await _single_clean_regeneration(
+        client,
+        prompt_text,
+        entities,
+        report.as_constraint_text(),
+    )
+    regenerated["used_llm_repair"] = True
+    regenerated = await _materialize_generation_result(
+        client,
+        request_messages,
+        prompt_text,
+        entities,
+        regenerated,
+        allow_intent_repair=False,
+    )
+    if regenerated.get("needs_clarification"):
+        return regenerated
+
+    regen_entity_map = build_entity_resolution_map(prompt_text, entities)
+    fixed_regen, regen_fixes = autofix_yaml(
+        regenerated.get("yaml", ""),
+        prompt_text,
+        entities,
+        regen_entity_map,
+    )
+    if regen_fixes:
+        _LOGGER.info(
+            "Autofix applied %d fixes to regenerated YAML: %s",
+            len(regen_fixes),
+            "; ".join(regen_fixes),
+        )
+    final_report = validate_generated_yaml(
+        prompt_text,
+        entities,
+        fixed_regen,
+        regen_entity_map,
+    )
+    regenerated["yaml"] = fixed_regen
+    regenerated["warnings"] = list(
+        dict.fromkeys(
+            [
+                *final_report.warnings,
+                *final_report.syntax_errors,
+                *final_report.missing_entities,
+                *final_report.structural_issues,
+                *[
+                    payload.get("message", key)
+                    for key, payload in final_report.missing_data.items()
+                ],
+            ]
+        )
+    )
+    return regenerated
 
 
 async def _maybe_refresh_backend_status(
@@ -2704,7 +2716,14 @@ async def _run_generation_job(
         # Detect YAML issues before launching the repair loop so we can update
         # the job status immediately — the frontend polls this and will show it
         # in the chat thread as an informational notice.
-        preliminary = _normalize_generation_result(result)
+        preliminary = await _materialize_generation_result(
+            client,
+            request_messages,
+            prompt_text,
+            prompt_entities,
+            result,
+            allow_intent_repair=False,
+        )
         if not preliminary.get("needs_clarification"):
             initial_issues = _collect_generated_yaml_issues(
                 prompt_text,
@@ -2724,61 +2743,21 @@ async def _run_generation_job(
                 result,
                 job,
             )
-
-            # ------- entity-id validation after structural YAML repair -------
             if not repaired.get("needs_clarification"):
                 yaml_text = repaired.get("yaml", "")
                 known_ids = {e["entity_id"] for e in entities_list}
                 hallucinated = _find_hallucinated_entities(yaml_text, known_ids)
                 if hallucinated:
-                    _mark_job_entity_repair(
-                        job,
-                        f"Unknown entities: {', '.join(hallucinated[:10])}",
+                    repaired["warnings"] = list(
+                        dict.fromkeys(
+                            [
+                                *(repaired.get("warnings", []) or []),
+                                "Unknown entity_ids remain in the YAML: "
+                                + ", ".join(hallucinated[:10])
+                                + ".",
+                            ]
+                        )
                     )
-                    full_entity_summary = "\n".join(
-                        f"{e['entity_id']} ({e['name']}) [{e['state']}]"
-                        for e in entities_list
-                    )
-                    entity_repair_issue = ""
-                    while hallucinated:
-                        _mark_job_entity_repair(
-                            job,
-                            entity_repair_issue
-                            or f"Unknown entities: {', '.join(hallucinated[:10])}",
-                        )
-                        try:
-                            candidate = _normalize_generation_result(
-                                await client.complete(
-                                    _build_entity_repair_messages(
-                                        request_messages,
-                                        repaired,
-                                        hallucinated,
-                                        full_entity_summary,
-                                        entity_repair_issue,
-                                    )
-                                )
-                            )
-                        except LLMResponseError as err:
-                            entity_repair_issue = _build_model_response_issue(err)
-                            continue
-                        if candidate.get("needs_clarification"):
-                            repaired = candidate
-                            break
-                        cand_yaml = candidate.get("yaml", "")
-                        candidate_issues = _collect_generated_yaml_issues(
-                            prompt_text,
-                            prompt_entities,
-                            cand_yaml,
-                        )
-                        if candidate_issues:
-                            entity_repair_issue = _summarize_issue_list(candidate_issues)
-                            continue  # broke structure, retry
-                        repaired = candidate
-                        hallucinated = _find_hallucinated_entities(
-                            cand_yaml, known_ids
-                        )
-                        if not hallucinated:
-                            break
 
             job["repair_in_progress"] = False
             return repaired

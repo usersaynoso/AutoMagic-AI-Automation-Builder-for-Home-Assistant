@@ -8,6 +8,7 @@ import pytest
 
 from custom_components.automagic.entity_collector import (
     _relevant_domain_matches,
+    build_entity_resolution_map,
     get_entity_context,
     get_entity_summary_string,
     select_relevant_entities,
@@ -733,3 +734,82 @@ def test_select_relevant_entities_falls_back_when_prompt_has_no_matches():
     )
 
     assert result == entities[:2]
+
+
+def test_build_entity_resolution_map_captures_colour_notify_and_guard_metadata():
+    """Resolved entity maps should preserve action, guard, and notify roles."""
+    entities = [
+        {
+            "entity_id": "sensor.washing_machine_cycle_active",
+            "name": "Washing Machine Cycle Active",
+            "domain": "sensor",
+        },
+        {
+            "entity_id": "light.lounge_strip_left",
+            "name": "Lounge Strip Left",
+            "domain": "light",
+        },
+        {
+            "entity_id": "light.lounge_strip_right",
+            "name": "Lounge Strip Right",
+            "domain": "light",
+        },
+        {
+            "entity_id": "light.bar_lamp",
+            "name": "Bar Lamp",
+            "domain": "light",
+        },
+        {
+            "entity_id": "switch.main_router_led",
+            "name": "Main Router LED",
+            "domain": "switch",
+        },
+        {
+            "entity_id": "switch.mesh_router_led",
+            "name": "Mesh Router LED",
+            "domain": "switch",
+        },
+        {
+            "entity_id": "notify.mobile_app_iphone_13",
+            "name": "Notify Iphone 13",
+            "domain": "notify",
+        },
+    ]
+    prompt = (
+        "When the washing machine starts, turn the lounge strip lights and the bar lamp "
+        "to warm white at 15% brightness. Don't start it if either of the router LED "
+        "switches are already off. Notify my iPhone if it is still running after 2 hours."
+    )
+
+    resolution_map = build_entity_resolution_map(prompt, entities)
+
+    strip_entry = next(
+        payload
+        for payload in resolution_map.values()
+        if {
+            "light.lounge_strip_left",
+            "light.lounge_strip_right",
+        }.issubset(set(payload.get("entity_ids", [])))
+    )
+    assert strip_entry["role"] == "action_target"
+    assert strip_entry["colour_request"]["color_temp"] == 370
+    assert strip_entry["colour_request"]["brightness_pct"] == 15
+
+    guard_entry = next(
+        payload
+        for payload in resolution_map.values()
+        if {
+            "switch.main_router_led",
+            "switch.mesh_router_led",
+        }.issubset(set(payload.get("entity_ids", [])))
+    )
+    assert guard_entry["role"] == "guard"
+    assert guard_entry["blocked_state"] == "off"
+    assert guard_entry["required_state"] == "on"
+
+    notify_entry = next(
+        payload
+        for payload in resolution_map.values()
+        if "notify.mobile_app_iphone_13" in payload.get("entity_ids", [])
+    )
+    assert notify_entry["role"] == "notify_target"

@@ -158,6 +158,51 @@ async def test_complete_strips_markdown_fences():
 
 
 @pytest.mark.asyncio
+async def test_complete_accepts_intent_only_json_responses():
+    """Intent-first responses should be preserved for deterministic YAML assembly."""
+    content = json.dumps(
+        {
+            "intent": {
+                "alias": "Warm Lights",
+                "description": "Turns the bar lamp on when the door opens.",
+                "mode": "single",
+                "triggers": [
+                    {
+                        "type": "state",
+                        "entity_id": "binary_sensor.front_door",
+                        "to": "on",
+                    }
+                ],
+                "conditions": [],
+                "action_sequence": [
+                    {
+                        "step_type": "service_call",
+                        "action": "light.turn_on",
+                        "target_entity_ids": ["light.bar_lamp"],
+                    }
+                ],
+            },
+            "summary": "Turns on the bar lamp when the door opens.",
+            "needs_clarification": False,
+            "clarifying_questions": [],
+        }
+    )
+    resp = FakeResponse(200, _make_completion_response(content))
+    session = FakeSession(resp)
+
+    client = LLMClient(
+        endpoint_url="http://localhost:11434",
+        model="llama3",
+        session=session,
+    )
+    result = await client.complete([{"role": "user", "content": "test"}])
+
+    assert result["yaml"] == ""
+    assert result["intent"]["alias"] == "Warm Lights"
+    assert result["summary"] == "Turns on the bar lamp when the door opens."
+
+
+@pytest.mark.asyncio
 async def test_complete_http_error():
     """Test that non-200 status raises LLMResponseError."""
     resp = FakeResponse(500, "Internal Server Error")

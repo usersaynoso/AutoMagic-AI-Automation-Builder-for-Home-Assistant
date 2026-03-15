@@ -9,7 +9,11 @@ from custom_components.automagic.config_flow import (
     _get_model_temperature,
     _get_model_max_tokens,
 )
-from custom_components.automagic.prompt_builder import build_prompt, SYSTEM_PROMPT
+from custom_components.automagic.prompt_builder import (
+    INTENT_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
+    build_prompt,
+)
 
 
 class TestBuildPrompt:
@@ -22,14 +26,14 @@ class TestBuildPrompt:
         assert result[0]["role"] == "system"
         assert result[1]["role"] == "user"
 
-    def test_system_message_contains_syntax_rules(self):
-        """System message must enforce 2024.10+ syntax."""
+    def test_system_message_uses_intent_first_generation(self):
+        """Generation should now ask the model for structured intent JSON."""
         result = build_prompt("test", "test")
         system = result[0]["content"]
-        assert "triggers:" in system
-        assert "actions:" in system
-        assert "NEVER use 'service:'" in system
-        assert "NOT 'platform:'" in system
+        assert "structured automation intent" in system
+        assert "Do NOT return YAML" in system
+        assert '"intent"' in system
+        assert "ENTITY MAP" in system
 
     def test_user_message_contains_entity_summary(self):
         """User message should include the entity list."""
@@ -54,10 +58,16 @@ class TestBuildPrompt:
         assert "Create an automation for:" in user_msg
 
     def test_system_prompt_requires_json_output(self):
-        """System prompt must instruct the LLM to output JSON."""
+        """Legacy YAML fallback prompt should still instruct the LLM to output JSON."""
         assert '"yaml"' in SYSTEM_PROMPT
         assert '"summary"' in SYSTEM_PROMPT
         assert "JSON" in SYSTEM_PROMPT
+
+    def test_intent_system_prompt_requires_intent_output(self):
+        """Intent prompt should require structured intent plus summary output."""
+        assert '"intent"' in INTENT_SYSTEM_PROMPT
+        assert '"summary"' in INTENT_SYSTEM_PROMPT
+        assert "Do NOT return YAML" in INTENT_SYSTEM_PROMPT
 
     def test_system_prompt_forbids_invented_entities(self):
         """System prompt must tell LLM not to invent entity IDs."""

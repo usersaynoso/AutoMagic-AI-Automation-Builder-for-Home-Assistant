@@ -10,7 +10,7 @@
     },
     "abort": {
       "already_configured": "AutoMagic is already configured.",
-      "reconfigure_successful": "[%key:common::config_flow::abort::reconfigure_successful%]"
+      "reconfigure_successful": "Configuration updated successfully."
     },
     "step": {
       "user": {
@@ -49,7 +49,7 @@
       },
       "abort": {
         "already_exists": "That AI service is already configured.",
-        "reconfigure_successful": "[%key:common::config_flow::abort::reconfigure_successful%]"
+        "reconfigure_successful": "Configuration updated successfully."
       },
       "error": {
         "already_exists": "That AI service is already configured.",

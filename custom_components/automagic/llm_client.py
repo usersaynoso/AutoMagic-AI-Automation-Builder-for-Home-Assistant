@@ -647,6 +647,7 @@ class LLMClient:
                 )
 
             yaml_text = _normalize_automation_yaml_text(parsed.get("yaml"))
+            intent = parsed.get("intent")
             summary = _normalize_text(parsed.get("summary"))
             needs_clarification = bool(parsed.get("needs_clarification"))
             clarifying_questions = _normalize_questions(
@@ -655,7 +656,7 @@ class LLMClient:
                 or parsed.get("follow_up_questions")
             )
 
-            if not yaml_text:
+            if not yaml_text and not isinstance(intent, dict):
                 if clarifying_questions:
                     needs_clarification = True
                 elif needs_clarification and summary:
@@ -673,18 +674,20 @@ class LLMClient:
                     clarifying_questions = [summary]
                 return {
                     "yaml": None,
+                    "intent": None,
                     "summary": summary,
                     "needs_clarification": True,
                     "clarifying_questions": clarifying_questions,
                 }
 
-            if not yaml_text:
+            if not yaml_text and not isinstance(intent, dict):
                 raise LLMResponseError(
-                    "LLM response did not include automation YAML or clarification questions"
+                    "LLM response did not include automation YAML, intent JSON, or clarification questions"
                 )
 
             return {
                 "yaml": yaml_text,
+                "intent": intent if isinstance(intent, dict) else None,
                 "summary": summary,
                 "needs_clarification": False,
                 "clarifying_questions": [],

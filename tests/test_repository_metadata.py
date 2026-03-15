@@ -48,7 +48,7 @@ def test_manifest_declares_single_config_entry_service_integration():
     assert manifest["integration_type"] == "service"
     assert manifest["issue_tracker"] == f"{CANONICAL_REPO_URL}/issues"
     assert manifest["single_config_entry"] is True
-    assert manifest["version"] == "0.2.33"
+    assert manifest["version"] == "0.2.34"
 
 
 def test_manifest_keys_follow_home_assistant_ordering_rules():
@@ -128,6 +128,21 @@ def test_reconfigure_translations_exist_for_config_entries_and_subentries():
     assert "reconfigure_openai" in strings["config_subentries"]["service"]["step"]
     assert "reconfigure_local" in translation["config_subentries"]["service"]["step"]
     assert "reconfigure_openai" in translation["config_subentries"]["service"]["step"]
+
+
+def test_reconfigure_success_translation_is_human_readable():
+    """Successful reconfigure flows should not show an unresolved translation token."""
+    strings = _read_json(STRINGS_PATH)
+    translation = _read_json(TRANSLATION_PATH)
+
+    assert (
+        strings["config"]["abort"]["reconfigure_successful"]
+        == "Configuration updated successfully."
+    )
+    assert (
+        translation["config"]["abort"]["reconfigure_successful"]
+        == "Configuration updated successfully."
+    )
 
 
 def test_validate_workflow_runs_hacs_without_skipping_brands():

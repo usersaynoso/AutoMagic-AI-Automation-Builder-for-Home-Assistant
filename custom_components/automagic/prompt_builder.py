@@ -12,7 +12,9 @@ from .entity_collector import (
     _tokenize,
     _normalize_phrase,
     _relevant_domain_matches,
+    build_entity_resolution_map,
 )
+from .intent_schema import INTENT_JSON_SCHEMA
 
 _LOGGER = logging.getLogger(__name__)
 _GROUP_MARKER_RE = re.compile(
@@ -161,6 +163,135 @@ duration, scene, notification target, brightness, color, or action mode.
 - Do not mark the task complete with an empty yaml string.
 - If the request cannot be fulfilled with the available entities even after clarification, \
 set yaml to null, needs_clarification to false, and explain why in the summary.\
+"""
+
+INTENT_SYSTEM_PROMPT = f"""\
+You are an expert Home Assistant automation engineer.
+You will be given a plain-English description of a desired automation and a list of available entities in the user's Home Assistant installation.
+The conversation may continue with follow-up questions, clarifications, corrections, or requested changes to the current automation.
+
+Your job is to return structured automation intent, not raw YAML.
+
+OUTPUT RULES:
+- Return only a JSON object with exactly two primary keys:
+    "intent": the structured automation intent object
+    "summary": a 1-2 sentence plain English description of what the automation does
+- You may also include:
+    "needs_clarification": true
+    "clarifying_questions": an array of 0-3 short, specific questions
+- Do NOT return YAML. Return only the structured intent JSON. The YAML will be assembled automatically from your intent.
+- Do not include markdown fences, commentary, or any text outside the JSON object.
+- Every entity_id in your response must come from the ENTITY MAP or the full entity list supplied by the user. Do not invent entity_ids.
+
+INTENT SCHEMA:
+{INTENT_JSON_SCHEMA}
+
+EXAMPLES:
+Example 1 user request:
+"Turn on <light_entity> at 07:00 every weekday."
+Example 1 response:
+{{
+  "intent": {{
+    "alias": "Weekday morning lights",
+    "description": "Turns on the requested light at 07:00 on weekdays.",
+    "mode": "single",
+    "triggers": [{{"type": "time", "at": "07:00:00"}}],
+    "conditions": [{{"type": "time", "weekday": ["mon", "tue", "wed", "thu", "fri"]}}],
+    "action_sequence": [
+      {{
+        "step_type": "service_call",
+        "action": "light.turn_on",
+        "target_entity_ids": ["<light_entity>"]
+      }}
+    ]
+  }},
+  "summary": "Turns on the requested light every weekday at 07:00."
+}}
+
+Example 2 user request:
+"When <trigger_entity> turns on, set <light_one> and <light_two> to warm white at 20% brightness."
+Example 2 response:
+{{
+  "intent": {{
+    "alias": "Warm light response",
+    "description": "Turns two lights on to a dim warm white when the trigger entity turns on.",
+    "mode": "restart",
+    "triggers": [{{"type": "state", "entity_id": "<trigger_entity>", "to": "on"}}],
+    "conditions": [],
+    "action_sequence": [
+      {{
+        "step_type": "service_call",
+        "action": "light.turn_on",
+        "target_entity_ids": ["<light_one>", "<light_two>"],
+        "data": {{"color_temp": 370, "brightness_pct": 20}}
+      }}
+    ]
+  }},
+  "summary": "Turns the requested lights on to dim warm white when the trigger entity turns on."
+}}
+
+Example 3 user request:
+"If <machine_sensor> is still active after 2 hours, notify <notify_service>."
+Example 3 response:
+{{
+  "intent": {{
+    "alias": "Machine timeout notify",
+    "description": "Waits for the machine to finish and notifies if it remains active after two hours.",
+    "mode": "single",
+    "triggers": [{{"type": "state", "entity_id": "<machine_sensor>", "to": "active"}}],
+    "conditions": [],
+    "action_sequence": [
+      {{
+        "step_type": "wait_for_trigger",
+        "wait_triggers": [{{"type": "state", "entity_id": "<machine_sensor>", "to": "idle"}}],
+        "timeout": "02:00:00"
+      }},
+      {{
+        "step_type": "choose",
+        "choose_options": [
+          {{
+            "conditions": [{{"type": "template", "value_template": "{{{{ not wait.completed }}}}"}}],
+            "sequence": [
+              {{
+                "step_type": "service_call",
+                "action": "<notify_service>",
+                "data": {{"message": "The device is still active after 2 hours."}}
+              }}
+            ]
+          }}
+        ],
+        "choose_default": []
+      }}
+    ]
+  }},
+  "summary": "Notifies if the device is still active after a two-hour wait."
+}}
+
+GENERATION RULES:
+- Always use Home Assistant 2024.10+ semantics in the intent so the assembler can emit triggers:, conditions:, actions:, and action: correctly.
+- Read the entire request as one combined condition/action sequence before deciding anything is missing.
+- Treat time-window exclusions such as "not between 9am and 5pm on a weekday" as conditions, not as the trigger schedule.
+- When the user says "don't start/run X if Y is already off/on", encode that as a blocking top-level condition, not as a choose branch inside actions.
+- Preserve thresholds, colours, brightness levels, delays, timeouts, weekdays, guard conditions, sibling-group expansion, and notification messages from the user's request.
+- When the prompt requires waiting for an event and also specifies a maximum wait time, use wait_for_trigger with timeout and structure the follow-up around wait.completed.
+- When the request targets all/both/every member of a sibling entity family, include the complete resolved set together.
+- When the user names a phone or mobile device and a matching notify.* service exists, use that notify service directly.
+- When the prompt requests lights on while a device is active and back off when it finishes, include an explicit off path in the action_sequence.
+- If the request cannot be implemented without guessing after using the entity map and entity list, set needs_clarification to true and ask the minimum number of direct questions needed.
+"""
+
+INTENT_REPAIR_SYSTEM_PROMPT = f"""\
+You are an expert Home Assistant automation intent repair assistant.
+Return only a JSON object with the keys intent, summary, needs_clarification, and clarifying_questions.
+Do not return YAML.
+Use this schema exactly:
+{INTENT_JSON_SCHEMA}
+
+Repair rules:
+- Keep the user's original automation behavior, guards, thresholds, delays, and notifications.
+- Replace invalid or invented entity_ids with exact entity_ids from the supplied ENTITY MAP or entity list.
+- Do not drop colour, brightness, timeout, weekday, or choose-branch logic when fixing another issue.
+- Ask for clarification only if the original request still cannot be implemented without guessing.
 """
 
 
@@ -650,6 +781,7 @@ def build_prompt(
     """
     guidance_lines = _build_prompt_guidance(user_input, entities)
     formatted_entity_summary = entity_summary
+    entity_map_block = ""
     if entities:
         compact_summary = "\n".join(
             f"{entity['entity_id']} ({entity['name']})"
@@ -658,25 +790,58 @@ def build_prompt(
         )
         if compact_summary:
             formatted_entity_summary = compact_summary
+        entity_map = build_entity_resolution_map(user_input, entities)
+        if entity_map:
+            map_lines: list[str] = []
+            for label, payload in entity_map.items():
+                entity_ids = ", ".join(payload.get("entity_ids", []) or [])
+                role = str(payload.get("role") or "").strip()
+                notes: list[str] = []
+                if role:
+                    notes.append(role.replace("_", " "))
+                if payload.get("required_state"):
+                    notes.append(f'must be "{payload["required_state"]}" to proceed')
+                elif payload.get("blocked_state"):
+                    notes.append(f'blocked when "{payload["blocked_state"]}"')
+                colour_request = payload.get("colour_request") or {}
+                if colour_request:
+                    colour_bits = []
+                    if colour_request.get("color_temp"):
+                        colour_bits.append(f"color_temp {colour_request['color_temp']}")
+                    if colour_request.get("color_name"):
+                        colour_bits.append(f"color {colour_request['color_name']}")
+                    if colour_request.get("brightness_pct"):
+                        colour_bits.append(
+                            f"brightness {colour_request['brightness_pct']}%"
+                        )
+                    if colour_bits:
+                        notes.append(", ".join(colour_bits))
+                note_text = f" [{'; '.join(notes)}]" if notes else ""
+                map_lines.append(f'- "{label}" -> {entity_ids}{note_text}')
+            entity_map_block = (
+                "ENTITY MAP (use these exact IDs, do not invent others):\n"
+                + "\n".join(map_lines)
+                + "\n\n"
+            )
     guidance_block = (
         "\n\nPrompt-specific guidance:\n- " + "\n- ".join(guidance_lines)
         if guidance_lines
         else ""
     )
     user_message = (
-        f"Available entities:\n{formatted_entity_summary}"
+        f"{entity_map_block}Available entities:\n{formatted_entity_summary}"
         f"{guidance_block}\n\n"
         f"Create an automation for:\n{user_input}"
     )
 
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": INTENT_SYSTEM_PROMPT},
         {"role": "user", "content": user_message},
     ]
 
     _LOGGER.debug(
         "Built prompt: system=%d chars, user=%d chars",
-        len(SYSTEM_PROMPT),
+        len(INTENT_SYSTEM_PROMPT),
         len(user_message),
     )
 

@@ -3478,11 +3478,10 @@ test("Create view source exposes a configured model picker", () => {
   assert.match(cardSource, /service_id/);
 });
 
-test("Missing-yaml repair explicitly demands a non-empty yaml string", () => {
-  assert.match(cardSource, /did not include the required automation YAML/i);
-  assert.match(cardSource, /yaml key must be a non-empty string/i);
-  assert.match(cardSource, /Do not leave yaml null or empty/i);
-  assert.match(cardSource, /Do not say the automation is ready, complete, or being generated/i);
+test("Missing-yaml repair now requests installable YAML or intent JSON", () => {
+  assert.match(cardSource, /did not include installable automation YAML/i);
+  assert.match(cardSource, /Return installable automation YAML or intent JSON/i);
+  assert.match(cardSource, /Do NOT return YAML\. The YAML will be assembled automatically from the intent\./i);
 });
 
 test("System prompt instructs the model to handle follow-up edits and questions", () => {
@@ -3597,24 +3596,11 @@ test("Plan-to-yaml messages compile from resolved interpretation without planner
   assert.doesNotMatch(messages[1].content, /Implementation brief:/);
 });
 
-test("Planner-only compile responses jump straight to YAML regeneration", async () => {
+test("Planner-only missing-yaml responses go straight to one clean regeneration", async () => {
   const harness = buildHarness();
   const calls = [];
-  harness._compilePlanToYaml = async (_prompt, context) => {
-    calls.push(["compile", context?.plan?.resolved_request || ""]);
-    return {
-      yaml: "",
-      summary: "Planner reply",
-      needs_clarification: false,
-      clarifying_questions: [],
-      missing_yaml: true,
-      planner_only: true,
-      plan_details: {
-        resolved_request: "Compile the final automation",
-        resolved_requirements: ["Return YAML"],
-        resolved_entities: ["light.test"],
-      },
-    };
+  harness._compilePlanToYaml = async () => {
+    throw new Error("planner compile should not run in the capped repair flow");
   };
   harness._regenerateAutomationYamlFromScratch = async (_prompt, context, issues) => {
     calls.push([
@@ -3662,24 +3648,27 @@ test("Planner-only compile responses jump straight to YAML regeneration", async 
     }
   );
 
-  assert.equal(calls[0][0], "compile");
-  assert.deepEqual(calls[1], [
+  assert.deepEqual(calls[0], [
     "regen",
-    "Compile the final automation",
-    "The previous response returned planning keys instead of automation YAML.",
+    "",
+    "Return installable automation YAML or intent JSON.",
   ]);
   assert.match(result.yaml, /^alias: Example/m);
 });
 
-test("Complex missing-yaml repairs skip chat JSON retries and go straight to YAML regeneration", async () => {
+test("Complex missing-yaml repairs skip chat retries and use one regeneration", async () => {
   const harness = buildHarness();
   harness._isComplexAutomationPrompt = () => true;
-  harness._regenerateAutomationYamlFromScratch = async (_prompt, _context, issues) => ({
-    yaml: "alias: Complex Example\ndescription: Example\ntriggers: []\nconditions: []\nactions: []",
-    summary: Array.isArray(issues) ? issues.join(" ") : "",
-    needs_clarification: false,
-    clarifying_questions: [],
-  });
+  let regenerationCalls = 0;
+  harness._regenerateAutomationYamlFromScratch = async (_prompt, _context, issues) => {
+    regenerationCalls += 1;
+    return {
+      yaml: "alias: Complex Example\ndescription: Example\ntriggers: []\nconditions: []\nactions: []",
+      summary: Array.isArray(issues) ? issues.join(" ") : "",
+      needs_clarification: false,
+      clarifying_questions: [],
+    };
+  };
   harness._directChatCompletion = async () => {
     throw new Error("chat completion should not run for complex missing-yaml repair");
   };
@@ -3713,11 +3702,12 @@ test("Complex missing-yaml repairs skip chat JSON retries and go straight to YAM
     }
   );
 
+  assert.equal(regenerationCalls, 1);
   assert.match(result.yaml, /^alias: Complex Example/m);
-  assert.match(result.summary, /required complete automation YAML/i);
+  assert.match(result.summary, /installable automation YAML or intent JSON/i);
 });
 
-test("Direct repair keeps retrying beyond the old cap until a later regeneration succeeds", async () => {
+test("Direct repair caps regeneration at one attempt and surfaces remaining warnings", async () => {
   const harness = buildHarness();
   let directCalls = 0;
   let rewriteCalls = 0;
@@ -3729,13 +3719,6 @@ test("Direct repair keeps retrying beyond the old cap until a later regeneration
     needs_clarification: false,
     clarifying_questions: [],
   };
-  const validResult = {
-    yaml: "alias: Fixed\ndescription: Fixed\ntriggers: []\nconditions: []\nactions: []\nmode: single",
-    summary: "Fixed automation",
-    needs_clarification: false,
-    clarifying_questions: [],
-  };
-
   harness._collectRepairIssues = (_prompt, yaml) =>
     String(yaml || "").includes("mode: single")
       ? []
@@ -3750,7 +3733,7 @@ test("Direct repair keeps retrying beyond the old cap until a later regeneration
   };
   harness._regenerateAutomationYamlFromScratch = async () => {
     regenerationCalls += 1;
-    return regenerationCalls >= 4 ? validResult : invalidResult;
+    return invalidResult;
   };
 
   const result = await harness._repairGeneratedYamlIfNeeded.call(
@@ -3769,34 +3752,26 @@ test("Direct repair keeps retrying beyond the old cap until a later regeneration
     }
   );
 
-  assert.equal(directCalls, 4);
-  assert.equal(rewriteCalls, 2);
-  assert.equal(regenerationCalls, 4);
-  assert.match(result.yaml, /^alias: Fixed/m);
+  assert.equal(directCalls, 0);
+  assert.equal(rewriteCalls, 0);
+  assert.equal(regenerationCalls, 1);
+  assert.match(result.yaml, /^alias: Broken/m);
+  assert.deepEqual(result.warnings, [
+    'Guard sensor.phone_audio_output must NOT be "Speaker". Use a condition entry like: - condition: not / conditions: / - condition: state / entity_id: sensor.phone_audio_output / state: "Speaker" or - condition: template / value_template: "{{ states(\'sensor.phone_audio_output\') != \'Speaker\' }}"',
+  ]);
 });
 
-test("Source includes a dedicated syntax rewrite fallback for invalid YAML", () => {
-  assert.match(cardSource, /_rewriteInvalidAutomationYaml\(prompt, messages, result, issues = \[\]\)/);
-  assert.match(cardSource, /_compilePlanToYaml\(prompt, context = \{\}\)/);
-  assert.match(cardSource, /_buildPlanToYamlMessages\(prompt, context = \{\}\)/);
-  assert.match(cardSource, /_rewritePlannerResponseToYaml\(prompt, context = \{\}\)/);
-  assert.match(cardSource, /_directYamlGeneration\(promptText, maxTokens = DIRECT_YAML_ONLY_MAX_TOKENS\)/);
-  assert.match(cardSource, /_regenerateAutomationYamlFromScratch\(/);
-  assert.match(cardSource, /DIRECT_FINAL_MODEL_PREFERENCES/);
-  assert.match(cardSource, /Return ONLY one complete Home Assistant automation in YAML/i);
-  assert.match(cardSource, /Do not return JSON, markdown fences, commentary, or explanations/i);
-  assert.match(cardSource, /\/api\/generate/);
-  assert.match(cardSource, /DIRECT_SYNTAX_REWRITE_SYSTEM_PROMPT/);
-  assert.match(cardSource, /DIRECT_PLAN_TO_YAML_SYSTEM_PROMPT/);
-  assert.match(cardSource, /rewrite the draft above into one valid Home Assistant automation/i);
-  assert.match(cardSource, /Syntax problems to fix:/);
-  assert.match(cardSource, /Return one complete Home Assistant automation as JSON now/i);
-  assert.match(cardSource, /Do not ask for clarification and do not return planning keys/i);
-  assert.match(cardSource, /Your previous reply was invalid because it returned planning keys/i);
-  assert.match(cardSource, /exactly four keys: yaml, summary, needs_clarification, clarifying_questions/i);
-  assert.match(cardSource, /The previous response returned planning keys instead of automation YAML\./);
-  assert.match(cardSource, /For nested outcomes such as 'if still above X after Y, do A, otherwise do B'/i);
-  assert.match(cardSource, /The previous response did not include the required complete automation YAML\./);
+test("Source encodes the simplified intent-first repair pipeline", () => {
+  assert.match(cardSource, /DIRECT_INTENT_SYSTEM_PROMPT/);
+  assert.match(cardSource, /DIRECT_INTENT_REPAIR_SYSTEM_PROMPT/);
+  assert.match(cardSource, /DIRECT_REPAIR_ATTEMPTS = 1/);
+  assert.match(cardSource, /DIRECT_REGENERATION_ATTEMPTS = 1/);
+  assert.match(cardSource, /_autofixYaml\(yaml,\s*prompt,\s*entities = \[\]\)/);
+  assert.match(cardSource, /_regenerateAutomationFromConstraints\(prompt, context = \{\}, issues = \[\]\)/);
+  assert.match(cardSource, /Ignore previous drafts\./);
+  assert.match(cardSource, /Return the best structured intent JSON you can\./);
+  assert.match(cardSource, /If you cannot follow the intent schema cleanly, return backward-compatible automation YAML instead\./);
+  assert.match(cardSource, /warnings:\s*remainingIssues/);
 });
 
 test("Source encodes do-not-run guards as top-level conditions", () => {

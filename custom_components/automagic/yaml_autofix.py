@@ -508,6 +508,102 @@ def _condition_exists(conditions: list[dict[str, Any]], target: dict[str, Any]) 
     return False
 
 
+def _entity_id_in_conditions(conditions: list[Any], entity_id: str) -> bool:
+    """Return True when an entity id appears anywhere inside a condition tree."""
+    target = str(entity_id or "").strip()
+    if not target:
+        return False
+
+    for condition in conditions:
+        if isinstance(condition, dict):
+            value = condition.get("entity_id")
+            if isinstance(value, str) and value.strip() == target:
+                return True
+            if isinstance(value, list) and any(str(item).strip() == target for item in value):
+                return True
+            nested_conditions = condition.get("conditions")
+            if isinstance(nested_conditions, list) and _entity_id_in_conditions(
+                nested_conditions, target
+            ):
+                return True
+            for key in ("value_template", "above", "below"):
+                if target in str(condition.get(key) or ""):
+                    return True
+        elif target in str(condition or ""):
+            return True
+
+    return False
+
+
+def _lookup_entity(entities: list[dict[str, Any]], entity_id: str) -> dict[str, Any] | None:
+    """Return the entity payload for an entity id."""
+    target = str(entity_id or "").strip()
+    if not target:
+        return None
+    return next(
+        (
+            entity
+            for entity in entities
+            if str(entity.get("entity_id") or "").strip() == target
+        ),
+        None,
+    )
+
+
+def _build_entity_map_guard_condition(
+    entity_id: str,
+    required_state: str,
+    blocked_state: str,
+    entities: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Build a top-level guard condition from entity-map metadata."""
+    if required_state:
+        return {
+            "condition": "state",
+            "entity_id": entity_id,
+            "state": required_state,
+        }
+
+    if blocked_state:
+        return {
+            "condition": "not",
+            "conditions": [
+                {
+                    "condition": "state",
+                    "entity_id": entity_id,
+                    "state": blocked_state,
+                }
+            ],
+        }
+
+    entity = _lookup_entity(entities, entity_id) or {}
+    domain = str(entity.get("domain") or "").strip().lower()
+    current_state = str(entity.get("state") or "").strip().lower()
+    if domain == "automation":
+        return {
+            "condition": "template",
+            "value_template": (
+                "{{ (state_attr('"
+                + entity_id
+                + "', 'current') | int(0)) == 0 }}"
+            ),
+        }
+
+    if domain in {"switch", "input_boolean"}:
+        expected_state = "on" if current_state == "on" else "on"
+        return {
+            "condition": "state",
+            "entity_id": entity_id,
+            "state": expected_state,
+        }
+
+    return {
+        "condition": "state",
+        "entity_id": entity_id,
+        "state": "on",
+    }
+
+
 def _ensure_guard_conditions(
     parsed: dict[str, Any],
     prompt_text: str,
@@ -574,6 +670,121 @@ def _ensure_guard_conditions(
             fixes.append(
                 f"Added missing top-level negated guard for {entity_id} != {state}"
             )
+
+
+def _ensure_entity_map_guard_conditions(
+    parsed: dict[str, Any],
+    prompt_text: str,
+    entities: list[dict[str, Any]],
+    entity_map: dict[str, dict[str, Any]],
+    fixes: list[str],
+) -> None:
+    """Ensure resolved entity-map guards exist in top-level conditions."""
+    del prompt_text
+
+    conditions = parsed.setdefault("conditions", [])
+    if not isinstance(conditions, list):
+        parsed["conditions"] = []
+        conditions = parsed["conditions"]
+
+    for payload in entity_map.values():
+        if str(payload.get("role") or "").strip().lower() != "guard":
+            continue
+        entity_ids = [
+            str(entity_id).strip()
+            for entity_id in payload.get("entity_ids", []) or []
+            if str(entity_id).strip()
+        ]
+        if not entity_ids:
+            continue
+
+        required_state = str(payload.get("required_state") or "").strip()
+        blocked_state = str(payload.get("blocked_state") or "").strip()
+        for entity_id in entity_ids:
+            if _entity_id_in_conditions(conditions, entity_id):
+                continue
+            condition = _build_entity_map_guard_condition(
+                entity_id,
+                required_state,
+                blocked_state,
+                entities,
+            )
+            if condition is None or _condition_exists(conditions, condition):
+                continue
+            conditions.append(condition)
+            fixes.append(
+                f"Injected missing guard condition for {entity_id} from entity map"
+            )
+
+
+def _walk_action_items(
+    actions: list[Any],
+    visitor_fn: Any,
+) -> None:
+    """Visit action mappings recursively across nested action sequences."""
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        visitor_fn(action)
+
+        for key in ("sequence", "default", "then", "else"):
+            nested = action.get(key)
+            if isinstance(nested, list):
+                _walk_action_items(nested, visitor_fn)
+
+        choose = action.get("choose")
+        if isinstance(choose, list):
+            for option in choose:
+                if not isinstance(option, dict):
+                    continue
+                sequence = option.get("sequence")
+                if isinstance(sequence, list):
+                    _walk_action_items(sequence, visitor_fn)
+
+        repeat = action.get("repeat")
+        if isinstance(repeat, dict):
+            sequence = repeat.get("sequence")
+            if isinstance(sequence, list):
+                _walk_action_items(sequence, visitor_fn)
+
+
+def _fix_notification_targets(
+    parsed: dict[str, Any],
+    entity_map: dict[str, dict[str, Any]],
+    fixes: list[str],
+) -> None:
+    """Replace incorrect notify actions with resolved notification targets."""
+    notify_targets: list[str] = []
+    for payload in entity_map.values():
+        if str(payload.get("role") or "").strip().lower() != "notify_target":
+            continue
+        for entity_id in payload.get("entity_ids", []) or []:
+            cleaned = str(entity_id or "").strip()
+            if cleaned and cleaned not in notify_targets:
+                notify_targets.append(cleaned)
+
+    if not notify_targets:
+        return
+
+    primary_target = notify_targets[0]
+    actions = parsed.get("actions")
+    if not isinstance(actions, list):
+        return
+
+    def _visitor(action_item: dict[str, Any]) -> None:
+        action_name = str(action_item.get("action") or "").strip()
+        if not action_name.startswith("notify."):
+            return
+        if action_name not in notify_targets:
+            action_item["action"] = primary_target
+            fixes.append(
+                f"Replaced incorrect notify target {action_name} with {primary_target}"
+            )
+        if "target" in action_item:
+            action_item.pop("target", None)
+            fixes.append("Removed redundant target block from notify action")
+
+    _walk_action_items(actions, _visitor)
 
 
 def _order_top_level_keys(parsed: dict[str, Any]) -> dict[str, Any]:
@@ -657,6 +868,8 @@ def autofix_yaml(
         )
 
     _ensure_guard_conditions(parsed, prompt_text, entities, fixes)
+    _ensure_entity_map_guard_conditions(parsed, prompt_text, entities, entity_map, fixes)
+    _fix_notification_targets(parsed, entity_map, fixes)
 
     if parsed == original:
         return normalized_yaml, []

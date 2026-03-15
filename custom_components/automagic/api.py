@@ -86,7 +86,6 @@ _BACKEND_PROBE_INTERVAL_SECONDS = 10
 _DEFAULT_GENERATION_CONTEXT_LIMIT = 60
 _YAML_REPAIR_ATTEMPTS = 1
 _YAML_REGENERATION_ATTEMPTS = 1
-_MAX_REGENERATION_ROUNDS = 1
 _TIME_WINDOW_RE = re.compile(
     r"\bbetween\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s+(?:and|to|-)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b",
     re.IGNORECASE,
@@ -2409,6 +2408,110 @@ async def _regenerate_generation_result(
     )
 
 
+async def _request_yaml_repair_result(
+    client: LLMClient,
+    request_messages: list[dict[str, str]],
+    prompt_text: str,
+    entities: list[dict[str, Any]],
+    result: dict[str, Any],
+    issues: str | list[str],
+    *,
+    issue_history: list[str] | None = None,
+    attempt_number: int = 1,
+    job: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Ask the model to repair the latest invalid YAML draft."""
+    if job is not None:
+        _mark_job_yaml_repair(job, _summarize_issue_list(issues))
+
+    repaired = _normalize_generation_result(
+        await client.complete(
+            _build_yaml_repair_messages(
+                request_messages,
+                result,
+                issues,
+                issue_history=issue_history,
+                attempt_number=attempt_number,
+            )
+        )
+    )
+    repaired["used_llm_repair"] = True
+    return await _materialize_generation_result(
+        client,
+        request_messages,
+        prompt_text,
+        entities,
+        repaired,
+        allow_intent_repair=False,
+    )
+
+
+def _extend_issue_history(
+    issue_history: list[str],
+    issues: list[str],
+) -> list[str]:
+    """Append new validation issues while preserving order."""
+    merged = list(issue_history)
+    for issue in issues:
+        text = str(issue or "").strip()
+        if text and text not in merged:
+            merged.append(text)
+    return merged
+
+
+def _build_report_warnings(report: ValidationReport) -> list[str]:
+    """Flatten a validation report into warning strings for the UI."""
+    return list(
+        dict.fromkeys(
+            [
+                *report.warnings,
+                *report.syntax_errors,
+                *report.missing_entities,
+                *report.structural_issues,
+                *[
+                    payload.get("message", key)
+                    for key, payload in report.missing_data.items()
+                ],
+            ]
+        )
+    )
+
+
+def _autofix_and_validate_generation_result(
+    current: dict[str, Any],
+    prompt_text: str,
+    entities: list[dict[str, Any]],
+    entity_map: dict[str, dict[str, Any]],
+    *,
+    job: dict[str, Any] | None = None,
+    repair_label: str = "",
+) -> tuple[dict[str, Any], ValidationReport]:
+    """Apply deterministic YAML fixes, then validate the updated draft."""
+    fixed_yaml, fixes = autofix_yaml(
+        current.get("yaml", ""),
+        prompt_text,
+        entities,
+        entity_map,
+    )
+    if fixes:
+        _LOGGER.info("Autofix applied %d fixes: %s", len(fixes), "; ".join(fixes))
+        if job is not None:
+            _mark_job_yaml_repair(
+                job,
+                repair_label or f"Auto-corrected {len(fixes)} issue(s)",
+            )
+        current["yaml"] = fixed_yaml
+
+    report = validate_generated_yaml(
+        prompt_text,
+        entities,
+        current.get("yaml", ""),
+        entity_map,
+    )
+    current["installable"] = _validate_generated_yaml(current.get("yaml", "")) is None
+    return current, report
+
+
 async def _repair_generation_result(
     client: LLMClient,
     request_messages: list[dict[str, str]],
@@ -2417,7 +2520,7 @@ async def _repair_generation_result(
     result: dict[str, Any],
     job: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Validate, autofix, and at most once regenerate a generated result."""
+    """Validate, autofix, and run bounded YAML repair/regeneration retries."""
     current = await _materialize_generation_result(
         client,
         request_messages,
@@ -2430,15 +2533,25 @@ async def _repair_generation_result(
         return current
 
     entity_map = build_entity_resolution_map(prompt_text, entities)
-    report = validate_generated_yaml(
+    current, report = _autofix_and_validate_generation_result(
+        current,
         prompt_text,
         entities,
-        current.get("yaml", ""),
         entity_map,
+        job=job,
     )
     if not report.has_blocking_issues and not report.has_autofixable_issues:
         current["warnings"] = report.warnings
-        current["installable"] = _validate_generated_yaml(current.get("yaml", "")) is None
+        return current
+    if not report.has_blocking_issues:
+        current["warnings"] = list(
+            dict.fromkeys(
+                [
+                    *report.warnings,
+                    *report.issue_strings(),
+                ]
+            )
+        )
         return current
 
     deterministic = _build_deterministic_generation_result(prompt_text, entities)
@@ -2456,109 +2569,106 @@ async def _repair_generation_result(
             )
             return deterministic
 
-    fixed_yaml, fixes = autofix_yaml(
-        current.get("yaml", ""),
-        prompt_text,
-        entities,
-        entity_map,
-    )
-    if fixes:
-        _LOGGER.info("Autofix applied %d fixes: %s", len(fixes), "; ".join(fixes))
-        if job is not None:
-            _mark_job_yaml_repair(job, f"Auto-corrected {len(fixes)} issue(s)")
-        current["yaml"] = fixed_yaml
+    issue_history = _extend_issue_history([], report.issue_strings())
 
-    report = validate_generated_yaml(
-        prompt_text,
-        entities,
-        current.get("yaml", ""),
-        entity_map,
-    )
-    if not report.has_blocking_issues:
-        current["warnings"] = list(
-            dict.fromkeys(
-                [
-                    *report.warnings,
-                    *report.issue_strings(),
-                ]
+    async def _attempt_latest_draft_repairs(
+        draft: dict[str, Any],
+        active_report: ValidationReport,
+    ) -> tuple[dict[str, Any], ValidationReport]:
+        nonlocal issue_history
+
+        repaired_draft = draft
+        repaired_report = active_report
+        for attempt_number in range(1, _YAML_REPAIR_ATTEMPTS + 1):
+            if not repaired_report.has_blocking_issues:
+                break
+            repaired_draft = await _request_yaml_repair_result(
+                client,
+                request_messages,
+                prompt_text,
+                entities,
+                repaired_draft,
+                repaired_report.issue_strings(),
+                issue_history=issue_history,
+                attempt_number=attempt_number,
+                job=job,
             )
-        )
-        current["installable"] = _validate_generated_yaml(current.get("yaml", "")) is None
-        return current
+            if repaired_draft.get("needs_clarification"):
+                return repaired_draft, repaired_report
 
-    if current.get("used_llm_repair") and current.get("yaml", "").strip():
-        current["warnings"] = list(
-            dict.fromkeys(
-                [
-                    *report.warnings,
-                    *report.syntax_errors,
-                    *report.missing_entities,
-                    *report.structural_issues,
-                    *[
-                        payload.get("message", key)
-                        for key, payload in report.missing_data.items()
-                    ],
-                ]
+            regen_entity_map = build_entity_resolution_map(prompt_text, entities)
+            repaired_draft, repaired_report = _autofix_and_validate_generation_result(
+                repaired_draft,
+                prompt_text,
+                entities,
+                regen_entity_map,
+                job=job,
             )
-        )
-        current["installable"] = _validate_generated_yaml(current.get("yaml", "")) is None
-        return current
+            issue_history = _extend_issue_history(
+                issue_history,
+                repaired_report.issue_strings(),
+            )
+            if not repaired_report.has_blocking_issues:
+                repaired_draft["warnings"] = list(
+                    dict.fromkeys(
+                        [
+                            *repaired_report.warnings,
+                            *repaired_report.issue_strings(),
+                        ]
+                    )
+                )
+                return repaired_draft, repaired_report
 
-    if job is not None:
-        _mark_job_yaml_repair(job, _summarize_issue_list(report.issue_strings()))
+        return repaired_draft, repaired_report
 
-    regenerated = await _single_clean_regeneration(
-        client,
-        prompt_text,
-        entities,
-        report.as_constraint_text(),
-    )
-    regenerated["used_llm_repair"] = True
-    regenerated = await _materialize_generation_result(
-        client,
-        request_messages,
-        prompt_text,
-        entities,
-        regenerated,
-        allow_intent_repair=False,
-    )
-    if regenerated.get("needs_clarification"):
-        return regenerated
+    if current.get("yaml", "").strip():
+        current, report = await _attempt_latest_draft_repairs(current, report)
+        if current.get("needs_clarification"):
+            return current
+        if not report.has_blocking_issues:
+            return current
 
-    regen_entity_map = build_entity_resolution_map(prompt_text, entities)
-    fixed_regen, regen_fixes = autofix_yaml(
-        regenerated.get("yaml", ""),
-        prompt_text,
-        entities,
-        regen_entity_map,
-    )
-    if regen_fixes:
-        _LOGGER.info(
-            "Autofix applied %d fixes to regenerated YAML: %s",
-            len(regen_fixes),
-            "; ".join(regen_fixes),
+    regenerated = current
+    for _regen_attempt in range(1, _YAML_REGENERATION_ATTEMPTS + 1):
+        regenerated = await _regenerate_generation_result(
+            client,
+            request_messages,
+            prompt_text,
+            entities,
+            report,
+            job,
+            issue_history,
         )
-    final_report = validate_generated_yaml(
-        prompt_text,
-        entities,
-        fixed_regen,
-        regen_entity_map,
-    )
-    regenerated["yaml"] = fixed_regen
-    regenerated["warnings"] = list(
-        dict.fromkeys(
-            [
-                *final_report.warnings,
-                *final_report.syntax_errors,
-                *final_report.missing_entities,
-                *final_report.structural_issues,
-                *[
-                    payload.get("message", key)
-                    for key, payload in final_report.missing_data.items()
-                ],
-            ]
+        if regenerated.get("needs_clarification"):
+            return regenerated
+
+        regen_entity_map = build_entity_resolution_map(prompt_text, entities)
+        regenerated, report = _autofix_and_validate_generation_result(
+            regenerated,
+            prompt_text,
+            entities,
+            regen_entity_map,
+            job=job,
         )
-    )
+        issue_history = _extend_issue_history(issue_history, report.issue_strings())
+        if not report.has_blocking_issues:
+            regenerated["warnings"] = list(
+                dict.fromkeys(
+                    [
+                        *report.warnings,
+                        *report.issue_strings(),
+                    ]
+                )
+            )
+            return regenerated
+
+        regenerated, report = await _attempt_latest_draft_repairs(regenerated, report)
+        if regenerated.get("needs_clarification"):
+            return regenerated
+        if not report.has_blocking_issues:
+            return regenerated
+
+    regenerated["warnings"] = _build_report_warnings(report)
     regenerated["installable"] = _validate_generated_yaml(regenerated.get("yaml", "")) is None
     return regenerated
 

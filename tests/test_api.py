@@ -813,7 +813,7 @@ async def test_run_generation_job_repairs_invalid_yaml_before_marking_complete()
 
 @pytest.mark.asyncio
 async def test_run_generation_job_regenerates_after_repair_attempts_stay_invalid():
-    """Structural issues should trigger one clean regeneration with constraints."""
+    """Structural issues should first trigger a latest-draft repair attempt."""
     hass = _make_hass()
     job = _create_generation_job(
         hass,
@@ -909,15 +909,15 @@ async def test_run_generation_job_regenerates_after_repair_attempts_stay_invalid
     assert job["status"] == "completed"
     assert _validate_generated_yaml(job["yaml"]) is None
     assert fake_client.complete.await_count == 2
-    regeneration_messages = fake_client.complete.await_args_list[1].args[0]
-    assert regeneration_messages[-1]["role"] == "user"
-    assert "CONSTRAINTS:" in regeneration_messages[-1]["content"]
-    assert "Ignore all previous drafts." in regeneration_messages[-1]["content"]
+    repair_messages = fake_client.complete.await_args_list[1].args[0]
+    assert repair_messages[-1]["role"] == "user"
+    assert "Correction attempt 1." in repair_messages[-1]["content"]
+    assert "After a delay, re-check the relevant state before notifying" in repair_messages[-1]["content"]
 
 
 @pytest.mark.asyncio
 async def test_run_generation_job_keeps_retrying_beyond_previous_yaml_retry_cap():
-    """The backend should stop after one clean regeneration and surface warnings."""
+    """The backend should keep retrying past the old single-regeneration limit."""
     hass = _make_hass()
     job = _create_generation_job(
         hass,
@@ -953,7 +953,9 @@ async def test_run_generation_job_keeps_retrying_beyond_previous_yaml_retry_cap(
     }
     fake_client = MagicMock()
     fake_client._request_timeout = 420
-    fake_client.complete = AsyncMock(side_effect=[invalid_yaml, invalid_yaml])
+    fake_client.complete = AsyncMock(
+        side_effect=[invalid_yaml, invalid_yaml, invalid_yaml, invalid_yaml]
+    )
 
     with patch(
         "custom_components.automagic.api.get_entity_context",
@@ -979,7 +981,7 @@ async def test_run_generation_job_keeps_retrying_beyond_previous_yaml_retry_cap(
         )
 
     assert job["status"] == "completed"
-    assert fake_client.complete.await_count == 2
+    assert fake_client.complete.await_count == 4
     assert "After a delay, re-check the relevant state before notifying" in " ".join(job["warnings"])
 
 
@@ -2329,7 +2331,7 @@ async def test_repair_generation_result_regenerates_when_used_llm_repair_has_emp
         return_value={},
     ), patch(
         "custom_components.automagic.api.validate_generated_yaml",
-        side_effect=[blocking_report, blocking_report, clean_report],
+        side_effect=[blocking_report, clean_report],
     ), patch(
         "custom_components.automagic.api._build_deterministic_generation_result",
         return_value=None,
@@ -2378,13 +2380,38 @@ async def test_repair_generation_result_marks_invalid_yaml_as_not_installable():
         return_value={},
     ), patch(
         "custom_components.automagic.api.validate_generated_yaml",
-        side_effect=[blocking_report, blocking_report],
+        side_effect=[
+            blocking_report,
+            blocking_report,
+            blocking_report,
+            blocking_report,
+        ],
     ), patch(
         "custom_components.automagic.api._build_deterministic_generation_result",
         return_value=None,
     ), patch(
         "custom_components.automagic.api.autofix_yaml",
         return_value=(invalid_yaml, []),
+    ), patch(
+        "custom_components.automagic.api._request_yaml_repair_result",
+        AsyncMock(
+            return_value={
+                "yaml": invalid_yaml,
+                "summary": "Broken draft",
+                "warnings": [],
+                "used_llm_repair": True,
+            }
+        ),
+    ), patch(
+        "custom_components.automagic.api._regenerate_generation_result",
+        AsyncMock(
+            return_value={
+                "yaml": invalid_yaml,
+                "summary": "Broken draft",
+                "warnings": [],
+                "used_llm_repair": True,
+            }
+        ),
     ):
         result = await _repair_generation_result(
             fake_client,
@@ -2401,7 +2428,7 @@ async def test_repair_generation_result_marks_invalid_yaml_as_not_installable():
 
 @pytest.mark.asyncio
 async def test_run_generation_job_repairs_prompt_coverage_issues_before_completion():
-    """Prompt-coverage issues should trigger one constrained regeneration."""
+    """Prompt-coverage issues should keep retrying until a valid draft is produced."""
     hass = _make_hass()
     prompt = (
         "Every weekday morning, check if Janet (the robot vacuum) has done a clean in the last 24 hours. "
@@ -2549,9 +2576,67 @@ async def test_run_generation_job_repairs_prompt_coverage_issues_before_completi
         "needs_clarification": False,
         "clarifying_questions": [],
     }
+    completed_yaml = {
+        "yaml": (
+            "alias: Start Janet Cleaning on Weekdays\n"
+            'description: "Starts Janet cleaning at 08:00 on weekdays when the requested guards pass."\n'
+            "triggers:\n"
+            "  - trigger: time\n"
+            '    at: "08:00:00"\n'
+            "    weekday:\n"
+            "      - mon\n"
+            "      - tue\n"
+            "      - wed\n"
+            "      - thu\n"
+            "      - fri\n"
+            "conditions:\n"
+            "  - condition: state\n"
+            "    entity_id: switch.router_led_left\n"
+            '    state: "on"\n'
+            "  - condition: state\n"
+            "    entity_id: switch.router_led_right\n"
+            '    state: "on"\n'
+            "  - condition: not\n"
+            "    conditions:\n"
+            "      - condition: state\n"
+            "        entity_id: sensor.iphone_13_audio_output\n"
+            '        state: "Speaker"\n'
+            "actions:\n"
+            "  - action: vacuum.start\n"
+            "    target:\n"
+            "      entity_id: vacuum.robot_vacuum\n"
+            "  - action: light.turn_on\n"
+            "    target:\n"
+            "      entity_id: [light.lounge_strip_lights_left, light.lounge_strip_lights_right, light.bar_lamp]\n"
+            "    data:\n"
+            "      brightness_pct: 20\n"
+            "      color_temp: 370\n"
+            "  - wait_for_trigger:\n"
+            "      - trigger: state\n"
+            "        entity_id: vacuum.robot_vacuum\n"
+            '        to: "docked"\n'
+            '    timeout: "01:30:00"\n'
+            "    continue_on_timeout: true\n"
+            "  - choose:\n"
+            "      - conditions:\n"
+            "          - condition: template\n"
+            '            value_template: "{{ not wait.completed }}"\n'
+            "        sequence:\n"
+            "          - action: notify.mobile_app_iphone_13\n"
+            "            data:\n"
+            '              message: "Janet is still cleaning after 90 minutes - she might be stuck"\n'
+            "  - action: light.turn_off\n"
+            "    target:\n"
+            "      entity_id: [light.lounge_strip_lights_left, light.lounge_strip_lights_right, light.bar_lamp]\n"
+            "mode: single\n"
+        ),
+        "summary": "Starts Janet cleaning on weekdays when the requested guards pass.",
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
     fake_client = MagicMock()
     fake_client._request_timeout = 420
-    fake_client.complete = AsyncMock(side_effect=[bad_yaml, fixed_yaml])
+    fake_client.complete = AsyncMock(side_effect=[bad_yaml, fixed_yaml, completed_yaml])
 
     with patch(
         "custom_components.automagic.api.get_entity_context",
@@ -2579,19 +2664,23 @@ async def test_run_generation_job_repairs_prompt_coverage_issues_before_completi
     assert "vacuum.robot_vacuum" in job["yaml"]
     assert "switch.router_led_right" in job["yaml"]
     assert "color_temp: 370" in job["yaml"]
-    assert fake_client.complete.await_count == 2
-    regeneration_messages = fake_client.complete.await_args_list[1].args[0]
-    assert regeneration_messages[-1]["role"] == "user"
-    assert "CONSTRAINTS:" in regeneration_messages[-1]["content"]
+    assert fake_client.complete.await_count == 3
+    repair_messages = fake_client.complete.await_args_list[1].args[0]
+    assert repair_messages[-1]["role"] == "user"
+    assert "Correction attempt 1." in repair_messages[-1]["content"]
     assert any(
-        token in regeneration_messages[-1]["content"]
+        token in repair_messages[-1]["content"]
         for token in ("switch.router_led_right", "Speaker", "warm_white")
     )
+    regeneration_messages = fake_client.complete.await_args_list[2].args[0]
+    assert regeneration_messages[-1]["role"] == "user"
+    assert "CONSTRAINTS:" in regeneration_messages[-1]["content"]
+    assert "weekday schedule" in regeneration_messages[-1]["content"]
 
 
 @pytest.mark.asyncio
-async def test_run_generation_job_keeps_repairing_latest_yaml_before_regeneration():
-    """If the single regeneration is still imperfect, the job should complete with warnings."""
+async def test_run_generation_job_keeps_repairing_after_an_invalid_regeneration():
+    """An invalid regeneration should trigger one more latest-draft repair attempt."""
     hass = _make_hass()
     prompt = (
         "Every weekday morning, check if Janet (the robot vacuum) has done a clean in the last 24 hours. "
@@ -2747,9 +2836,74 @@ async def test_run_generation_job_keeps_repairing_latest_yaml_before_regeneratio
         "needs_clarification": False,
         "clarifying_questions": [],
     }
+    final_repaired_yaml = {
+        "yaml": (
+            "alias: Start Janet Cleaning on Weekdays\n"
+            "description: Starts Janet cleaning when conditions are met.\n"
+            "triggers:\n"
+            "  - trigger: time\n"
+            '    at: "08:00:00"\n'
+            "    weekday:\n"
+            "      - mon\n"
+            "      - tue\n"
+            "      - wed\n"
+            "      - thu\n"
+            "      - fri\n"
+            "conditions:\n"
+            "  - condition: state\n"
+            "    entity_id: switch.router_led_left\n"
+            '    state: "on"\n'
+            "  - condition: state\n"
+            "    entity_id: switch.router_led_right\n"
+            '    state: "on"\n'
+            "  - condition: not\n"
+            "    conditions:\n"
+            "      - condition: state\n"
+            "        entity_id: sensor.iphone_13_audio_output\n"
+            '        state: "Speaker"\n'
+            "actions:\n"
+            "  - action: vacuum.start\n"
+            "    target:\n"
+            "      entity_id: vacuum.robot_vacuum\n"
+            "  - action: light.turn_on\n"
+            "    target:\n"
+            "      entity_id: [light.lounge_strip_lights_left, light.lounge_strip_lights_right, light.bar_lamp]\n"
+            "    data:\n"
+            "      brightness_pct: 20\n"
+            "      kelvin: 2700\n"
+            "  - wait_for_trigger:\n"
+            "      - trigger: state\n"
+            "        entity_id: vacuum.robot_vacuum\n"
+            '        to: "docked"\n'
+            '    timeout: "01:30:00"\n'
+            "    continue_on_timeout: true\n"
+            "  - choose:\n"
+            "      - conditions:\n"
+            "          - condition: template\n"
+            '            value_template: "{{ not wait.completed }}"\n'
+            "        sequence:\n"
+            "          - action: notify.mobile_app_iphone_13\n"
+            "            data:\n"
+            '              message: "Janet is still cleaning after 90 minutes - she might be stuck"\n'
+            "  - action: light.turn_off\n"
+            "    target:\n"
+            "      entity_id: [light.lounge_strip_lights_left, light.lounge_strip_lights_right, light.bar_lamp]\n"
+            "mode: single\n"
+        ),
+        "summary": "Starts Janet cleaning on weekdays.",
+        "needs_clarification": False,
+        "clarifying_questions": [],
+    }
     fake_client = MagicMock()
     fake_client._request_timeout = 420
-    fake_client.complete = AsyncMock(side_effect=[initial_invalid_yaml, still_incomplete_yaml])
+    fake_client.complete = AsyncMock(
+        side_effect=[
+            initial_invalid_yaml,
+            partially_fixed_yaml,
+            still_incomplete_yaml,
+            final_repaired_yaml,
+        ]
+    )
 
     with patch(
         "custom_components.automagic.api.get_entity_context",
@@ -2772,9 +2926,11 @@ async def test_run_generation_job_keeps_repairing_latest_yaml_before_regeneratio
         )
 
     assert job["status"] == "completed"
-    assert fake_client.complete.await_count == 2
-    assert job["warnings"]
-    assert isinstance(job["warnings"][0], str)
+    assert fake_client.complete.await_count == 4
+    assert _validate_generated_yaml(job["yaml"]) is None
+    post_regen_repair_messages = fake_client.complete.await_args_list[3].args[0]
+    assert post_regen_repair_messages[-1]["role"] == "user"
+    assert "Correction attempt 1." in post_regen_repair_messages[-1]["content"]
 
 
 @pytest.mark.asyncio
